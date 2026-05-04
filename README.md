@@ -9,6 +9,16 @@ Document de design: page Notion **Phase 3 - Design pipeline Python (avant-vente 
 > `routing.py`, `writer.py`, `flags.py`, `reporter.py` arrivent dans les iterations suivantes,
 > apres premiers retours de Pierre sur les 5 SRO pilotes.
 
+## Lancement rapide (GUI)
+
+Double-cliquez sur `start.bat`. Une fenetre s'ouvre :
+- Choisissez le fichier GPKG
+- Cochez les SRO a traiter
+- Cliquez "Lancer"
+
+Le mode CLI reste disponible via `run_pipeline.bat --all-pilots` ou
+`run_pipeline.bat --sros <ids>`.
+
 ## Structure
 
 ```

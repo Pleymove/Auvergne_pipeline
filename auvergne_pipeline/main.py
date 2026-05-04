@@ -215,6 +215,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--sro", action="append", help="Code SRO (peut etre repete).")
     g.add_argument(
+        "--sros",
+        nargs="+",
+        metavar="CODE",
+        help="Liste de codes SRO espaces par espace (ex: --sros A B C).",
+    )
+    g.add_argument(
         "--all-pilots",
         action="store_true",
         help="Traite les 5 SRO pilotes (config.PILOT_SROS).",
@@ -242,7 +248,12 @@ def main(argv: list[str] | None = None) -> int:
             print(code)
         return 0
 
-    sros = list(config.PILOT_SROS) if args.all_pilots else list(args.sro or [])
+    if args.all_pilots:
+        sros = list(config.PILOT_SROS)
+    elif args.sros:
+        sros = list(args.sros)
+    else:
+        sros = list(args.sro or [])
     if not sros:
         log.error("[X] Aucun SRO a traiter.")
         return 2
