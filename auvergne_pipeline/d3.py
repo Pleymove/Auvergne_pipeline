@@ -1,17 +1,25 @@
-"""D3 distance: BAT parcel boundary -> nearest reusable infrastructure.
+"""D3 distance: BAT point -> nearest reusable infrastructure.
 
 The "D3" distance drives the AUTO_OK / TO_CREATE classification per BAT.
-For each BAT we:
 
-1. Find the parcel that contains the BAT point (point-in-polygon).
-2. If the parcel is public (commune): D3 = 0.
-3. Else (private parcel): take its boundary, snap to the public side
-   (intersect / 0.5 m tolerance with ``public_geom``).
-   - If the parcel is enclaved (no boundary on public), walk up to two
-     levels of adjacent parcels to find one that touches public; flag
-     ``BAT_ENCLAVE``.
-4. Measure the minimum distance from the (possibly neighbour) boundary to
-   the nearest reusable infra segment via the spatial index.
+Important (fix vs iteration 2): D3 is measured from the **BAT point**
+(building hookup at the facade) to the closest reusable-infrastructure
+segment, not from the parcel boundary. The boundary is essentially always
+glued to the street where the infra runs, so the boundary-based measurement
+collapsed to ~0 m and over-reported AUTO_OK.
+
+Per-BAT logic:
+
+1. Point-in-polygon to identify the BAT's parcel (used for the
+   ``BAT_HORS_CADASTRE`` / ``BAT_ENCLAVE`` flags and for the public
+   shortcut). When the BAT is hors cadastre, the flag is raised but the
+   distance measurement still proceeds (best-effort).
+2. If the parcel is public (commune): D3 = 0 (BAT already on the public
+   domain, no cordon to pull).
+3. If the parcel is private and has no boundary on the public domain
+   (parcel enclavee): flag ``BAT_ENCLAVE``. The measurement still runs.
+4. Distance = min over reusable infra in a search envelope around the BAT
+   of ``infra.distance(bat_point)``.
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from . import flags as flags_mod
 SEUIL_D3_M = 100.0
 TOUCH_TOLERANCE_M = 0.5      # floating-point tolerance for "touches public"
 NEIGHBOR_TOLERANCE_M = 1.0   # tolerance to find adjacent parcels (touching)
-SEARCH_RADIUS_M = 500.0      # spatial-index search envelope around the boundary
+SEARCH_RADIUS_M = 500.0      # spatial-index search envelope around the BAT
 
 
 def _bat_url(bat) -> str:
@@ -78,33 +86,6 @@ def _touches_public(boundary, public_geom) -> bool:
     return boundary.distance(public_geom) <= TOUCH_TOLERANCE_M
 
 
-def _enclave_target_boundary(
-    parcel,
-    parcelles: gpd.GeoDataFrame,
-    public_geom,
-    max_levels: int = 2,
-):
-    """Walk up to ``max_levels`` of neighbours to find one whose boundary touches public."""
-    visited = {parcel.name}
-    frontier = [parcel]
-    for _ in range(max_levels):
-        next_frontier = []
-        for p in frontier:
-            buf = p.geometry.buffer(NEIGHBOR_TOLERANCE_M)
-            mask = parcelles.geometry.intersects(buf) & ~parcelles.index.isin(visited)
-            for idx in parcelles[mask].index:
-                visited.add(idx)
-                neighbor = parcelles.loc[idx]
-                nb_boundary = neighbor.geometry.boundary
-                if _touches_public(nb_boundary, public_geom):
-                    return nb_boundary
-                next_frontier.append(neighbor)
-        frontier = next_frontier
-        if not frontier:
-            break
-    return None
-
-
 def measure_d3(
     bat,
     parcelles_classifiees: gpd.GeoDataFrame,
@@ -113,55 +94,51 @@ def measure_d3(
     sindex_infra,
     flag_collector: Optional["flags_mod.FlagCollector"] = None,
 ) -> Tuple[Optional[float], Optional[int], Optional[str]]:
-    """Distance from BAT's parcel boundary (private side) to nearest reusable infra.
+    """Distance from the BAT point to the nearest reusable infra segment.
 
     Returns
     -------
     (distance_m, infra_idx, parcel_url)
-        - ``distance_m`` in metres or ``None`` if not measurable.
-        - ``infra_idx`` is the row index (label) of the closest reusable infra,
-          or ``None`` if not applicable / not measurable.
+        - ``distance_m`` in metres or ``None`` if no infra is within
+          ``SEARCH_RADIUS_M`` of the BAT.
+        - ``infra_idx`` is the row index (label) of the closest reusable
+          infra, or ``None`` when not measurable / on a public parcel.
         - ``parcel_url`` is a string identifier for the BAT's parcel, or
           ``None`` when the BAT is hors cadastre.
     """
     bat_geom = bat.geometry
 
+    # ---- Step 1: identify the BAT's parcel (for flags + public shortcut) --
+    purl: Optional[str] = None
     if parcelles_classifiees is None or parcelles_classifiees.empty:
         if flag_collector is not None:
             flag_collector.add("BAT_HORS_CADASTRE", target_url=_bat_url(bat))
-        return None, None, None
-
-    contains = parcelles_classifiees[parcelles_classifiees.geometry.contains(bat_geom)]
-    if contains.empty:
-        if flag_collector is not None:
-            flag_collector.add("BAT_HORS_CADASTRE", target_url=_bat_url(bat))
-        return None, None, None
-
-    parcel = contains.iloc[0]
-    purl = _parcel_url(parcel)
-
-    if bool(parcel.get("public", False)):
-        return 0.0, None, purl
-
-    boundary = parcel.geometry.boundary
-
-    if _touches_public(boundary, public_geom):
-        target_boundary = boundary
     else:
-        target_boundary = _enclave_target_boundary(
-            parcel, parcelles_classifiees, public_geom, max_levels=2
-        )
-        if flag_collector is not None:
-            flag_collector.add("BAT_ENCLAVE", target_url=purl)
-        if target_boundary is None:
-            return None, None, purl
+        contains = parcelles_classifiees[
+            parcelles_classifiees.geometry.contains(bat_geom)
+        ]
+        if contains.empty:
+            if flag_collector is not None:
+                flag_collector.add("BAT_HORS_CADASTRE", target_url=_bat_url(bat))
+        else:
+            parcel = contains.iloc[0]
+            purl = _parcel_url(parcel)
 
-    cand_pos = _candidates(sindex_infra, reusable_infra, target_boundary, SEARCH_RADIUS_M)
+            if bool(parcel.get("public", False)):
+                return 0.0, None, purl
+
+            boundary = parcel.geometry.boundary
+            if not _touches_public(boundary, public_geom):
+                if flag_collector is not None:
+                    flag_collector.add("BAT_ENCLAVE", target_url=purl)
+
+    # ---- Step 2: distance BAT (point) -> nearest reusable infra ----------
+    cand_pos = _candidates(sindex_infra, reusable_infra, bat_geom, SEARCH_RADIUS_M)
     if not cand_pos:
         return None, None, purl
 
     candidates = reusable_infra.iloc[cand_pos]
-    distances = candidates.geometry.distance(target_boundary)
+    distances = candidates.geometry.distance(bat_geom)
     if distances.empty:
         return None, None, purl
 
