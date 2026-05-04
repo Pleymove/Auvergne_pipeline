@@ -29,12 +29,21 @@ def filter_athd(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def filter_bt(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """ENEDIS BT: drop buried cables (only aerial / facade segments are reusable)."""
+    """ENEDIS BT: drop buried cables (only aerial / facade segments are reusable).
+
+    Implementation note: the embedded QGIS pyarrow lacks ``match_substring_regex``,
+    which pandas calls when ``str.contains`` is invoked with ``case=False`` (or
+    any regex) on an arrow-backed string column. We force a Python-object dtype
+    and lowercase the column ourselves, then use ``regex=False`` so pandas only
+    needs ``match_substring`` (which is available).
+    """
     if gdf.empty or "type_de_lien" not in gdf.columns:
         return _empty_like(gdf)
-    tdl = gdf["type_de_lien"].astype(str)
-    buried = tdl.str.contains("cable enterre", case=False, na=False) | tdl.str.contains(
-        "câble enterré", case=False, na=False
+    tdl = gdf["type_de_lien"].astype("object").fillna("").str.lower()
+    buried = (
+        tdl.str.contains("cable enterre", regex=False, na=False)
+        | tdl.str.contains("cable enterree", regex=False, na=False)
+        | tdl.str.contains("câble enterré", regex=False, na=False)
     )
     return gdf[~buried].copy()
 

@@ -41,6 +41,11 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
     layers = loader.load_sro(gpkg_path, sro_code)
     reusable = filters.build_reusable_infra(layers)
 
+    by_src = {
+        s: int((reusable["src"] == s).sum()) if "src" in reusable.columns else 0
+        for s in ("athd", "bt", "ft", "chem")
+    }
+
     summary = {
         "sro": sro_code,
         "bal": len(layers["bal"]),
@@ -51,17 +56,33 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
         "bt_in": len(layers[config.LAYER_BT]),
         "ft_in": len(layers[config.LAYER_FT_ARCITI]),
         "chem_in": len(layers[config.LAYER_CHEMINEMENT]),
+        "athd_out": by_src["athd"],
+        "bt_out": by_src["bt"],
+        "ft_out": by_src["ft"],
+        "chem_out": by_src["chem"],
         "reusable_total": len(reusable),
     }
+
     log.info(
-        "[OK] SRO %s : %d trononcs reutilisables (athd=%d bt=%d ft=%d chem=%d)",
+        "[INFO] %s reusable totals : athd=%d bt=%d ft=%d chem=%d -> total=%d",
         sro_code,
+        by_src["athd"], by_src["bt"], by_src["ft"], by_src["chem"],
         summary["reusable_total"],
-        int((reusable.get("src") == "athd").sum()) if "src" in reusable.columns else 0,
-        int((reusable.get("src") == "bt").sum()) if "src" in reusable.columns else 0,
-        int((reusable.get("src") == "ft").sum()) if "src" in reusable.columns else 0,
-        int((reusable.get("src") == "chem").sum()) if "src" in reusable.columns else 0,
     )
+
+    def _pct(out: int, in_: int) -> str:
+        return f"{(100 * out / in_):5.1f}%" if in_ else "  n/a"
+
+    log.info(
+        "[INFO] %s filter retention : athd=%s bt=%s ft=%s chem=%s",
+        sro_code,
+        _pct(by_src["athd"], summary["athd_in"]),
+        _pct(by_src["bt"], summary["bt_in"]),
+        _pct(by_src["ft"], summary["ft_in"]),
+        _pct(by_src["chem"], summary["chem_in"]),
+    )
+
+    log.info("[OK] SRO %s traite", sro_code)
     return summary
 
 
