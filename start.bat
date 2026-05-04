@@ -57,6 +57,23 @@ pause
 exit /b 1
 
 :launch
+REM o4w_env.bat charge Python + GeoPandas mais PAS les DLLs Qt.
+REM PyQt6 (utilise par launcher.py) a besoin de apps\Qt6\bin dans le PATH.
+REM On essaie le chemin detecte (TRIED ou QGIS_ROOT) + les chemins frequents.
+for %%p in ("%TRIED%" "%QGIS_ROOT%"
+            "C:\Program Files\QGIS 4.0.1"
+            "C:\Program Files\QGIS 4.0.0"
+            "C:\OSGeo4W"
+            "D:\OSGeo4W") do (
+    if exist "%%~p\apps\Qt6\bin" (
+        set "PATH=%%~p\apps\Qt6\bin;%%~p\bin;%PATH%"
+    )
+)
+REM Scan C:\Program Files\QGIS* pour Qt6 (cas rares)
+for /d %%d in ("C:\Program Files\QGIS*") do (
+    if exist "%%d\apps\Qt6\bin" set "PATH=%%d\apps\Qt6\bin;%%d\bin;%PATH%"
+)
+
 cd /d "%~dp0"
 python -m auvergne_pipeline.launcher
 if errorlevel 1 (
