@@ -19,6 +19,11 @@ Double-cliquez sur `start.bat`. Une fenetre s'ouvre :
 Le mode CLI reste disponible via `run_pipeline.bat --all-pilots` ou
 `run_pipeline.bat --sros <ids>`.
 
+> Note technique : la GUI est implementee en **PyQt6** (framework GUI natif
+> de QGIS, livre par OSGeo4W). **Aucune dependance supplementaire** n'est
+> requise -- PyQt6 est deja present dans l'environnement charge par
+> `o4w_env.bat`.
+
 ## Structure
 
 ```
