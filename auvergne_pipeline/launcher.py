@@ -12,6 +12,48 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Initialiser l'environnement Qt AVANT d'importer PyQt6.
+# o4w_env.bat charge Python + GeoPandas mais ne configure pas les DLLs Qt.
+# Sans ca, PyQt6 plante avec :
+#   - "DLL load failed while importing QtCore" (Qt6\bin pas dans PATH)
+#   - "Could not find the Qt platform plugin windows" (QT_PLUGIN_PATH absent)
+# ---------------------------------------------------------------------------
+def _init_qt_env() -> None:
+    """Detecte QGIS et configure PATH / QT_PLUGIN_PATH avant l'import PyQt6."""
+    if os.environ.get("_HERMES_QT_INIT_DONE"):
+        return
+
+    # Deduire QGIS_ROOT depuis le chemin de python.exe
+    qgis_root = os.environ.get("QGIS_ROOT", "")
+    if not qgis_root:
+        # python.exe est dans apps\Python3xx\python.exe, on remonte de 3 niveaux
+        _py = Path(sys.executable).resolve()
+        _candidate = _py.parent.parent.parent  # python.exe -> Python3xx -> apps -> QGIS_ROOT
+        if (_candidate / "bin" / "o4w_env.bat").exists():
+            qgis_root = str(_candidate)
+
+    if not qgis_root:
+        return  # pas dans l'environnement QGIS, on laisse planter
+
+    # Qt bin dans PATH
+    for qt_ver in ("Qt6", "Qt5"):
+        qt_bin = os.path.join(qgis_root, "apps", qt_ver, "bin")
+        if os.path.isdir(qt_bin):
+            os.environ["PATH"] = qt_bin + os.pathsep + os.path.join(qgis_root, "bin") + os.pathsep + os.environ.get("PATH", "")
+            break
+
+    # Qt platform plugins (evite "Could not find the Qt platform plugin windows")
+    for qt_ver in ("Qt6", "Qt5"):
+        qt_plugins = os.path.join(qgis_root, "apps", qt_ver, "plugins")
+        if os.path.isdir(qt_plugins):
+            os.environ["QT_PLUGIN_PATH"] = qt_plugins
+            break
+
+    os.environ["_HERMES_QT_INIT_DONE"] = "1"
+
+_init_qt_env()
+
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
