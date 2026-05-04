@@ -21,3 +21,6 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+
+# Pipeline run logs
+logs/
