@@ -132,3 +132,17 @@ def test_no_self_loop_after_welding():
     # Result: 0 nodes (degenerate edge, no connected component preserved)
     assert G_w.number_of_nodes() <= 1
     assert G_w.number_of_edges() == 0  # self-loop removed
+
+
+# ---------------------------------------------------------------------------
+# PR #22.5 — sklearn-free welding
+# ---------------------------------------------------------------------------
+
+
+def test_weld_uses_scipy_not_sklearn():
+    """Garantit qu'on n'a plus de dépendance sklearn dans routing.py."""
+    import inspect
+    src = inspect.getsource(routing._weld_close_nodes)
+    assert 'sklearn' not in src, "routing.py ne doit plus importer sklearn"
+    assert 'DBSCAN' not in src, "routing.py ne doit plus utiliser DBSCAN"
+    assert 'cKDTree' in src, "routing.py doit utiliser scipy cKDTree"

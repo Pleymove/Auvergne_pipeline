@@ -35,15 +35,6 @@ SNAP_PROJECTION_RADIUS_M = 200.0  # edge-projection fallback radius (PR #21)
 WELD_RADIUS_M = 2.0             # node fusion radius for topology welding (PR #22)
 EDGE_KEY_SEP = "::"
 
-# Lazy import: scikit-learn is available in QGIS embedded Python
-try:
-    from sklearn.cluster import DBSCAN
-    _HAS_SKLEARN = True
-except ImportError:
-    _HAS_SKLEARN = False
-    log.warning("[ROUTING] sklearn indisponible — welding desactive")
-
-
 def _explode_to_linestrings(geom):
     """Yield LineString parts from a (Multi)LineString geometry."""
     if geom is None or geom.is_empty:
@@ -74,19 +65,24 @@ def _point_key(pt) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Topology welding (PR #22)
+# Topology welding (PR #22 / PR #22.5)
 # ---------------------------------------------------------------------------
 
+# Scipy is guaranteed present in QGIS embedded Python 4.0.1
+# (already used elsewhere in the pipeline).
 
 def _weld_close_nodes(
     G: nx.Graph, weld_radius_m: float = WELD_RADIUS_M
 ) -> nx.Graph:
-    """Fuse nodes within ``weld_radius_m`` via DBSCAN spatial clustering.
+    """Fuse nodes within ``weld_radius_m`` via scipy cKDTree + union-find.
 
     ATHD / BT / FT / cheminement edges sit at cm-level offsets from each
     other and from IGN routes, producing a graph of N disconnected islands.
     Welding merges close endpoints into a single node, reconnecting the
     graph so Dijkstra can find paths across all infrastructure layers.
+
+    PR #22.5: replaced scikit-learn clustering with scipy.spatial.cKDTree
+    (scikit-learn unavailable in QGIS 4.0.1 embedded Python on Pierre's box).
     """
     if G.number_of_nodes() < 2:
         return G
@@ -94,33 +90,57 @@ def _weld_close_nodes(
     nodes = list(G.nodes())
     coords = np.array(nodes, dtype=float)
 
-    if _HAS_SKLEARN:
-        db = DBSCAN(eps=weld_radius_m, min_samples=1).fit(coords)
-        labels = db.labels_
-    else:
-        return G  # fallback: identity
+    # 1) Build KDTree and find all node pairs within weld_radius_m
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=weld_radius_m, output_type='ndarray')
 
-    # Representative coord per cluster (centroid, rounded)
-    cluster_to_rep: dict[int, tuple[float, float]] = {}
-    for label in set(labels):
-        members = coords[labels == label]
-        cx, cy = members.mean(axis=0)
-        cluster_to_rep[label] = (round(float(cx), 6), round(float(cy), 6))
+    # 2) Union-find with path compression to group pairs into clusters
+    parent = list(range(len(nodes)))
 
-    node_to_rep = {nodes[i]: cluster_to_rep[labels[i]] for i in range(len(nodes))}
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    # Rebuild graph with fused nodes
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for a, b in pairs:
+        _union(int(a), int(b))
+
+    # 3) Compute cluster labels
+    labels = np.array([_find(i) for i in range(len(nodes))])
+
+    # 4) Representative coord per cluster (centroid, rounded to 6 decimals)
+    cluster_to_centroid: dict[int, tuple[float, float]] = {}
+    for label in np.unique(labels):
+        mask = labels == label
+        cx = round(float(coords[mask, 0].mean()), 6)
+        cy = round(float(coords[mask, 1].mean()), 6)
+        cluster_to_centroid[int(label)] = (cx, cy)
+
+    old_to_new = {
+        nodes[i]: cluster_to_centroid[int(labels[i])]
+        for i in range(len(nodes))
+    }
+
+    # 5) Rebuild graph with fused nodes
     G_welded = nx.Graph()
     for u, v, data in G.edges(data=True):
-        ru, rv = node_to_rep[u], node_to_rep[v]
-        if ru == rv:
+        nu, nv = old_to_new[u], old_to_new[v]
+        if nu == nv:
             continue  # self-loop after welding — skip
-        if G_welded.has_edge(ru, rv):
-            if data.get("length", 0) < G_welded[ru][rv].get("length", float("inf")):
-                G_welded[ru][rv].update(data)
+        if G_welded.has_edge(nu, nv):
+            if data.get("length", 0) < G_welded[nu][nv].get("length", float("inf")):
+                G_welded[nu][nv].update(data)
         else:
-            G_welded.add_edge(ru, rv, **data)
+            G_welded.add_edge(nu, nv, **data)
 
+    # 6) Log
     n_before = G.number_of_nodes()
     n_after = G_welded.number_of_nodes()
     n_cc_before = nx.number_connected_components(G)
