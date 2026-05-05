@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 LAYER_PA = "livrable_pa"
 LAYER_ZAPA = "livrable_zapa"
-LAYER_BAT = "livrable_bat"
+LAYER_BAL = "livrable_bal"
 LAYER_INFRA = "livrable_infra"
 LAYER_PB = "livrable_pb"
 LAYER_PARCELLES = "livrable_parcelles"
@@ -41,7 +41,7 @@ QML_MAPPING = {
     LAYER_PA: "livrable_pa_style.qml",
     LAYER_INFRA: "livrable_infra_style.qml",
     LAYER_ZAPA: "livrable_zapa_style.qml",
-    LAYER_BAT: "bal_style.qml",
+    LAYER_BAL: "bal_style.qml",
     LAYER_PARCELLES: "parcelle_style.qml",
     LAYER_ZASRO: "za_sro_style.qml",
 }
@@ -128,13 +128,12 @@ def write_sro_outputs(
         _ensure_layer_exists(zapa_gdf, output_gpkg, LAYER_ZAPA, crs)
         counts[LAYER_ZAPA] = len(zapa_rows)
 
-    # ---- 3. livrable_bat ────────────────────────────────────────────
-    bat_out = bal.copy()
-    bat_out["sro_code"] = sro_code
-    bat_out["pa_rattache"] = ""
-    if not bat_out.empty:
-        _ensure_layer_exists(bat_out, output_gpkg, LAYER_BAT, crs)
-        counts[LAYER_BAT] = len(bat_out)
+    # ---- 3. livrable_bal (BAL filtered by ZASRO) ────────────────────
+    bal_out = bal.copy()
+    bal_out["sro_code"] = sro_code
+    if not bal_out.empty:
+        _ensure_layer_exists(bal_out, output_gpkg, LAYER_BAL, crs)
+        counts[LAYER_BAL] = len(bal_out)
 
     # ---- 4. livrable_infra (existant + GC neuf) ─────────────────────
     if livrable_infra is not None and not livrable_infra.empty:
@@ -198,10 +197,10 @@ def write_sro_outputs(
 
     # ---- log recap ----------------------------------------------------
     log.info(
-        "[INFO] %s writer : pa=%d zapa=%d bat=%d infra=%d pb=%d parcelles=%d zasro=%d sro=%d flags=%d",
+        "[INFO] %s writer : pa=%d zapa=%d bal=%d infra=%d pb=%d parcelles=%d zasro=%d sro=%d flags=%d",
         sro_code,
         counts.get(LAYER_PA, 0), counts.get(LAYER_ZAPA, 0),
-        counts.get(LAYER_BAT, 0), counts.get(LAYER_INFRA, 0),
+        counts.get(LAYER_BAL, 0), counts.get(LAYER_INFRA, 0),
         counts.get(LAYER_PB, 0), counts.get(LAYER_PARCELLES, 0),
         counts.get(LAYER_ZASRO, 0), counts.get(LAYER_SRO, 0),
         counts.get(LAYER_FLAGS, 0),
@@ -270,3 +269,95 @@ def apply_qml_styles_to_gpkg(gpkg_path: Path) -> None:
     conn.commit()
     conn.close()
     log.info("[QML] %d styles officiels appliques au GPKG", applied)
+
+
+# ---------------------------------------------------------------------------
+# QML sidecars — .qml files alongside the GPKG for QGIS auto-load
+# ---------------------------------------------------------------------------
+
+
+def write_qml_sidecars(gpkg_path: Path) -> int:
+    """Copy each official QML to a sidecar file alongside the GPKG.
+
+    Uses QGIS naming convention for automatic style loading:
+    ``<gpkg_basename>_<layer_name>.qml``
+
+    Example: ``output/auvergne_outputs_livrable_pa.qml``
+    """
+    import shutil
+
+    output_dir = gpkg_path.parent
+    gpkg_basename = gpkg_path.stem
+    count = 0
+    for layer_name, qml_filename in QML_MAPPING.items():
+        src = QML_DIR / qml_filename
+        if not src.exists():
+            log.warning("[QML sidecar] Fichier introuvable: %s", src)
+            continue
+        dst = output_dir / f"{gpkg_basename}_{layer_name}.qml"
+        shutil.copy2(src, dst)
+        count += 1
+    if count:
+        log.info("[QML] %d sidecars .qml ecrits a cote du GPKG", count)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Pre-styled .qgz project for auto-loading all layers at once
+# ---------------------------------------------------------------------------
+
+
+def write_qgis_project(gpkg_path: Path) -> Path | None:
+    """Generate a .qgz alongside the GPKG that pre-loads all 9 livrable
+    layers with official QML styles in correct stacking order.
+
+    Pierre double-clicks the .qgz → QGIS opens with everything styled.
+    """
+    try:
+        from qgis.core import QgsProject, QgsVectorLayer, QgsApplication
+    except ImportError:
+        log.warning("[QGZ] qgis.core non disponible — projet .qgz non genere")
+        return None
+
+    # Init QGIS app if not already running
+    if not QgsApplication.instance():
+        qgs = QgsApplication([], False)
+        qgs.initQgis()
+
+    project = QgsProject.instance()
+    project.clear()
+
+    qgz_path = gpkg_path.with_suffix(".qgz")
+    project.setFileName(str(qgz_path))
+
+    # Stacking order: background → foreground
+    LAYER_ORDER = [
+        ("livrable_parcelles", "parcelle_style.qml"),
+        ("livrable_zasro", "za_sro_style.qml"),
+        ("livrable_zapa", "livrable_zapa_style.qml"),
+        ("livrable_infra", "livrable_infra_style.qml"),
+        ("livrable_bal", "bal_style.qml"),
+        ("livrable_pb", None),   # no official QML for PB fictif
+        ("livrable_pa", "livrable_pa_style.qml"),
+        ("livrable_sro", None),   # no official QML for SRO point
+        ("livrable_flags", None),
+    ]
+
+    gpkg_uri = str(gpkg_path.resolve())
+    loaded = 0
+    for layer_name, qml_name in LAYER_ORDER:
+        uri = f"{gpkg_uri}|layername={layer_name}"
+        layer = QgsVectorLayer(uri, layer_name, "ogr")
+        if not layer.isValid():
+            log.warning("[QGZ] Layer invalide: %s", layer_name)
+            continue
+        if qml_name:
+            qml_path = QML_DIR / qml_name
+            if qml_path.exists():
+                layer.loadNamedStyle(str(qml_path))
+        project.addMapLayer(layer)
+        loaded += 1
+
+    project.write()
+    log.info("[QGZ] Projet QGIS pre-style ecrit: %s (%d couches)", qgz_path.name, loaded)
+    return qgz_path

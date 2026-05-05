@@ -69,7 +69,7 @@ def test_pipeline_full_no_crash(tmp_path, empty_ign_routes):
     expected_minimum = {
         "livrable_pa",
         "livrable_zapa",
-        "livrable_bat",
+        "livrable_bal",
         "livrable_parcelles",
         "livrable_zasro",
         "livrable_sro",
@@ -112,8 +112,8 @@ def test_pipeline_no_output_runs_d3_only(empty_ign_routes):
 # ---------------------------------------------------------------------------
 
 
-def test_livrable_infra_includes_reusable(tmp_path, empty_ign_routes):
-    """PR #19 Bug #1: livrable_infra doit contenir au moins reusable_total."""
+def test_livrable_infra_is_routed_only(tmp_path, empty_ign_routes):
+    """PR #20 Bug #2: livrable_infra = strict PA→PB paths, not all reusable."""
     from auvergne_pipeline.main import run_for_sros
 
     output = tmp_path / "test_infra.gpkg"
@@ -124,9 +124,11 @@ def test_livrable_infra_includes_reusable(tmp_path, empty_ign_routes):
 
     # Load livrable_infra from the output GPKG
     infra_gdf = gpd.read_file(output, layer="livrable_infra")
-    assert len(infra_gdf) >= reusable_total, (
-        f"livrable_infra has {len(infra_gdf)} features, "
-        f"but reusable_total={reusable_total}"
+    # PR #20: livrable_infra should be STRICTLY less than full reusable
+    # (only edges actually on PA→PB paths)
+    assert len(infra_gdf) < reusable_total, (
+        f"PR #20: livrable_infra should contain only routed edges, "
+        f"but has {len(infra_gdf)} >= reusable_total={reusable_total}"
     )
 
 
@@ -142,3 +144,19 @@ def test_layer_styles_after_e2e(tmp_path, empty_ign_routes):
     n = conn.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0]
     conn.close()
     assert n >= 6, f"Expected >=6 QML styles in layer_styles, found {n}"
+
+
+def test_qml_sidecars_after_e2e(tmp_path, empty_ign_routes):
+    """PR #20 Bug #1: .qml sidecars written alongside GPKG after E2E."""
+    from auvergne_pipeline.main import run_for_sros
+
+    output = tmp_path / "test_sidecars.gpkg"
+    run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=output)
+
+    # Sidecars should exist
+    for layer_name in ("livrable_pa", "livrable_bal", "livrable_infra",
+                       "livrable_zapa", "livrable_parcelles", "livrable_zasro"):
+        sidecar = tmp_path / f"test_sidecars_{layer_name}.qml"
+        assert sidecar.exists(), f"Missing sidecar: {sidecar.name}"
+        # Should have content (> 100 bytes)
+        assert sidecar.stat().st_size > 100, f"Sidecar too small: {sidecar.name}"

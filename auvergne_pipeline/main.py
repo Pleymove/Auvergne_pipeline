@@ -153,6 +153,9 @@ def run_for_sro(
             bat_enriched.at[bat_enriched.index[i], "cls_d3"] = d["cls"]
             bat_enriched.at[bat_enriched.index[i], "parcel_url"] = d["parcel_url"]
 
+    # PR #20: filter BAL to ZASRO only (livrable scope)
+    bat_enriched = bat_enriched[bat_enriched.intersects(za_geom)].copy()
+
     log.info("[INFO] %s d3 : auto_ok=%d (%.1f%%) to_create=%d (%.1f%%) median=%.1fm max=%.1fm",
              sro_code, auto_ok, (100*auto_ok/n_bat) if n_bat else 0.0,
              to_create, (100*to_create/n_bat) if n_bat else 0.0, median, maxv)
@@ -204,37 +207,15 @@ def run_for_sro(
             layers["bal"], pa_all, zapa_all, combined_edges, flag_collector
         )
 
-        # 9. Routing PA→PB on combined graph (for GC neuf C0 edges only)
+        # 9. Routing PA→PB on combined graph (includes gc_neuf C0 edges)
         routed_infra = routing.route_pa_to_pb(
-            pa_all, pb_gdf, reusable, ign_roads, flag_collector
+            pa_all, pb_gdf, reusable, ign_roads, flag_collector,
+            gc_neuf=gc_neuf,
         )
 
-        # Compose final livrable_infra: reusable existant + GC neuf C0
-        livrable_infra_parts = []
-        if reusable is not None and not reusable.empty:
-            livrable_infra_parts.append(reusable.copy())
-        if gc_neuf is not None and not gc_neuf.empty:
-            livrable_infra_parts.append(gc_neuf.copy())
-        if routed_infra is not None and not routed_infra.empty:
-            # Keep only C0 edges from routing (new GC neuf)
-            if "mode_pose" in routed_infra.columns:
-                new_only = routed_infra[
-                    routed_infra["mode_pose"].astype(str).str.upper() == "C0"
-                ]
-            else:
-                new_only = gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
-            if not new_only.empty:
-                livrable_infra_parts.append(new_only)
-
-        if livrable_infra_parts:
-            livrable_infra_full = gpd.GeoDataFrame(
-                pd.concat(livrable_infra_parts, ignore_index=True),
-                geometry="geometry", crs=config.PROJECT_CRS,
-            )
-        else:
-            livrable_infra_full = gpd.GeoDataFrame(
-                geometry=[], crs=config.PROJECT_CRS,
-            )
+        # livrable_infra = routed edges only (strict PA→PB paths)
+        # PR #20: scope corrigé — plus de reusable complet, juste les arêtes
+        # effectivement traversées par les chemins routing.
 
         # 10. Writer
         writer.write_sro_outputs(
@@ -244,7 +225,7 @@ def run_for_sro(
             georeso_zapa_existantes=layers["georeso_zapa"],
             new_pas=new_pas, new_zapas=new_zapas,
             pb_fictifs=pb_gdf,
-            livrable_infra=livrable_infra_full,
+            livrable_infra=routed_infra,
             parcelles=parcelles_class,
             za_sro=layers.get("za_sro"),
             flag_collector=flag_collector,
@@ -273,6 +254,8 @@ def run_for_sros(
     if output_gpkg is not None and output_gpkg.exists():
         log.info("[OK] GPKG output : %s", output_gpkg.resolve())
         writer.apply_qml_styles_to_gpkg(output_gpkg)
+        writer.write_qml_sidecars(output_gpkg)
+        writer.write_qgis_project(output_gpkg)
     for code, err in failures:
         log.warning("[!] %s : %s", code, err)
     return summaries
