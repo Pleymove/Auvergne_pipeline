@@ -17,9 +17,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-import fiona
 import geopandas as gpd
 import pytest
+from pyogrio import list_layers as pyogrio_list_layers
 
 from auvergne_pipeline import config
 
@@ -64,13 +64,15 @@ def test_pipeline_full_no_crash(tmp_path, empty_ign_routes):
     assert s["new_pa"] >= 1
 
     assert output.exists(), "Output GPKG was not written"
-    layers = set(fiona.listlayers(str(output)))
+    layers = set(pyogrio_list_layers(str(output))[:, 0])
 
     expected_minimum = {
         "livrable_pa",
         "livrable_zapa",
         "livrable_bat",
         "livrable_parcelles",
+        "livrable_zasro",
+        "livrable_sro",
     }
     missing = expected_minimum - layers
     assert not missing, f"Missing livrable layers: {missing}. Got: {layers}"
@@ -103,3 +105,40 @@ def test_pipeline_no_output_runs_d3_only(empty_ign_routes):
     assert summaries[0]["bal"] == 5
     # ign_routes must NOT have been called (output_gpkg is None)
     empty_ign_routes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PR #19 regression E2E tests
+# ---------------------------------------------------------------------------
+
+
+def test_livrable_infra_includes_reusable(tmp_path, empty_ign_routes):
+    """PR #19 Bug #1: livrable_infra doit contenir au moins reusable_total."""
+    from auvergne_pipeline.main import run_for_sros
+
+    output = tmp_path / "test_infra.gpkg"
+    summaries = run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=output)
+
+    assert len(summaries) == 1
+    reusable_total = summaries[0]["reusable_total"]
+
+    # Load livrable_infra from the output GPKG
+    infra_gdf = gpd.read_file(output, layer="livrable_infra")
+    assert len(infra_gdf) >= reusable_total, (
+        f"livrable_infra has {len(infra_gdf)} features, "
+        f"but reusable_total={reusable_total}"
+    )
+
+
+def test_layer_styles_after_e2e(tmp_path, empty_ign_routes):
+    """PR #19 Bug #3: layer_styles table filled after E2E pipeline run."""
+    from auvergne_pipeline.main import run_for_sros
+
+    output = tmp_path / "test_styles.gpkg"
+    run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=output)
+
+    import sqlite3
+    conn = sqlite3.connect(str(output))
+    n = conn.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0]
+    conn.close()
+    assert n >= 6, f"Expected >=6 QML styles in layer_styles, found {n}"
