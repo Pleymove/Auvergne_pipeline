@@ -5,7 +5,7 @@ Business rules (Pierre, 05/05/2026):
   - Default capacity: 5 prises.  Max: 10 prises (2 micro-modules).
   - Placement: nearest point on public infrastructure to the farthest BAT
     in the cluster (minimises max D3).
-  -alen PB is fictitious — for debug only, may be stripped for the client.
+  - Each PB is fictitious — for debug only, may be stripped for the client.
 """
 
 from __future__ import annotations
@@ -188,16 +188,11 @@ def build_pb_fictifs(
             continue
 
         # ── Cluster BATs by 100 m proximity ──────────────────────────
-        bat_pts = [b.geometry for b in (bats_in_zapa.itertuples(index=False)
-                  if hasattr(bats_in_zapa, 'itertuples') else bats_in_zapa.iterrows())]
-        # Actually, let's use iterrows for consistency
-        bat_indices: List[int] = []
         _pts: List[Point] = []
         _w: List[float] = []
-        for idx, bat in bats_in_zapa.iterrows():
+        for _, bat in bats_in_zapa.iterrows():
             _pts.append(bat.geometry)
             _w.append(_prise_weight(bat))
-            bat_indices.append(idx)  # keep the label
 
         clusters = _spatial_clusters(_pts, CLUSTER_EPS_M)
 
