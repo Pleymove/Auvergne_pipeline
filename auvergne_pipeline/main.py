@@ -204,16 +204,36 @@ def run_for_sro(
             layers["bal"], pa_all, zapa_all, combined_edges, flag_collector
         )
 
-        # 9. Routing PA→PB on combined graph
+        # 9. Routing PA→PB on combined graph (for GC neuf C0 edges only)
         routed_infra = routing.route_pa_to_pb(
             pa_all, pb_gdf, reusable, ign_roads, flag_collector
         )
 
-        # Merge GC neuf into the routed infra
+        # Compose final livrable_infra: reusable existant + GC neuf C0
+        livrable_infra_parts = []
+        if reusable is not None and not reusable.empty:
+            livrable_infra_parts.append(reusable.copy())
         if gc_neuf is not None and not gc_neuf.empty:
-            routed_infra = gpd.GeoDataFrame(
-                pd.concat([routed_infra, gc_neuf], ignore_index=True),
+            livrable_infra_parts.append(gc_neuf.copy())
+        if routed_infra is not None and not routed_infra.empty:
+            # Keep only C0 edges from routing (new GC neuf)
+            if "mode_pose" in routed_infra.columns:
+                new_only = routed_infra[
+                    routed_infra["mode_pose"].astype(str).str.upper() == "C0"
+                ]
+            else:
+                new_only = gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
+            if not new_only.empty:
+                livrable_infra_parts.append(new_only)
+
+        if livrable_infra_parts:
+            livrable_infra_full = gpd.GeoDataFrame(
+                pd.concat(livrable_infra_parts, ignore_index=True),
                 geometry="geometry", crs=config.PROJECT_CRS,
+            )
+        else:
+            livrable_infra_full = gpd.GeoDataFrame(
+                geometry=[], crs=config.PROJECT_CRS,
             )
 
         # 10. Writer
@@ -224,8 +244,9 @@ def run_for_sro(
             georeso_zapa_existantes=layers["georeso_zapa"],
             new_pas=new_pas, new_zapas=new_zapas,
             pb_fictifs=pb_gdf,
-            livrable_infra=routed_infra,
+            livrable_infra=livrable_infra_full,
             parcelles=parcelles_class,
+            za_sro=layers.get("za_sro"),
             flag_collector=flag_collector,
         )
 
@@ -251,6 +272,7 @@ def run_for_sros(
                  s.get("auto_ok", 0), s["bal"], s.get("orphan_bats", 0), s.get("new_pa", 0))
     if output_gpkg is not None and output_gpkg.exists():
         log.info("[OK] GPKG output : %s", output_gpkg.resolve())
+        writer.apply_qml_styles_to_gpkg(output_gpkg)
     for code, err in failures:
         log.warning("[!] %s : %s", code, err)
     return summaries

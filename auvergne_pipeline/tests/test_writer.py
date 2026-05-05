@@ -1,7 +1,8 @@
-"""Tests for writer.write_sro_outputs — PR #14 (8 couches)."""
+"""Tests for writer.write_sro_outputs — PR #14 (8 couches) expanded PR #19 (10)."""
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -47,7 +48,19 @@ def _parcelles(): return gpd.GeoDataFrame(pd.DataFrame({
 }), geometry="geometry", crs=config.PROJECT_CRS)
 
 
-def test_writes_8_layers():
+def _za_sro(): return gpd.GeoDataFrame(pd.DataFrame({
+    "nom_nro": ["SRO_TEST"],
+    "geometry": [Polygon([(-10, -10), (20, -10), (20, 20), (-10, 20)])],
+}), geometry="geometry", crs=config.PROJECT_CRS)
+
+
+# ---------------------------------------------------------------------------
+# Core tests
+# ---------------------------------------------------------------------------
+
+
+def test_writes_10_layers():
+    """PR #19: 8 → 10 layers (+ livrable_zasro, livrable_sro)."""
     fc = flags_mod.FlagCollector("test")
     fc.add("TEST_FLAG")
     with tempfile.TemporaryDirectory() as td:
@@ -56,11 +69,13 @@ def test_writes_8_layers():
             "test", out, bal=_bal(), georeso_pa_existants=_pa(),
             georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
             pb_fictifs=_pb(), livrable_infra=_infra(),
-            parcelles=_parcelles(), flag_collector=fc,
+            parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
         )
-        assert set(counts.keys()) == {"livrable_pa", "livrable_zapa", "livrable_bat",
-                                       "livrable_infra", "livrable_pb", "livrable_parcelles",
-                                       "livrable_flags"}
+        assert set(counts.keys()) == {
+            "livrable_pa", "livrable_zapa", "livrable_bat",
+            "livrable_infra", "livrable_pb", "livrable_parcelles",
+            "livrable_flags", "livrable_zasro", "livrable_sro",
+        }
 
 
 def test_append_mode():
@@ -70,11 +85,11 @@ def test_append_mode():
         writer.write_sro_outputs("S1", out, bal=_bal(), georeso_pa_existants=_pa(),
                                  georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
                                  pb_fictifs=_pb(), livrable_infra=_infra(),
-                                 parcelles=_parcelles(), flag_collector=fc)
+                                 parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc)
         writer.write_sro_outputs("S2", out, bal=_bal(), georeso_pa_existants=_pa(),
                                  georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
                                  pb_fictifs=_pb(), livrable_infra=_infra(),
-                                 parcelles=_parcelles(), flag_collector=fc)
+                                 parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc)
         bat = gpd.read_file(out, layer="livrable_bat")
         assert len(bat) == 4  # 2×2
 
@@ -88,7 +103,48 @@ def test_parcelles_has_all():
         writer.write_sro_outputs("t", out, bal=_bal(), georeso_pa_existants=_pa(),
                                  georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
                                  pb_fictifs=_pb(), livrable_infra=_infra(),
-                                 parcelles=parc, flag_collector=fc)
+                                 parcelles=parc, za_sro=_za_sro(), flag_collector=fc)
         p = gpd.read_file(out, layer="livrable_parcelles")
         assert len(p) == 2
         assert set(p["is_public"]) == {True, False}
+
+
+# ---------------------------------------------------------------------------
+# PR #19 regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_livrable_zasro_and_sro_present():
+    """PR #19 Bug #2: le GPKG doit avoir livrable_zasro et livrable_sro."""
+    fc = flags_mod.FlagCollector("t")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "t.gpkg"
+        writer.write_sro_outputs(
+            "t", out, bal=_bal(), georeso_pa_existants=_pa(),
+            georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
+            pb_fictifs=_pb(), livrable_infra=_infra(),
+            parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
+        )
+        # Use pyogrio (geopandas backend) to list layers
+        from pyogrio import list_layers
+        names = list(list_layers(str(out))[:, 0])
+        assert "livrable_zasro" in names
+        assert "livrable_sro" in names
+
+
+def test_layer_styles_table_filled():
+    """PR #19 Bug #3: layer_styles doit avoir >=6 entrées après apply_qml."""
+    fc = flags_mod.FlagCollector("t")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "t.gpkg"
+        writer.write_sro_outputs(
+            "t", out, bal=_bal(), georeso_pa_existants=_pa(),
+            georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
+            pb_fictifs=_pb(), livrable_infra=_infra(),
+            parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
+        )
+        writer.apply_qml_styles_to_gpkg(out)
+        conn = sqlite3.connect(str(out))
+        n = conn.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0]
+        conn.close()
+        assert n >= 6, f"Attendu >=6 styles, trouve {n}"

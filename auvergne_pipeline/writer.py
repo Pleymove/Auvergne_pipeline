@@ -31,6 +31,20 @@ LAYER_INFRA = "livrable_infra"
 LAYER_PB = "livrable_pb"
 LAYER_PARCELLES = "livrable_parcelles"
 LAYER_FLAGS = "livrable_flags"
+LAYER_ZASRO = "livrable_zasro"
+LAYER_SRO = "livrable_sro"
+
+# QML styles directory (official Pierre from Notion "QML Auvergne")
+QML_DIR = Path(__file__).parent / "qml" / "officiel"
+
+QML_MAPPING = {
+    LAYER_PA: "livrable_pa_style.qml",
+    LAYER_INFRA: "livrable_infra_style.qml",
+    LAYER_ZAPA: "livrable_zapa_style.qml",
+    LAYER_BAT: "bal_style.qml",
+    LAYER_PARCELLES: "parcelle_style.qml",
+    LAYER_ZASRO: "za_sro_style.qml",
+}
 
 
 def _ensure_layer_exists(
@@ -61,6 +75,7 @@ def write_sro_outputs(
     pb_fictifs: gpd.GeoDataFrame,
     livrable_infra: gpd.GeoDataFrame,
     parcelles: gpd.GeoDataFrame,  # ALL parcels with is_public column
+    za_sro: gpd.GeoDataFrame | None = None,  # Polygon ZASRO for the SRO
     flag_collector,  # : flags_mod.FlagCollector
     crs: str = config.PROJECT_CRS,
 ) -> Dict[str, int]:
@@ -147,7 +162,29 @@ def write_sro_outputs(
         _ensure_layer_exists(parc_out, output_gpkg, LAYER_PARCELLES, crs)
         counts[LAYER_PARCELLES] = len(parc_out)
 
-    # ---- 7. livrable_flags (non-spatial table) ──────────────────────
+    # ---- 7. livrable_zasro (Polygon, 1 ligne par SRO) ──────────────
+    if za_sro is not None and not za_sro.empty:
+        zasro_out = za_sro.copy()
+        if "sro_code" not in zasro_out.columns:
+            zasro_out["sro_code"] = sro_code
+        _ensure_layer_exists(zasro_out, output_gpkg, LAYER_ZASRO, crs)
+        counts[LAYER_ZASRO] = len(zasro_out)
+
+    # ---- 7bis. livrable_sro (Point, 1 ligne par SRO) ───────────────
+    # representative_point = toujours dans le polygone, robuste aux ZASRO
+    # non-convexes (meilleur que centroid).
+    if za_sro is not None and not za_sro.empty:
+        sro_pt_geom = za_sro.geometry.iloc[0].representative_point()
+        sro_attrs = {
+            "sro_code": sro_code,
+            "nom_nro": za_sro.iloc[0].get("nom_nro", ""),
+            "geometry": sro_pt_geom,
+        }
+        sro_gdf = gpd.GeoDataFrame([sro_attrs], geometry="geometry", crs=crs)
+        _ensure_layer_exists(sro_gdf, output_gpkg, LAYER_SRO, crs)
+        counts[LAYER_SRO] = 1
+
+    # ---- 8. livrable_flags (non-spatial table) ──────────────────────
     flags_df = flag_collector.to_dataframe()
     if not flags_df.empty:
         flags_df["sro_code"] = sro_code
@@ -161,11 +198,75 @@ def write_sro_outputs(
 
     # ---- log recap ----------------------------------------------------
     log.info(
-        "[INFO] %s writer : pa=%d zapa=%d bat=%d infra=%d pb=%d parcelles=%d flags=%d",
+        "[INFO] %s writer : pa=%d zapa=%d bat=%d infra=%d pb=%d parcelles=%d zasro=%d sro=%d flags=%d",
         sro_code,
         counts.get(LAYER_PA, 0), counts.get(LAYER_ZAPA, 0),
         counts.get(LAYER_BAT, 0), counts.get(LAYER_INFRA, 0),
         counts.get(LAYER_PB, 0), counts.get(LAYER_PARCELLES, 0),
+        counts.get(LAYER_ZASRO, 0), counts.get(LAYER_SRO, 0),
         counts.get(LAYER_FLAGS, 0),
     )
     return counts
+
+
+# ---------------------------------------------------------------------------
+# QML style injection into GPKG layer_styles table
+# ---------------------------------------------------------------------------
+
+
+def apply_qml_styles_to_gpkg(gpkg_path: Path) -> None:
+    """Inject QML styles into the layer_styles table of the GPKG.
+
+    QGIS reads this table on layer open and applies the style automatically.
+    Schema: https://docs.qgis.org/latest/en/docs/user_manual/managing_data_source\
+/create_layers.html#geopackage-styles
+    """
+    conn = sqlite3.connect(str(gpkg_path))
+    cur = conn.cursor()
+    # Create layer_styles table if missing (QGIS schema)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS layer_styles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            f_table_catalog TEXT,
+            f_table_schema TEXT,
+            f_table_name TEXT,
+            f_geometry_column TEXT,
+            styleName TEXT,
+            styleQML TEXT,
+            styleSLD TEXT,
+            useAsDefault BOOLEAN,
+            description TEXT,
+            owner TEXT,
+            ui TEXT,
+            update_time DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    applied = 0
+    for layer_name, qml_filename in QML_MAPPING.items():
+        qml_path = QML_DIR / qml_filename
+        if not qml_path.exists():
+            log.warning(
+                "[QML] Fichier introuvable: %s — style non applique", qml_path
+            )
+            continue
+        qml_content = qml_path.read_text(encoding="utf-8")
+        # Upsert: remove previous style for this layer if present
+        # (idempotent — safe to call multiple times / multi-SRO runs)
+        cur.execute(
+            "DELETE FROM layer_styles WHERE f_table_name = ? AND styleName = ?",
+            (layer_name, layer_name + "_style"),
+        )
+        cur.execute(
+            """
+            INSERT INTO layer_styles
+              (f_table_name, f_geometry_column, styleName, styleQML, useAsDefault)
+            VALUES (?, 'geom', ?, ?, 1)
+            """,
+            (layer_name, layer_name + "_style", qml_content),
+        )
+        applied += 1
+    conn.commit()
+    conn.close()
+    log.info("[QML] %d styles officiels appliques au GPKG", applied)
