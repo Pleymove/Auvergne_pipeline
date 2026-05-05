@@ -303,6 +303,13 @@ class LauncherWindow(QMainWindow):
         self.thread = None
         self.worker = None
 
+    def closeEvent(self, event):
+        """Attendre proprement la fin du thread avant de fermer la fenetre."""
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait(2000)  # 2 s max
+        super().closeEvent(event)
+
 
 def main() -> int:
     app = QApplication(sys.argv)
