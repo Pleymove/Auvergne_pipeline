@@ -3,6 +3,7 @@
 Builds a NetworkX graph from the union of:
   - Filtered public infrastructure (``filters.build_reusable_infra``)
   - IGN BD TOPO routes (``ign_routes.load_ign_routes_for_sro``)
+  - GC neuf C0 edges (``pb_fictif.build_pb_fictifs``)
 
 Then snaps PA/PB endpoints onto the graph, runs Dijkstra for each
 (PA, PB) pair, and returns the traversed edges tagged with
@@ -20,7 +21,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from shapely.geometry import LineString, Point
-from shapely.ops import nearest_points, split, snap
+from shapely import STRtree
 
 from . import config
 
@@ -29,7 +30,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SNAP_TOLERANCE_M = 0.5
+SNAP_TOLERANCE_M = 50.0         # nearest-node lookup radius (PR #21: was 0.5)
+SNAP_PROJECTION_RADIUS_M = 200.0  # edge-projection fallback radius (PR #21)
 EDGE_KEY_SEP = "::"
 
 
@@ -46,7 +48,7 @@ def _explode_to_linestrings(geom):
 
 
 # ---------------------------------------------------------------------------
-# Helpers ────────────────────────────────────────────────────────────────
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _edge_key(u, v) -> str:
@@ -55,9 +57,11 @@ def _edge_key(u, v) -> str:
     return f"{a[0]:.6f},{a[1]:.6f}{EDGE_KEY_SEP}{b[0]:.6f},{b[1]:.6f}"
 
 
-def _point_key(pt: Point) -> tuple[float, float]:
-    """Rounded coordinate key for a node."""
-    return (round(pt.x, 6), round(pt.y, 6))
+def _point_key(pt) -> tuple[float, float]:
+    """Rounded coordinate key for a node (accepts Point or (x,y) tuple)."""
+    if isinstance(pt, Point):
+        return (round(pt.x, 6), round(pt.y, 6))
+    return (round(pt[0], 6), round(pt[1], 6))
 
 
 def _build_graph(
@@ -79,8 +83,8 @@ def _build_graph(
                     b = coords[i + 1]
                     length = Point(a).distance(Point(b))
                     G.add_edge(
-                        _point_key(Point(a)),
-                        _point_key(Point(b)),
+                        _point_key(a),
+                        _point_key(b),
                         length=length,
                         **attrs,
                         **{k: row.get(k) for k in ("statut", "mode_pose", "src", "sro_code")
@@ -97,106 +101,70 @@ def _build_graph(
     return G
 
 
-def _snap_to_graph(
-    pt: Point,
-    G: nx.Graph,
-    snap_tol: float = SNAP_TOLERANCE_M,
-) -> Optional[tuple[float, float]]:
-    """Snap a point to the nearest graph node within tolerance.
-
-    If no node is within tolerance, project onto the nearest edge, split it,
-    and return the coords of the new intermediate node.
-    """
-    # 1) Exact node lookup
-    pk = _point_key(pt)
-    if pk in G:
-        return pk
-
-    # 2) Nearest node within tolerance
-    nodes = np.array([(x, y) for x, y in G.nodes()])
-    if len(nodes) == 0:
-        return None
-
-    dists = np.linalg.norm(nodes - np.array([[pt.x, pt.y]]), axis=1)
-    i_min = int(dists.argmin())
-    if dists[i_min] <= snap_tol:
-        return (float(nodes[i_min, 0]), float(nodes[i_min, 1]))
-
-    # 3) Project onto nearest edge
-    best_edge = None
-    best_param = 0.0
-    best_dist = float("inf")
-
-    for u, v, data in G.edges(data=True):
-        ux, uy = u
-        vx, vy = v
-        dx, dy = vx - ux, vy - uy
-        edge_len_sq = dx * dx + dy * dy
-        if edge_len_sq < 1e-18:
-            # degenerate — skip
-            proj_x, proj_y = ux, uy
-        else:
-            t = max(0.0, min(1.0, ((pt.x - ux) * dx + (pt.y - uy) * dy) / edge_len_sq))
-            proj_x, proj_y = ux + t * dx, uy + t * dy
-
-        d = Point(pt.x, pt.y).distance(Point(proj_x, proj_y))
-        if d < best_dist:
-            best_dist = d
-            best_edge = (u, v, data)
-            best_param = (
-                Point(proj_x, proj_y).distance(Point(u[0], u[1]))
-                / math.sqrt(edge_len_sq)
-                if edge_len_sq > 1e-18
-                else 0.0
-            )
-
-    if best_edge is None or best_dist > snap_tol * 100:
-        return None
-
-    # Split the edge at the projected point
-    u, v, data = best_edge
-    new_key = _point_key(Point(pt.x, pt.y))
-
-    # Remove old edge, add two new ones
-    G.remove_edge(u, v)
-    d1 = Point(u[0], u[1]).distance(pt)
-    d2 = Point(v[0], v[1]).distance(pt)
-    total = d1 + d2 or 1.0
-    G.add_edge(u, new_key, length=d1, **{k: data[k] for k in data if k != "length"})
-    G.add_edge(new_key, v, length=d2, **{k: data[k] for k in data if k != "length"})
-
-    return new_key
-
-
 # ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+
 
 def _add_gc_neuf_to_graph(
-    G: nx.Graph, gc_neuf: gpd.GeoDataFrame
+    G: nx.Graph,
+    gc_neuf: gpd.GeoDataFrame,
+    snap_tol: float = SNAP_TOLERANCE_M,
 ) -> None:
-    """Add GC neuf C0 edges into an existing NetworkX graph.
+    """Add GC neuf C0 edges into graph, snapping endpoints to nearest nodes.
 
-    Edges are tagged ``statut=None``, ``mode_pose='C0'``, ``src='gc_neuf'``.
+    PR #21: endpoints are snapped to existing graph nodes first so that
+    Dijkstra can traverse through GC neuf segments. If no node within
+    snap_tol, the raw _point_key is added as a new isolated node.
     """
+    if gc_neuf is None or gc_neuf.empty:
+        return
+
+    # Quick node lookup
+    node_coords = np.array([(x, y) for x, y in G.nodes()])
+    has_nodes = len(node_coords) > 0
+
+    def _snap_endpoint(coord) -> tuple[float, float]:
+        pk = _point_key(coord)
+        if pk in G:
+            return pk
+        if has_nodes:
+            dists = np.linalg.norm(node_coords - np.array([[coord[0], coord[1]]]), axis=1)
+            i_min = int(dists.argmin())
+            if dists[i_min] <= snap_tol:
+                return _point_key(node_coords[i_min])
+        return pk
+
     for _, row in gc_neuf.iterrows():
-        coords = list(row.geometry.coords)
+        line = row.geometry
+        if line is None or line.is_empty:
+            continue
+        coords = list(line.coords)
         if len(coords) < 2:
             continue
-        pk_a = _point_key(Point(coords[0]))
-        pk_b = _point_key(Point(coords[-1]))
+
+        pk_a = _snap_endpoint(coords[0])
+        pk_b = _snap_endpoint(coords[-1])
+
+        # Ensure both endpoints exist as nodes in G
+        if pk_a not in G:
+            G.add_node(pk_a)
+        if pk_b not in G:
+            G.add_node(pk_b)
+
         attrs = {
-            "length": Point(coords[0]).distance(Point(coords[-1])),
+            "length": Point(pk_a[0], pk_a[1]).distance(Point(pk_b[0], pk_b[1])),
             "type": "gc_neuf",
             "statut": None,
             "mode_pose": "C0",
             "src": "gc_neuf",
         }
-        # Keep any extra columns that the caller passed along
         for col in ("sro_code", "pa_id", "pb_id"):
             if col in gc_neuf.columns:
                 attrs[col] = row.get(col)
         G.add_edge(pk_a, pk_b, **attrs)
+
+
+# ---------------------------------------------------------------------------
+
 
 def route_pa_to_pb(
     pa_sro: gpd.GeoDataFrame,
@@ -219,22 +187,90 @@ def route_pa_to_pb(
 
     # Build combined graph
     G = _build_graph(infra_filtered, ign_routes, snap_tol=SNAP_TOLERANCE_M)
-    # Inject GC neuf C0 edges into the routing graph
+
+    # Inject GC neuf C0 edges (snaps endpoints to existing nodes first)
     if gc_neuf is not None and not gc_neuf.empty:
-        _add_gc_neuf_to_graph(G, gc_neuf)
+        _add_gc_neuf_to_graph(G, gc_neuf, snap_tol=SNAP_TOLERANCE_M)
+
     if G.number_of_nodes() == 0:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     edges_out: List[dict] = []
 
-    # ── For each SRO, route all PA → PB ──────────────────────────────
+    # Build STRtree indices for fast PA/PB snapping (PR #21)
+    node_tree = None
+    edge_tree = None
+    nodes_list = list(G.nodes())
+    node_coords_to_geom = {n: Point(n[0], n[1]) for n in nodes_list}
+    node_geoms = [node_coords_to_geom[n] for n in nodes_list]
+    if node_geoms:
+        node_tree = STRtree(node_geoms)
+
+    # Build edge list + STRtree for edge projection
+    edge_list: list[tuple] = []
+    edge_geoms: list = []
+    for u, v, data in G.edges(data=True):
+        line = LineString([(u[0], u[1]), (v[0], v[1])])
+        edge_list.append((u, v, data))
+        edge_geoms.append(line)
+    if edge_geoms:
+        edge_tree = STRtree(edge_geoms)
+
+    def _snap(_pt: Point) -> Optional[tuple[float, float]]:
+        # 0) Exact key
+        pk = _point_key(_pt)
+        if pk in G:
+            return pk
+
+        # 1) Nearest node
+        if node_tree is not None:
+            buf = _pt.buffer(SNAP_TOLERANCE_M)
+            candidates = node_tree.query(buf)
+            best_n, best_d = None, SNAP_TOLERANCE_M
+            for idx in candidates:
+                n = nodes_list[idx]
+                d = _pt.distance(Point(n[0], n[1]))
+                if d < best_d:
+                    best_d, best_n = d, n
+            if best_n is not None:
+                return best_n
+
+        # 2) Project onto edge
+        if edge_tree is not None and edge_list:
+            buf = _pt.buffer(SNAP_PROJECTION_RADIUS_M)
+            candidates = edge_tree.query(buf)
+            best_e, best_d, best_proj = None, SNAP_PROJECTION_RADIUS_M, None
+            for idx in candidates:
+                u, v, edata = edge_list[idx]
+                line = LineString([(u[0], u[1]), (v[0], v[1])])
+                proj = line.interpolate(line.project(_pt))
+                d = _pt.distance(proj)
+                if d < best_d:
+                    best_d, best_e, best_proj = d, (u, v, edata), proj
+            if best_proj is not None:
+                u, v, edata = best_e
+                new_key = _point_key(best_proj)
+                # Check edge still exists (may have been split by earlier snap)
+                if new_key not in G and G.has_edge(u, v):
+                    G.remove_edge(u, v)
+                    d1 = Point(u[0], u[1]).distance(best_proj)
+                    d2 = Point(v[0], v[1]).distance(best_proj)
+                    G.add_edge(u, new_key, length=d1,
+                               **{k: edata[k] for k in edata if k != "length"})
+                    G.add_edge(new_key, v, length=d2,
+                               **{k: edata[k] for k in edata if k != "length"})
+                if new_key in G:
+                    return new_key
+
+        return None
+
+    # ── For each PA, route all PA → PB ──────────────────────────────
     for _, pa in pa_sro.iterrows():
         pa_id = pa.get("id_metier", f"pa#{pa.name}")
         sro = pa.get("sro", "?")
         pa_geom = pa.geometry
 
-        # Snap PA to graph
-        pa_node = _snap_to_graph(pa_geom, G)
+        pa_node = _snap(pa_geom)
         if pa_node is None:
             if flag_collector is not None:
                 flag_collector.add(
@@ -244,7 +280,6 @@ def route_pa_to_pb(
                 )
             continue
 
-        # PBs for this PA
         pb4pa = pb_sro[pb_sro.get("pa_id", pd.Series(dtype=str)) == pa_id]
         if pb4pa.empty:
             continue
@@ -253,7 +288,7 @@ def route_pa_to_pb(
             pb_id = pb.get("pb_id", f"pb#{pb.name}")
             pb_geom = pb.geometry
 
-            pb_node = _snap_to_graph(pb_geom, G)
+            pb_node = _snap(pb_geom)
             if pb_node is None:
                 if flag_collector is not None:
                     flag_collector.add(

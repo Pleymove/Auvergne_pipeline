@@ -176,7 +176,7 @@ def test_livrable_bal_not_bat():
 
 
 def test_qml_sidecars_written():
-    """PR #20 Bug #1: .qml sidecars written alongside GPKG."""
+    """PR #21: write_qml_sidecars is deprecated — returns 0, no sidecars."""
     fc = flags_mod.FlagCollector("t")
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "test_output.gpkg"
@@ -187,9 +187,4 @@ def test_qml_sidecars_written():
             parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
         )
         n = writer.write_qml_sidecars(out)
-        assert n >= 6, f"Expected >=6 sidecars, got {n}"
-        # Verify files exist
-        for layer_name in ("livrable_pa", "livrable_infra", "livrable_zapa",
-                           "livrable_bal", "livrable_parcelles", "livrable_zasro"):
-            sidecar = Path(td) / f"test_output_{layer_name}.qml"
-            assert sidecar.exists(), f"Missing sidecar: {sidecar.name}"
+        assert n == 0, "Deprecated sidecars should return 0"

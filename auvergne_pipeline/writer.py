@@ -277,29 +277,15 @@ def apply_qml_styles_to_gpkg(gpkg_path: Path) -> None:
 
 
 def write_qml_sidecars(gpkg_path: Path) -> int:
-    """Copy each official QML to a sidecar file alongside the GPKG.
+    """DEPRECATED (PR #21) — sidecars .qml ne fonctionnent pas pour GPKG multi-layer.
 
-    Uses QGIS naming convention for automatic style loading:
-    ``<gpkg_basename>_<layer_name>.qml``
-
-    Example: ``output/auvergne_outputs_livrable_pa.qml``
+    La convention QGIS <gpkg>_<layer>.qml ne s'applique qu'aux Shapefiles.
+    Pour un GPKG multi-couches, utiliser :
+    1. La table interne layer_styles avec useAsDefault=1
+    2. Un projet .qgz (``write_qgis_project``) qui charge toutes les couches
     """
-    import shutil
-
-    output_dir = gpkg_path.parent
-    gpkg_basename = gpkg_path.stem
-    count = 0
-    for layer_name, qml_filename in QML_MAPPING.items():
-        src = QML_DIR / qml_filename
-        if not src.exists():
-            log.warning("[QML sidecar] Fichier introuvable: %s", src)
-            continue
-        dst = output_dir / f"{gpkg_basename}_{layer_name}.qml"
-        shutil.copy2(src, dst)
-        count += 1
-    if count:
-        log.info("[QML] %d sidecars .qml ecrits a cote du GPKG", count)
-    return count
+    log.debug("[QML sidecar] Deprecated — sidecars inutiles sur GPKG, utiliser .qgz")
+    return 0
 
 
 # ---------------------------------------------------------------------------
