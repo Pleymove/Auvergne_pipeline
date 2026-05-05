@@ -32,7 +32,16 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SNAP_TOLERANCE_M = 50.0         # nearest-node lookup radius (PR #21: was 0.5)
 SNAP_PROJECTION_RADIUS_M = 200.0  # edge-projection fallback radius (PR #21)
+WELD_RADIUS_M = 2.0             # node fusion radius for topology welding (PR #22)
 EDGE_KEY_SEP = "::"
+
+# Lazy import: scikit-learn is available in QGIS embedded Python
+try:
+    from sklearn.cluster import DBSCAN
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+    log.warning("[ROUTING] sklearn indisponible — welding desactive")
 
 
 def _explode_to_linestrings(geom):
@@ -62,6 +71,65 @@ def _point_key(pt) -> tuple[float, float]:
     if isinstance(pt, Point):
         return (round(pt.x, 6), round(pt.y, 6))
     return (round(pt[0], 6), round(pt[1], 6))
+
+
+# ---------------------------------------------------------------------------
+# Topology welding (PR #22)
+# ---------------------------------------------------------------------------
+
+
+def _weld_close_nodes(
+    G: nx.Graph, weld_radius_m: float = WELD_RADIUS_M
+) -> nx.Graph:
+    """Fuse nodes within ``weld_radius_m`` via DBSCAN spatial clustering.
+
+    ATHD / BT / FT / cheminement edges sit at cm-level offsets from each
+    other and from IGN routes, producing a graph of N disconnected islands.
+    Welding merges close endpoints into a single node, reconnecting the
+    graph so Dijkstra can find paths across all infrastructure layers.
+    """
+    if G.number_of_nodes() < 2:
+        return G
+
+    nodes = list(G.nodes())
+    coords = np.array(nodes, dtype=float)
+
+    if _HAS_SKLEARN:
+        db = DBSCAN(eps=weld_radius_m, min_samples=1).fit(coords)
+        labels = db.labels_
+    else:
+        return G  # fallback: identity
+
+    # Representative coord per cluster (centroid, rounded)
+    cluster_to_rep: dict[int, tuple[float, float]] = {}
+    for label in set(labels):
+        members = coords[labels == label]
+        cx, cy = members.mean(axis=0)
+        cluster_to_rep[label] = (round(float(cx), 6), round(float(cy), 6))
+
+    node_to_rep = {nodes[i]: cluster_to_rep[labels[i]] for i in range(len(nodes))}
+
+    # Rebuild graph with fused nodes
+    G_welded = nx.Graph()
+    for u, v, data in G.edges(data=True):
+        ru, rv = node_to_rep[u], node_to_rep[v]
+        if ru == rv:
+            continue  # self-loop after welding — skip
+        if G_welded.has_edge(ru, rv):
+            if data.get("length", 0) < G_welded[ru][rv].get("length", float("inf")):
+                G_welded[ru][rv].update(data)
+        else:
+            G_welded.add_edge(ru, rv, **data)
+
+    n_before = G.number_of_nodes()
+    n_after = G_welded.number_of_nodes()
+    n_cc_before = nx.number_connected_components(G)
+    n_cc_after = nx.number_connected_components(G_welded)
+    log.info(
+        "[WELD] %d -> %d noeuds (-%d), %d -> %d composantes connexes",
+        n_before, n_after, n_before - n_after, n_cc_before, n_cc_after,
+    )
+    return G_welded
 
 
 def _build_graph(
@@ -97,7 +165,9 @@ def _build_graph(
     if G.number_of_nodes() == 0:
         log.warning("[ROUTING] Graphe vide — pas d'aretes ni infra ni IGN")
 
-    log.info("[ROUTING] Graphe: %d noeuds, %d aretes", G.number_of_nodes(), G.number_of_edges())
+    log.info("[ROUTING] Graphe brut: %d noeuds, %d aretes", G.number_of_nodes(), G.number_of_edges())
+    G = _weld_close_nodes(G, weld_radius_m=WELD_RADIUS_M)
+    log.info("[ROUTING] Graphe welded: %d noeuds, %d aretes", G.number_of_nodes(), G.number_of_edges())
     return G
 
 
@@ -166,6 +236,49 @@ def _add_gc_neuf_to_graph(
 # ---------------------------------------------------------------------------
 
 
+def _bridge_components_with_gc_neuf(
+    G: nx.Graph,
+    pa_node: tuple[float, float],
+    pb_node: tuple[float, float],
+    flag_collector=None,
+) -> bool:
+    """If pa_node and pb_node belong to different connected components,
+    add a direct GC neuf C0 edge between them and return True.
+
+    PR #22: in rural areas the welded graph may still be disconnected.
+    Bridging ensures Dijkstra can find a path (straight line in last resort).
+    """
+    try:
+        cc_pa = nx.node_connected_component(G, pa_node)
+        if pb_node in cc_pa:
+            return False
+    except (nx.NetworkXError, KeyError):
+        # One or both nodes not in G
+        return False
+
+    direct_length = Point(pa_node[0], pa_node[1]).distance(
+        Point(pb_node[0], pb_node[1])
+    )
+    G.add_edge(
+        pa_node, pb_node,
+        length=direct_length,
+        type="gc_neuf",
+        statut=None,
+        mode_pose="C0",
+        src="gc_neuf_runtime",
+    )
+    if flag_collector is not None:
+        flag_collector.add(
+            "GC_NEUF_GENERE_DIJKSTRA",
+            target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
+            message=f"Pont GC neuf C0 ligne droite, length={direct_length:.0f}m",
+        )
+    return True
+
+
+# ---------------------------------------------------------------------------
+
+
 def route_pa_to_pb(
     pa_sro: gpd.GeoDataFrame,
     pb_sro: gpd.GeoDataFrame,
@@ -194,6 +307,15 @@ def route_pa_to_pb(
 
     if G.number_of_nodes() == 0:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
+
+    # Spec C (PR #22): diagnostic on connected components
+    n_cc = nx.number_connected_components(G)
+    if n_cc > 0:
+        largest_cc = max(nx.connected_components(G), key=len)
+        log.info(
+            "[ROUTING] %d composantes connexes (plus grande = %d noeuds / %d total)",
+            n_cc, len(largest_cc), G.number_of_nodes(),
+        )
 
     edges_out: List[dict] = []
 
@@ -302,13 +424,29 @@ def route_pa_to_pb(
             try:
                 path = nx.shortest_path(G, source=pa_node, target=pb_node, weight="length")
             except nx.NetworkXNoPath:
-                if flag_collector is not None:
-                    flag_collector.add(
-                        "PA_PB_DECONNECTES",
-                        target_url=pa_id,
-                        message=f"Pas de chemin vers {pb_id}",
-                    )
-                continue
+                # Spec B (PR #22): bridge components with GC neuf C0
+                bridged = _bridge_components_with_gc_neuf(
+                    G, pa_node, pb_node, flag_collector=flag_collector
+                )
+                if bridged:
+                    try:
+                        path = nx.shortest_path(G, source=pa_node, target=pb_node, weight="length")
+                    except nx.NetworkXNoPath:
+                        if flag_collector is not None:
+                            flag_collector.add(
+                                "PA_PB_DECONNECTES",
+                                target_url=pa_id,
+                                message=f"Pas de chemin vers {pb_id} meme apres pont GC neuf",
+                            )
+                        continue
+                else:
+                    if flag_collector is not None:
+                        flag_collector.add(
+                            "PA_PB_DECONNECTES",
+                            target_url=pa_id,
+                            message=f"Pas de chemin vers {pb_id}",
+                        )
+                    continue
 
             # Collect edges along the path
             for i in range(len(path) - 1):
