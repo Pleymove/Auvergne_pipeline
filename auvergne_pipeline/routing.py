@@ -12,6 +12,7 @@ Then snaps PA/PB endpoints onto the graph, runs Dijkstra for each
 from __future__ import annotations
 
 import logging
+import math
 from typing import List, Optional
 
 import geopandas as gpd
@@ -183,8 +184,6 @@ def route_pa_to_pb(
     Returns a GeoDataFrame of LineStrings with columns:
     ``sro``, ``pa_id``, ``pb_id``, ``statut``, ``mode_pose``, ``src``, ``length_m``.
     """
-    import math
-
     if pa_sro is None or pa_sro.empty or pb_sro is None or pb_sro.empty:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
