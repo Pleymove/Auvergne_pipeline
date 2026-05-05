@@ -113,7 +113,12 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
 
     orphan_bats = orphans.detect_orphans(layers["bal"], layers["georeso_zapa"])
     new_pas, new_zapas = orphans.create_pa_for_orphans(
-        orphan_bats, sro_code, flag_collector=flag_collector
+        orphan_bats,
+        sro_code,
+        cheminement_lines=layers.get(config.LAYER_CHEMINEMENT),
+        athd_lines=layers.get(config.LAYER_ATHD),
+        parcelles_classifiees=parcelles_class,
+        flag_collector=flag_collector,
     )
     summary.update(
         {"orphan_bats": len(orphan_bats), "new_pa": len(new_pas), "new_zapa": len(new_zapas)}
