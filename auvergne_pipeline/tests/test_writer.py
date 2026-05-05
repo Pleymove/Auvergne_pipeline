@@ -72,7 +72,7 @@ def test_writes_10_layers():
             parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
         )
         assert set(counts.keys()) == {
-            "livrable_pa", "livrable_zapa", "livrable_bat",
+            "livrable_pa", "livrable_zapa", "livrable_bal",
             "livrable_infra", "livrable_pb", "livrable_parcelles",
             "livrable_flags", "livrable_zasro", "livrable_sro",
         }
@@ -90,8 +90,8 @@ def test_append_mode():
                                  georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
                                  pb_fictifs=_pb(), livrable_infra=_infra(),
                                  parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc)
-        bat = gpd.read_file(out, layer="livrable_bat")
-        assert len(bat) == 4  # 2×2
+        bal = gpd.read_file(out, layer="livrable_bal")
+        assert len(bal) == 4  # 2×2
 
 
 def test_parcelles_has_all():
@@ -148,3 +148,48 @@ def test_layer_styles_table_filled():
         n = conn.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0]
         conn.close()
         assert n >= 6, f"Attendu >=6 styles, trouve {n}"
+
+
+# ---------------------------------------------------------------------------
+# PR #20 regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_livrable_bal_not_bat():
+    """PR #20 Bug #3: livrable_bat must be livrable_bal."""
+    fc = flags_mod.FlagCollector("t")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "t.gpkg"
+        counts = writer.write_sro_outputs(
+            "t", out, bal=_bal(), georeso_pa_existants=_pa(),
+            georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
+            pb_fictifs=_pb(), livrable_infra=_infra(),
+            parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
+        )
+        assert "livrable_bal" in counts
+        assert "livrable_bat" not in counts
+        # Verify layer exists in GPKG
+        from pyogrio import list_layers
+        names = list(list_layers(str(out))[:, 0])
+        assert "livrable_bal" in names
+        assert "livrable_bat" not in names
+
+
+def test_qml_sidecars_written():
+    """PR #20 Bug #1: .qml sidecars written alongside GPKG."""
+    fc = flags_mod.FlagCollector("t")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "test_output.gpkg"
+        writer.write_sro_outputs(
+            "t", out, bal=_bal(), georeso_pa_existants=_pa(),
+            georeso_zapa_existantes=_zapa(), new_pas=[], new_zapas=[],
+            pb_fictifs=_pb(), livrable_infra=_infra(),
+            parcelles=_parcelles(), za_sro=_za_sro(), flag_collector=fc,
+        )
+        n = writer.write_qml_sidecars(out)
+        assert n >= 6, f"Expected >=6 sidecars, got {n}"
+        # Verify files exist
+        for layer_name in ("livrable_pa", "livrable_infra", "livrable_zapa",
+                           "livrable_bal", "livrable_parcelles", "livrable_zasro"):
+            sidecar = Path(td) / f"test_output_{layer_name}.qml"
+            assert sidecar.exists(), f"Missing sidecar: {sidecar.name}"
