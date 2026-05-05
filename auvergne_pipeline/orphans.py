@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 from shapely.geometry import MultiPoint, Point
 from shapely.ops import nearest_points
 
@@ -323,7 +324,6 @@ def _snap_to_public_parcel(
     radius_m: float = FALLBACK_PUBLIC_RADIUS_M,
 ) -> Tuple[Optional[Point], str]:
     """Fallback: snap to nearest point inside a public parcel."""
-    import pandas as pd
 
     if parcelles_classifiees is None or parcelles_classifiees.empty:
         return None, ""
@@ -392,8 +392,6 @@ def create_pa_for_orphans(
     """
     if orphan_bats is None or orphan_bats.empty:
         return [], []
-
-    import pandas as pd  # local import, always available
 
     prefix = _id_prefix(sro_code)
     pa_rows: List[dict] = []
