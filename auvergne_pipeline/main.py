@@ -1,7 +1,8 @@
 """CLI entry point for the Auvergne avant-vente pipeline.
 
 Iteration 2 wires loader + filters + parcelles + orphans + d3 + flags into
-``run_for_sro``. Iteration 3+ will plug routing / writer / reporter on top.
+``run_for_sro``.  PR #13 adds ``writer.write_sro_outputs`` so every SRO
+produces QGIS-ready GPKG layers.
 
 Usage examples (Windows, via run_pipeline.bat):
     run_pipeline.bat --sro 63149/M06/PMZ/42478
@@ -18,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+import geopandas as gpd
+
 from . import (
     config,
     filters,
@@ -25,6 +28,7 @@ from . import (
     loader,
     orphans,
     parcelles,
+    writer,
 )
 from . import d3 as d3_mod
 
@@ -39,11 +43,13 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
-    """Execute iteration-1 steps for one SRO and return a small summary dict.
+def run_for_sro(
+    gpkg_path: Path, sro_code: str, *, output_gpkg: Path | None = None
+) -> dict:
+    """Execute all pipeline steps for one SRO and return a summary dict.
 
-    The returned dict is intentionally lightweight (counts only) so it can be
-    aggregated for the CLI summary without keeping every GeoDataFrame around.
+    When *output_gpkg* is provided, ``writer.write_sro_outputs`` is called
+    at the end of the run to materialise the QGIS layers.
     """
     log.info("=== SRO %s ===", sro_code)
     layers = loader.load_sro(gpkg_path, sro_code)
@@ -74,7 +80,10 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
     log.info(
         "[INFO] %s reusable totals : athd=%d bt=%d ft=%d chem=%d -> total=%d",
         sro_code,
-        by_src["athd"], by_src["bt"], by_src["ft"], by_src["chem"],
+        by_src["athd"],
+        by_src["bt"],
+        by_src["ft"],
+        by_src["chem"],
         summary["reusable_total"],
     )
 
@@ -100,14 +109,20 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
     public_geom = parcelles.public_space_geometry(parcelles_class, dom_pub_hors)
 
     n_parc_total = len(parcelles_class)
-    n_pub = int(parcelles_class["public"].sum()) if "public" in parcelles_class.columns else 0
+    n_pub = (
+        int(parcelles_class["public"].sum())
+        if "public" in parcelles_class.columns
+        else 0
+    )
     n_priv = n_parc_total - n_pub
     summary.update({"parc_pub": n_pub, "parc_priv": n_priv})
     log.info(
         "[INFO] %s parcelles : public=%d (%.1f%%) prive=%d (%.1f%%) total=%d",
         sro_code,
-        n_pub, (100.0 * n_pub / n_parc_total) if n_parc_total else 0.0,
-        n_priv, (100.0 * n_priv / n_parc_total) if n_parc_total else 0.0,
+        n_pub,
+        (100.0 * n_pub / n_parc_total) if n_parc_total else 0.0,
+        n_priv,
+        (100.0 * n_priv / n_parc_total) if n_parc_total else 0.0,
         n_parc_total,
     )
 
@@ -121,11 +136,17 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
         flag_collector=flag_collector,
     )
     summary.update(
-        {"orphan_bats": len(orphan_bats), "new_pa": len(new_pas), "new_zapa": len(new_zapas)}
+        {
+            "orphan_bats": len(orphan_bats),
+            "new_pa": len(new_pas),
+            "new_zapa": len(new_zapas),
+        }
     )
     log.info(
         "[INFO] %s orphans : bat_orphelins=%d new_pa_created=%d",
-        sro_code, len(orphan_bats), len(new_pas),
+        sro_code,
+        len(orphan_bats),
+        len(new_pas),
     )
 
     sindex = reusable.sindex if not reusable.empty else None
@@ -165,9 +186,12 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
         "[INFO] %s d3 : auto_ok=%d (%.1f%%) to_create=%d (%.1f%%) "
         "median=%.1fm max=%.1fm bat_hors_cadastre=%d bat_enclave=%d",
         sro_code,
-        auto_ok, (100.0 * auto_ok / n_bat) if n_bat else 0.0,
-        to_create, (100.0 * to_create / n_bat) if n_bat else 0.0,
-        median, maxv,
+        auto_ok,
+        (100.0 * auto_ok / n_bat) if n_bat else 0.0,
+        to_create,
+        (100.0 * to_create / n_bat) if n_bat else 0.0,
+        median,
+        maxv,
         counts.get("BAT_HORS_CADASTRE", 0),
         counts.get("BAT_ENCLAVE", 0),
     )
@@ -178,16 +202,39 @@ def run_for_sro(gpkg_path: Path, sro_code: str) -> dict:
         for ft, n in counts.most_common():
             log.info("[INFO] %s flags : %s=%d", sro_code, ft, n)
 
+    # ---------- PR #13: writer (materialise QGIS layers) --------------------
+    if output_gpkg is not None:
+        writer.write_sro_outputs(
+            sro_code,
+            output_gpkg,
+            bal=layers["bal"],
+            d3_results=d3_results,
+            georeso_pa_existants=layers["georeso_pa"],
+            georeso_zapa_existantes=layers["georeso_zapa"],
+            new_pas=new_pas,
+            new_zapas=new_zapas,
+            reusable_infra=reusable,
+            parcelles_classifiees=parcelles_class,
+            flag_collector=flag_collector,
+        )
+
     log.info("[OK] SRO %s traite", sro_code)
     return summary
 
 
-def run_for_sros(gpkg_path: Path, sro_codes: Iterable[str]) -> list[dict]:
+def run_for_sros(
+    gpkg_path: Path,
+    sro_codes: Iterable[str],
+    *,
+    output_gpkg: Path | None = None,
+) -> list[dict]:
     summaries: list[dict] = []
     failures: list[tuple[str, str]] = []
     for code in sro_codes:
         try:
-            summaries.append(run_for_sro(gpkg_path, code))
+            summaries.append(
+                run_for_sro(gpkg_path, code, output_gpkg=output_gpkg)
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("[X] SRO %s : %s", code, exc)
             failures.append((code, str(exc)))
@@ -197,10 +244,18 @@ def run_for_sros(gpkg_path: Path, sro_codes: Iterable[str]) -> list[dict]:
         log.info(
             "[OK] %s : BAT=%d  ZAPA=%d  PA=%d  reusable=%d  auto_ok=%d/%d  "
             "orphans=%d  new_pa=%d",
-            s["sro"], s["bal"], s["zapa"], s["pa"], s["reusable_total"],
-            s.get("auto_ok", 0), s["bal"],
-            s.get("orphan_bats", 0), s.get("new_pa", 0),
+            s["sro"],
+            s["bal"],
+            s["zapa"],
+            s["pa"],
+            s["reusable_total"],
+            s.get("auto_ok", 0),
+            s["bal"],
+            s.get("orphan_bats", 0),
+            s.get("new_pa", 0),
         )
+    if output_gpkg is not None and output_gpkg.exists():
+        log.info("[OK] GPKG output : %s", output_gpkg.resolve())
     for code, err in failures:
         log.warning("[!] %s : %s", code, err)
     return summaries
@@ -209,7 +264,7 @@ def run_for_sros(gpkg_path: Path, sro_codes: Iterable[str]) -> list[dict]:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="auvergne_pipeline",
-        description="Pipeline avant-vente Auvergne (Phase 3, iteration 2).",
+        description="Pipeline avant-vente Auvergne (Phase 3).",
     )
     p.add_argument(
         "--gpkg",
@@ -217,13 +272,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=config.DEFAULT_GPKG,
         help=f"Chemin vers le GPKG local (defaut: {config.DEFAULT_GPKG}).",
     )
+    p.add_argument(
+        "--output",
+        type=Path,
+        default=config.DEFAULT_OUTPUT_GPKG,
+        help="GPKG de sortie (defaut: output/auvergne_outputs.gpkg).",
+    )
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--sro", action="append", help="Code SRO (peut etre repete).")
     g.add_argument(
         "--sros",
         nargs="+",
         metavar="CODE",
-        help="Liste de codes SRO espaces par espace (ex: --sros A B C).",
+        help="Liste de codes SRO (ex: --sros A B C).",
     )
     g.add_argument(
         "--all-pilots",
@@ -253,6 +314,14 @@ def main(argv: list[str] | None = None) -> int:
             print(code)
         return 0
 
+    # Resolve output path
+    output_gpkg = Path(args.output).resolve()
+    # Truncate at start of run (fresh GPKG for this batch)
+    output_gpkg.parent.mkdir(parents=True, exist_ok=True)
+    if output_gpkg.exists():
+        output_gpkg.unlink()
+    log.info("[OK] Output GPKG : %s", output_gpkg)
+
     if args.all_pilots:
         sros = list(config.PILOT_SROS)
     elif args.sros:
@@ -263,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("[X] Aucun SRO a traiter.")
         return 2
 
-    summaries = run_for_sros(gpkg, sros)
+    summaries = run_for_sros(gpkg, sros, output_gpkg=output_gpkg)
     return 0 if len(summaries) == len(sros) else 1
 
 

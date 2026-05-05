@@ -38,6 +38,9 @@ LAYER_LIVRABLE_PA = "livrable_pa"
 LAYER_LIVRABLE_ZAPA = "livrable_zapa"
 LAYER_LIVRABLE_INFRA = "livrable_infra"
 
+# Output GPKG path (default, overridable via --output CLI)
+DEFAULT_OUTPUT_GPKG = Path("output/auvergne_outputs.gpkg")
+
 INFRA_LAYERS = (LAYER_ATHD, LAYER_BT, LAYER_FT_ARCITI, LAYER_CHEMINEMENT)
 
 # Spatial buffers (metres) applied around the SRO bounding box when clipping.

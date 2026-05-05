@@ -269,6 +269,9 @@ class LauncherWindow(QMainWindow):
             argv.extend(sorted(self.selected_sros))
         if gpkg:
             argv.extend(["--gpkg", gpkg])
+        # Default output path (relative to repo root)
+        output = REPO_ROOT / "output" / "auvergne_outputs.gpkg"
+        argv.extend(["--output", str(output)])
         return argv
 
     def _launch(self) -> None:

@@ -32,6 +32,9 @@ if not exist "%OSGEO4W_ENV%" (
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%" >nul
 
+REM --- Output GPKG path (overridable via --output passed in %*) -----------
+set "OUTPUT=!SCRIPT_DIR!output\auvergne_outputs.gpkg"
+
 REM --- Charger l'env QGIS (modifie le PATH) ----------------------------
 call "%OSGEO4W_ENV%"
 if errorlevel 1 (
@@ -65,7 +68,8 @@ echo [OK] Lancement: python -m auvergne_pipeline.main %*
 
 REM --- Lancer python avec redirection complete -------------------------
 REM %* passe les arguments (--all-pilots, --gpkg, --sro, ...) tels quels.
-python -m auvergne_pipeline.main %* > "!LOGFILE!" 2>&1
+REM --output est ajoute a la fin (ecrase par l'utilisateur si deja dans %*).
+python -m auvergne_pipeline.main %* --output "!OUTPUT!" > "!LOGFILE!" 2>&1
 set "RC=!errorlevel!"
 
 REM --- Reafficher le log dans la console -------------------------------
