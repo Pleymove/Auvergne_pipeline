@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Iterable
 
 import geopandas as gpd
+import pandas as pd
 
 from . import (
     config,
@@ -197,8 +198,6 @@ def run_for_sro(
         ) if not reusable.empty and not ign_roads.empty else (
             reusable if not reusable.empty else ign_roads
         )
-
-        import pandas as pd
 
         # 8. PB fictifs
         pb_gdf, gc_neuf = pb_fictif.build_pb_fictifs(
