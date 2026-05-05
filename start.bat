@@ -57,6 +57,10 @@ REM =====================================================================
 
 call "%QGIS_PATH%\bin\o4w_env.bat"
 
+REM === Fix qgis.core access (PR #21) ===
+set "PYTHONPATH=%QGIS_PATH%\apps\qgis\python;%QGIS_PATH%\apps\qgis\python\plugins;%PYTHONPATH%"
+REM ====================================
+
 REM Qt6 (prioritaire) ou Qt5 fallback
 if exist "%QGIS_PATH%\apps\Qt6\bin" (
     set "PATH=%QGIS_PATH%\apps\Qt6\bin;%QGIS_PATH%\bin;%PATH%"

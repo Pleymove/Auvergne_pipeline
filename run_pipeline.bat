@@ -45,6 +45,10 @@ if errorlevel 1 (
 )
 echo [OK] QGIS env charge: %QGIS_ROOT%
 
+REM === Fix qgis.core access (PR #21) ===
+set "PYTHONPATH=%QGIS_ROOT%\apps\qgis\python;%QGIS_ROOT%\apps\qgis\python\plugins;%PYTHONPATH%"
+REM ====================================
+
 REM --- Timestamp natif cmd via wmic ------------------------------------
 REM Format: YYYYMMDDHHMMSS.xxxxxx+ZZZ -> on garde YYYYMMDD_HHMMSS.
 REM Pas de delims== sur wmic (le double = peut planter).

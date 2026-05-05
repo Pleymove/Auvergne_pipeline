@@ -254,7 +254,6 @@ def run_for_sros(
     if output_gpkg is not None and output_gpkg.exists():
         log.info("[OK] GPKG output : %s", output_gpkg.resolve())
         writer.apply_qml_styles_to_gpkg(output_gpkg)
-        writer.write_qml_sidecars(output_gpkg)
         writer.write_qgis_project(output_gpkg)
     for code, err in failures:
         log.warning("[!] %s : %s", code, err)
