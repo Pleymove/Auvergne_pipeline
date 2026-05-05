@@ -24,3 +24,5 @@ Thumbs.db
 
 # Pipeline run logs
 logs/
+output/
+cache/*
