@@ -10,6 +10,7 @@ PR #14: expanded to 8 output layers (was 6 in PR #13).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Dict, List
 
@@ -151,7 +152,6 @@ def write_sro_outputs(
     if not flags_df.empty:
         flags_df["sro_code"] = sro_code
         try:
-            import sqlite3
             conn = sqlite3.connect(str(output_gpkg))
             flags_df.to_sql(LAYER_FLAGS, conn, if_exists="append", index=False)
             conn.close()

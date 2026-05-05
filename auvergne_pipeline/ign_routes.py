@@ -13,8 +13,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import certifi
 import geopandas as gpd
+import pandas as pd
 import requests
+import urllib3
 from requests.exceptions import SSLError
 from shapely.geometry.base import BaseGeometry
 
@@ -25,9 +28,6 @@ log = logging.getLogger(__name__)
 
 def _wfs_get(params: dict, base_url: str, timeout: int):
     """GET with SSL fallback for QGIS embedded Python (certifi may be stale)."""
-    import certifi
-    import urllib3
-
     try:
         return requests.get(base_url, params=params, timeout=timeout,
                             verify=certifi.where())
@@ -56,8 +56,6 @@ def load_ign_routes_for_sro(
     buffer_m: float = config.IGN_BBOX_BUFFER_M,
 ) -> gpd.GeoDataFrame:
     """Return IGN road LineStrings inside the SRO bbox (cached)."""
-    import pandas as pd
-
     if cache_dir is None:
         _pkg_root = Path(__file__).resolve().parent.parent
         cache_dir = _pkg_root / config.CACHE_DIR_IGN
