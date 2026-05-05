@@ -107,7 +107,7 @@ def _split_oversized_cluster(
                 break
 
             bucket.append(remaining.pop(best_i))
-            bucket_w += weights[bucket[b - 1]]  # last added
+            bucket_w += weights[bucket[-1]]  # last added
 
         result.append(bucket)
 

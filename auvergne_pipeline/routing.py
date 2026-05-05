@@ -28,8 +28,20 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SNAP_TOLERANCE_M = 0.5  # distance threshold for snapping endpoints to nodes
-EDGE_KEY_SEP = "::"      # separator for synthetic edge keys
+SNAP_TOLERANCE_M = 0.5
+EDGE_KEY_SEP = "::"
+
+
+def _explode_to_linestrings(geom):
+    """Yield LineString parts from a (Multi)LineString geometry."""
+    if geom is None or geom.is_empty:
+        return
+    if geom.geom_type == "LineString":
+        yield geom
+    elif geom.geom_type == "MultiLineString":
+        for part in geom.geoms:
+            if not part.is_empty:
+                yield part
 
 
 # ---------------------------------------------------------------------------
@@ -59,22 +71,20 @@ def _build_graph(
         if gdf is None or gdf.empty:
             return
         for _, row in gdf.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-            coords = list(geom.coords)
-            for i in range(len(coords) - 1):
-                a = coords[i]
-                b = coords[i + 1]
-                length = Point(a).distance(Point(b))
-                G.add_edge(
-                    _point_key(Point(a)),
-                    _point_key(Point(b)),
-                    length=length,
-                    **attrs,
-                    **{k: row.get(k) for k in ("statut", "mode_pose", "src", "sro_code")
-                       if k in gdf.columns},
-                )
+            for line in _explode_to_linestrings(row.geometry):
+                coords = list(line.coords)
+                for i in range(len(coords) - 1):
+                    a = coords[i]
+                    b = coords[i + 1]
+                    length = Point(a).distance(Point(b))
+                    G.add_edge(
+                        _point_key(Point(a)),
+                        _point_key(Point(b)),
+                        length=length,
+                        **attrs,
+                        **{k: row.get(k) for k in ("statut", "mode_pose", "src", "sro_code")
+                           if k in gdf.columns},
+                    )
 
     _add_edges(infra, {"type": "infra"})
     _add_edges(ign_routes, {"type": "ign_route"})

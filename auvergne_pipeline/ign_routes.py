@@ -15,11 +15,26 @@ from typing import Optional
 
 import geopandas as gpd
 import requests
+from requests.exceptions import SSLError
 from shapely.geometry.base import BaseGeometry
 
 from . import config
 
 log = logging.getLogger(__name__)
+
+
+def _wfs_get(params: dict, base_url: str, timeout: int):
+    """GET with SSL fallback for QGIS embedded Python (certifi may be stale)."""
+    import certifi
+    import urllib3
+
+    try:
+        return requests.get(base_url, params=params, timeout=timeout,
+                            verify=certifi.where())
+    except SSLError:
+        log.warning("[IGN] SSL verify failed via certifi — fallback verify=False")
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return requests.get(base_url, params=params, timeout=timeout, verify=False)
 
 
 def _build_bbox(
@@ -58,7 +73,10 @@ def load_ign_routes_for_sro(
     if cache_path.exists():
         try:
             gdf = gpd.read_file(cache_path)
-            if not gdf.empty:
+            if gdf.empty:
+                log.info("[IGN] Cache 0-feature detected, re-fetch")
+                cache_path.unlink()
+            else:
                 log.info("[IGN] Cache hit: %s (%d features)", cache_path.name, len(gdf))
                 return gdf.to_crs(crs) if (gdf.crs and gdf.crs != crs) else gdf
         except Exception:
@@ -88,9 +106,7 @@ def load_ign_routes_for_sro(
                     "STARTINDEX": str(start_index),
                 }
 
-                resp = requests.get(
-                    config.IGN_WFS_BASE, params=params, timeout=config.IGN_TIMEOUT_S
-                )
+                resp = _wfs_get(params, config.IGN_WFS_BASE, config.IGN_TIMEOUT_S)
                 resp.raise_for_status()
                 data = resp.json()
                 features = data.get("features", [])
