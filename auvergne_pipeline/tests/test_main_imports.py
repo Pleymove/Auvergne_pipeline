@@ -27,3 +27,21 @@ def test_all_pipeline_modules_import():
     import auvergne_pipeline.writer
     # launcher requires PyQt6 — skip here
     assert True  # reached without exception
+
+
+def test_routing_module_uses_math_globally():
+    """Régression PR #17 : math doit être importé au top-level de routing.py."""
+    import inspect
+    import re
+
+    from auvergne_pipeline import routing
+
+    src = inspect.getsource(routing)
+    # "import math" indenté (= local) → interdit
+    local_imports = re.findall(r"^\s+import math\b", src, re.MULTILINE)
+    assert not local_imports, (
+        "import math doit être au top-level de routing.py, pas dans une fonction"
+    )
+    # Il doit y avoir un import math top-level
+    top_imports = re.findall(r"^import math\b", src, re.MULTILINE)
+    assert top_imports, "routing.py doit avoir 'import math' au top-level"
