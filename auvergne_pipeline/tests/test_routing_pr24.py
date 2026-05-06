@@ -87,13 +87,13 @@ def test_routing_dedups_shared_trunk(monkeypatch):
     """Feature D: a trunk shared by 2 PBs of the same PA appears once."""
     G = nx.Graph()
     # Shared trunk PA -> middle, then 2 short branches to 2 PBs.
-    G.add_edge((0.0, 0.0), (5.0, 0.0), length=5,
+    G.add_edge((0.0, 0.0), (15.0, 0.0), length=15,
                type="infra", statut="E", mode_pose="1", src="bt", infra_type="bt")
-    G.add_edge((5.0, 0.0), (10.0, 0.0), length=5,
+    G.add_edge((15.0, 0.0), (30.0, 0.0), length=15,
                type="infra", statut="E", mode_pose="1", src="bt", infra_type="bt")
-    G.add_edge((10.0, 0.0), (12.0, 2.0), length=2.83,
+    G.add_edge((30.0, 0.0), (35.0, 10.0), length=11.18,
                type="infra", statut="E", mode_pose="1", src="bt", infra_type="bt")
-    G.add_edge((10.0, 0.0), (12.0, -2.0), length=2.83,
+    G.add_edge((30.0, 0.0), (35.0, -10.0), length=11.18,
                type="infra", statut="E", mode_pose="1", src="bt", infra_type="bt")
 
     monkeypatch.setattr(routing, "_build_graph", lambda *a, **k: G)
@@ -101,7 +101,7 @@ def test_routing_dedups_shared_trunk(monkeypatch):
     pa = _pa()
     pb_two = gpd.GeoDataFrame(pd.DataFrame({
         "pb_id": ["PB1", "PB2"], "pa_id": ["PA1", "PA1"],
-        "geometry": [Point(12, 2), Point(12, -2)],
+        "geometry": [Point(35, 10), Point(35, -10)],
     }), geometry="geometry", crs=CRS)
 
     routed = routing.route_pa_to_pb(
