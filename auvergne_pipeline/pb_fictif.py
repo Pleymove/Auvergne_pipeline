@@ -157,7 +157,17 @@ def _ensure_pb_on_public_domain(
         (pb_geom_corrected, flag) where flag is None (ok) or
         'PB_PLACEMENT_PRIVE' (re-snap failed, needs manual review).
     """
-    public = parcelle_publique_union.union(ign_routes_buffered)
+    if parcelle_publique_union is None or parcelle_publique_union.is_empty:
+        public = ign_routes_buffered
+    elif ign_routes_buffered is None or ign_routes_buffered.is_empty:
+        public = parcelle_publique_union
+    else:
+        public = parcelle_publique_union.union(ign_routes_buffered)
+
+    # If we have no public reference at all, can't verify — flag and keep PB.
+    if public is None or public.is_empty:
+        return pb_geom, "PB_PLACEMENT_PRIVE"
+
     if pb_geom.intersects(public.buffer(2)):
         return pb_geom, None
     # Re-snap: nearest point on public domain within re_snap_radius_m

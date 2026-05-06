@@ -25,6 +25,7 @@ from typing import Iterable
 
 import geopandas as gpd
 import pandas as pd
+from shapely.ops import unary_union as _shp_unary_union
 
 from . import (
     config,
@@ -104,10 +105,13 @@ def run_for_sro(
 
     # ── 3.5 PR #23 Bug B: clip BT to public domain (CDC) ────────────
     if "src" in reusable.columns and (reusable["src"] == "bt").any():
-        parcelle_publique = parcelles_class[
-            parcelles_class.get("proprietaire", pd.Series(dtype=str))
-            .str.contains("commune", case=False, na=False)
-        ]
+        # Use the already-populated 'public' column from parcelles.classify_parcelles
+        # (avoids re-running str.contains with case=False, which uses regex internally
+        # and crashes on QGIS embedded pyarrow — cf parcelles.py docstring).
+        if "public" in parcelles_class.columns:
+            parcelle_publique = parcelles_class[parcelles_class["public"]]
+        else:
+            parcelle_publique = parcelles_class.iloc[:0]
         # PR #23 fix: load IGN routes EARLY so BT clip sees the full public domain
         ign_roads = ign_routes.load_ign_routes_for_sro(za_geom)
         bt_mask = reusable["src"] == "bt"
@@ -234,11 +238,14 @@ def run_for_sro(
         )
 
         # 8. PB fictifs (PR #23 Bug C: pass public domain for validation)
+        ign_routes_buffered = (
+            _shp_unary_union(ign_roads.geometry.buffer(5.0).tolist())
+            if not ign_roads.empty else None
+        )
         pb_gdf, gc_neuf = pb_fictif.build_pb_fictifs(
             layers["bal"], pa_all, zapa_all, combined_edges, flag_collector,
             parcelle_publique_union=public_geom,
-            ign_routes_buffered=ign_roads.geometry.buffer(5.0).unary_union
-            if not ign_roads.empty else None,
+            ign_routes_buffered=ign_routes_buffered,
         )
 
         # 9. Routing PA→PB on combined graph (includes gc_neuf C0 edges)
