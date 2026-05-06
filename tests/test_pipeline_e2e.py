@@ -96,15 +96,20 @@ def test_pipeline_handles_multilinestring_in_routing(tmp_path, empty_ign_routes)
 
 def test_pipeline_no_output_runs_d3_only(empty_ign_routes):
     """Without output_gpkg, the pipeline stops at D3 and does not call
-    ign_routes / pb_fictif / routing / writer.
+    pb_fictif / routing / writer.
+
+    PR #23 (CDC): if reusable infra contains BT segments, IGN routes ARE
+    loaded once (in section 3.5) so the BT clip can include road buffers
+    in the public domain. This is the correct CDC behavior — D3 distances
+    must reference clipped BT, not unclipped BT.
     """
     from auvergne_pipeline.main import run_for_sros
 
     summaries = run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=None)
     assert len(summaries) == 1
     assert summaries[0]["bal"] == 5
-    # ign_routes must NOT have been called (output_gpkg is None)
-    empty_ign_routes.assert_not_called()
+    # ign_routes is loaded at most once (BT clip), never twice (no routing).
+    assert empty_ign_routes.call_count <= 1
 
 
 # ---------------------------------------------------------------------------
@@ -166,3 +171,41 @@ def test_qml_sidecars_after_e2e(tmp_path, empty_ign_routes):
         if sidecar.exists():
             sidecars_exist = True
     assert not sidecars_exist, "PR #21: sidecars .qml are deprecated, should not exist"
+
+
+# ---------------------------------------------------------------------------
+# PR #23 regression E2E tests
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_log_emitted_when_bt_present(tmp_path, empty_ign_routes, caplog):
+    """PR #23 Bug B: a `[CDC]` log line is emitted when BT clip happens."""
+    import logging
+
+    from auvergne_pipeline.main import run_for_sros
+
+    output = tmp_path / "test_cdc.gpkg"
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline"):
+        run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=output)
+    cdc_lines = [r for r in caplog.records if "[CDC]" in r.getMessage()]
+    assert cdc_lines, "Expected at least one [CDC] log line during BT clip"
+    msg = cdc_lines[0].getMessage()
+    assert "BT clip public" in msg
+    assert SRO_CODE in msg
+
+
+def test_livrable_infra_carries_infra_type_column(tmp_path, empty_ign_routes):
+    """PR #23 Bug A: livrable_infra rows must carry an ``infra_type`` column."""
+    from auvergne_pipeline.main import run_for_sros
+
+    output = tmp_path / "test_infra_type.gpkg"
+    run_for_sros(FIXTURE, [SRO_CODE], output_gpkg=output)
+
+    from pyogrio import list_layers
+    layers = list_layers(str(output))[:, 0]
+    if "livrable_infra" not in layers:
+        pytest.skip("No routed edges on this fixture; livrable_infra absent")
+    infra = gpd.read_file(output, layer="livrable_infra")
+    assert "infra_type" in infra.columns, (
+        "livrable_infra must carry infra_type for the QML to colour edges"
+    )

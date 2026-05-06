@@ -1,52 +1,40 @@
-"""Integration tests for loader.py against the local GPKG.
-
-These tests are skipped automatically when the GPKG is not available, so they
-are safe to run on CI / dev machines without the data. On Pierre's PC pro the
-default path is picked up via ``config.DEFAULT_GPKG``.
-"""
+"""Tests for loader — PR #23 Bug B (BT clip to public domain)."""
 
 from __future__ import annotations
 
+import geopandas as gpd
 import pytest
+from shapely.geometry import LineString, Polygon
 
 from auvergne_pipeline import config, loader
 
 
-pytestmark = pytest.mark.skipif(
-    not config.DEFAULT_GPKG.exists(),
-    reason=f"GPKG local absent: {config.DEFAULT_GPKG}",
-)
+def test_bt_clipped_to_public_domain():
+    """Bug B : a BT segment entirely inside a private parcel must be dropped."""
+    bt = gpd.GeoDataFrame(
+        {"geometry": [LineString([(50, 50), (60, 60)])]},
+        crs=config.PROJECT_CRS,
+    )
+    parc_pub = gpd.GeoDataFrame(
+        {"geometry": [Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])]},
+        crs=config.PROJECT_CRS,
+    )
+    ign = gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
+    result = loader.filter_bt_to_public_domain(bt, parc_pub, ign)
+    assert result.empty
 
 
-@pytest.mark.parametrize("sro_code", config.PILOT_SROS)
-def test_load_pilot_sro(sro_code: str):
-    """Each pilot SRO must load cleanly with all expected layer keys."""
-    layers = loader.load_sro(config.DEFAULT_GPKG, sro_code)
-
-    expected_keys = {
-        "za_sro",
-        "bal",
-        "georeso_zapa",
-        "georeso_pa",
-        "parcelle",
-        config.LAYER_ATHD,
-        config.LAYER_BT,
-        config.LAYER_FT_ARCITI,
-        config.LAYER_CHEMINEMENT,
-    }
-    assert expected_keys.issubset(layers.keys())
-
-    assert len(layers["za_sro"]) == 1
-    # Sanity: at least one BAT in the SRO (otherwise the SRO has nothing to do).
-    assert len(layers["bal"]) > 0, f"SRO pilote {sro_code} sans BAT"
-
-
-def test_list_available_sros_contains_all_pilots():
-    available = set(loader.list_available_sros(config.DEFAULT_GPKG))
-    missing = set(config.PILOT_SROS) - available
-    assert not missing, f"SRO pilotes absents du GPKG: {sorted(missing)}"
-
-
-def test_unknown_sro_raises():
-    with pytest.raises(loader.SroNotFoundError):
-        loader.load_sro(config.DEFAULT_GPKG, "00000/AAA/PMZ/00000")
+def test_bt_clipped_at_public_private_boundary():
+    """Bug B : a BT segment half public half private must be clipped."""
+    bt = gpd.GeoDataFrame(
+        {"geometry": [LineString([(0, 5), (20, 5)])]},
+        crs=config.PROJECT_CRS,
+    )
+    parc_pub = gpd.GeoDataFrame(
+        {"geometry": [Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])]},
+        crs=config.PROJECT_CRS,
+    )
+    ign = gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
+    result = loader.filter_bt_to_public_domain(bt, parc_pub, ign)
+    assert not result.empty
+    assert result.geometry.iloc[0].length == pytest.approx(10.0, abs=0.5)

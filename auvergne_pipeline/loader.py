@@ -13,6 +13,7 @@ from typing import Dict
 
 import geopandas as gpd
 from shapely.geometry import box
+from shapely.ops import unary_union
 
 from . import config
 
@@ -103,3 +104,51 @@ def list_available_sros(gpkg_path: str | Path) -> list[str]:
     """Return the distinct SRO codes present in ``za_sro`` (sorted)."""
     za = _read_layer(Path(gpkg_path), config.LAYER_ZA_SRO)
     return sorted(s for s in za["sro"].dropna().unique())
+
+
+# ---------------------------------------------------------------------------
+# PR #23 Bug B — BT clip to public domain (CDC NGE Énergie & Solutions)
+# ---------------------------------------------------------------------------
+
+def filter_bt_to_public_domain(
+    bt_gdf: gpd.GeoDataFrame,
+    parcelle_publique_gdf: gpd.GeoDataFrame,
+    ign_routes_gdf: gpd.GeoDataFrame,
+    buffer_m: float = 5.0,
+) -> gpd.GeoDataFrame:
+    """Keep only BT segments that lie within the public domain.
+
+    Public domain = communal parcels (proprietaire ILIKE '%commune%')
+                    ∪ buffer(buffer_m) around IGN BD TOPO routes.
+    Segments crossing private land are clipped at the public/private boundary.
+
+    PR #23 Bug B: BT (Enedis) has its own electric servitudes that do NOT
+    transfer to telecom operators. Per CDC, only the BT portion within the
+    public domain may be reused for the FTTH design.
+    """
+    if bt_gdf.empty:
+        return bt_gdf
+
+    # Use shapely.ops.unary_union on a list of geometries — works across
+    # geopandas <1.0 (where GeoSeries.union_all() is missing) and shields us
+    # from the deprecation warning of GeoSeries.unary_union in geopandas >=1.0.
+    polys = []
+    if not parcelle_publique_gdf.empty:
+        polys.append(unary_union(parcelle_publique_gdf.geometry.tolist()))
+    if not ign_routes_gdf.empty:
+        polys.append(unary_union(ign_routes_gdf.geometry.buffer(buffer_m).tolist()))
+    if not polys:
+        return bt_gdf.iloc[:0]
+
+    public_union = unary_union(polys)
+
+    # Clip exact (cut at the public/private boundary)
+    bt_clipped = gpd.clip(
+        bt_gdf,
+        gpd.GeoDataFrame(geometry=[public_union], crs=bt_gdf.crs),
+        keep_geom_type=True,
+    )
+
+    # Drop residual micro-segments (< 0.5 m)
+    bt_clipped = bt_clipped[bt_clipped.geometry.length > 0.5].reset_index(drop=True)
+    return bt_clipped

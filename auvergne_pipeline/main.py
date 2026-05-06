@@ -25,6 +25,7 @@ from typing import Iterable
 
 import geopandas as gpd
 import pandas as pd
+from shapely.ops import unary_union as _shp_unary_union
 
 from . import (
     config,
@@ -102,6 +103,39 @@ def run_for_sro(
              sro_code, n_pub, (100*n_pub/n_parc_total) if n_parc_total else 0.0,
              n_priv, (100*n_priv/n_parc_total) if n_parc_total else 0.0, n_parc_total)
 
+    # ── 3.5 PR #23 Bug B: clip BT to public domain (CDC) ────────────
+    if "src" in reusable.columns and (reusable["src"] == "bt").any():
+        # Use the already-populated 'public' column from parcelles.classify_parcelles
+        # (avoids re-running str.contains with case=False, which uses regex internally
+        # and crashes on QGIS embedded pyarrow — cf parcelles.py docstring).
+        if "public" in parcelles_class.columns:
+            parcelle_publique = parcelles_class[parcelles_class["public"]]
+        else:
+            parcelle_publique = parcelles_class.iloc[:0]
+        # PR #23 fix: load IGN routes EARLY so BT clip sees the full public domain
+        ign_roads = ign_routes.load_ign_routes_for_sro(za_geom)
+        bt_mask = reusable["src"] == "bt"
+        bt_raw = reusable[bt_mask]
+        non_bt = reusable[~bt_mask]
+        bt_filtree = loader.filter_bt_to_public_domain(
+            bt_raw, parcelle_publique, ign_roads, buffer_m=5.0,
+        )
+        log.info("[CDC] %s BT clip public : %d -> %d segments (-%d)",
+                 sro_code, len(bt_raw), len(bt_filtree),
+                 len(bt_raw) - len(bt_filtree))
+        reusable = gpd.GeoDataFrame(
+            pd.concat([non_bt, bt_filtree], ignore_index=True),
+            geometry="geometry", crs=config.PROJECT_CRS,
+        ) if not bt_filtree.empty else non_bt
+        # Update by_src after BT filter
+        by_src["bt"] = len(bt_filtree)
+        summary["bt_out"] = by_src["bt"]
+        summary["reusable_total"] = len(reusable)
+    else:
+        ign_roads = gpd.GeoDataFrame(
+            geometry=[], crs=config.PROJECT_CRS
+        )  # placeholder, loaded later if needed
+
     # ── 4. Orphans (PA/ZAPA creation) ──────────────────────────────
     orphan_bats = orphans.detect_orphans(layers["bal"], layers["georeso_zapa"])
     new_pas, new_zapas = orphans.create_pa_for_orphans(
@@ -168,8 +202,9 @@ def run_for_sro(
 
     # ── 6-9. IGN + PB + Routing + Writer (only if output is requested) ──
     if output_gpkg is not None:
-        # 6. IGN routes
-        ign_roads = ign_routes.load_ign_routes_for_sro(za_geom)
+        # 6. IGN routes (may already be loaded by section 3.5 BT clip)
+        if ign_roads.empty:
+            ign_roads = ign_routes.load_ign_routes_for_sro(za_geom)
 
         # 7. Build combined PA/ZAPA view (existing + created)
         pa_rows = [
@@ -202,9 +237,15 @@ def run_for_sro(
             reusable if not reusable.empty else ign_roads
         )
 
-        # 8. PB fictifs
+        # 8. PB fictifs (PR #23 Bug C: pass public domain for validation)
+        ign_routes_buffered = (
+            _shp_unary_union(ign_roads.geometry.buffer(5.0).tolist())
+            if not ign_roads.empty else None
+        )
         pb_gdf, gc_neuf = pb_fictif.build_pb_fictifs(
-            layers["bal"], pa_all, zapa_all, combined_edges, flag_collector
+            layers["bal"], pa_all, zapa_all, combined_edges, flag_collector,
+            parcelle_publique_union=public_geom,
+            ign_routes_buffered=ign_routes_buffered,
         )
 
         # 9. Routing PA→PB on combined graph (includes gc_neuf C0 edges)
