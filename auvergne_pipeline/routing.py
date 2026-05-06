@@ -322,7 +322,11 @@ def route_pa_to_pb(
     into the routing graph so they can be traversed by PA→PB paths.
 
     Returns a GeoDataFrame of LineStrings with columns:
-    ``sro``, ``pa_id``, ``pb_id``, ``statut``, ``mode_pose``, ``src``, ``length_m``.
+    ``sro``, ``pa_id``, ``pb_id``, ``statut``, ``mode_pose``, ``infra_type``,
+    ``src``, ``length_m``.
+
+    Edges are deduplicated via _edge_key so a trunk shared by multiple PBs
+    of the same PA appears only once in the output (PR #23 Feature D).
     """
     if pa_sro is None or pa_sro.empty or pb_sro is None or pb_sro.empty:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)

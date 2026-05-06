@@ -13,6 +13,7 @@ from typing import Dict
 
 import geopandas as gpd
 from shapely.geometry import box
+from shapely.ops import unary_union
 
 from . import config
 
@@ -128,15 +129,17 @@ def filter_bt_to_public_domain(
     if bt_gdf.empty:
         return bt_gdf
 
+    # Use shapely.ops.unary_union on a list of geometries — works across
+    # geopandas <1.0 (where GeoSeries.union_all() is missing) and shields us
+    # from the deprecation warning of GeoSeries.unary_union in geopandas >=1.0.
     polys = []
     if not parcelle_publique_gdf.empty:
-        polys.append(parcelle_publique_gdf.geometry.unary_union)
+        polys.append(unary_union(parcelle_publique_gdf.geometry.tolist()))
     if not ign_routes_gdf.empty:
-        polys.append(ign_routes_gdf.geometry.buffer(buffer_m).unary_union)
+        polys.append(unary_union(ign_routes_gdf.geometry.buffer(buffer_m).tolist()))
     if not polys:
         return bt_gdf.iloc[:0]
 
-    from shapely.ops import unary_union
     public_union = unary_union(polys)
 
     # Clip exact (cut at the public/private boundary)
