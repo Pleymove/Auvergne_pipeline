@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import LineString, Point
 from shapely import STRtree
+import shapely.ops  # PR #26: substring for edge geometry splitting
 
 from . import config
 
@@ -180,10 +181,13 @@ def _build_graph(
                         "infra_type",
                         edge_attrs.get("src") or attrs.get("type", "?"),
                     )
+                    # PR #26: store actual source geometry on the edge
+                    seg_geom = LineString([a, b])
                     G.add_edge(
                         _point_key(a),
                         _point_key(b),
                         length=length,
+                        geometry=seg_geom,
                         **attrs,
                         **edge_attrs,
                     )
@@ -252,9 +256,13 @@ def _add_gc_neuf_to_graph(
         attrs = {
             "length": Point(pk_a[0], pk_a[1]).distance(Point(pk_b[0], pk_b[1])),
             "type": "gc_neuf",
-            "statut": None,
+            "statut": "",
             "mode_pose": "C0",
             "src": "gc_neuf",
+            "infra_type": "gc_neuf",
+            "geometry": row.geometry
+            if row.geometry is not None and not row.geometry.is_empty
+            else LineString([(pk_a[0], pk_a[1]), (pk_b[0], pk_b[1])]),
         }
         for col in ("sro_code", "pa_id", "pb_id"):
             if col in gc_neuf.columns:
@@ -270,37 +278,60 @@ def _bridge_components_with_gc_neuf(
     pa_node: tuple[float, float],
     pb_node: tuple[float, float],
     flag_collector=None,
+    max_bridge_length_m: float = 50.0,
 ) -> bool:
-    """If pa_node and pb_node belong to different connected components,
-    add a direct GC neuf C0 edge between them and return True.
+    """If pa_node and pb_node belong to different connected components
+    AND the direct distance is within *max_bridge_length_m*, add a short
+    GC neuf C0 bridge and return True.
 
-    PR #22: in rural areas the welded graph may still be disconnected.
-    Bridging ensures Dijkstra can find a path (straight line in last resort).
+    Otherwise only flag the disconnection — NEVER create a long diagonal
+    across private parcels (PR #26: CDC compliance).
+
+    PR #22: in rural areas the welded graph may still be disconnected
+    by short gaps. Bridging resolves those gaps ONLY when the direct
+    distance is small enough to be a plausible public-domain connector.
     """
     try:
         cc_pa = nx.node_connected_component(G, pa_node)
         if pb_node in cc_pa:
             return False
     except (nx.NetworkXError, KeyError):
-        # One or both nodes not in G
         return False
 
     direct_length = Point(pa_node[0], pa_node[1]).distance(
         Point(pb_node[0], pb_node[1])
     )
+
+    if direct_length > max_bridge_length_m:
+        # Too far — flag instead of inventing a diagonal
+        if flag_collector is not None:
+            flag_collector.add(
+                "GC_NEUF_ROUTING_IMPOSSIBLE",
+                target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
+                message=f"Pont GC neuf impossible — distance {direct_length:.0f}m > seuil {max_bridge_length_m}m",
+            )
+        return False
+
+    # Short connector, geometrically plausible as a public-domain link
+    bridge_geom = LineString([
+        (pa_node[0], pa_node[1]),
+        (pb_node[0], pb_node[1]),
+    ])
     G.add_edge(
         pa_node, pb_node,
         length=direct_length,
         type="gc_neuf",
-        statut=None,
+        statut="",
         mode_pose="C0",
-        src="gc_neuf_runtime",
+        src="gc_neuf",
+        infra_type="gc_neuf",
+        geometry=bridge_geom,
     )
     if flag_collector is not None:
         flag_collector.add(
             "GC_NEUF_GENERE_DIJKSTRA",
             target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-            message=f"Pont GC neuf C0 ligne droite, length={direct_length:.0f}m",
+            message=f"Pont GC neuf C0 short-range, length={direct_length:.0f}m",
         )
     return True
 
@@ -410,10 +441,19 @@ def route_pa_to_pb(
                     G.remove_edge(u, v)
                     d1 = Point(u[0], u[1]).distance(best_proj)
                     d2 = Point(v[0], v[1]).distance(best_proj)
-                    G.add_edge(u, new_key, length=d1,
-                               **{k: edata[k] for k in edata if k != "length"})
-                    G.add_edge(new_key, v, length=d2,
-                               **{k: edata[k] for k in edata if k != "length"})
+                    extra = {k: edata[k] for k in edata if k not in ("length", "geometry")}
+                    # PR #26: build proper sub-geometries from the original edge
+                    orig_geom = edata.get("geometry")
+                    if orig_geom is not None and isinstance(orig_geom, LineString):
+                        # Split the original LineString at the projection point
+                        proj_dist = orig_geom.project(best_proj)
+                        seg_a = shapely.ops.substring(orig_geom, 0, proj_dist)
+                        seg_b = shapely.ops.substring(orig_geom, proj_dist, orig_geom.length)
+                    else:
+                        seg_a = LineString([(u[0], u[1]), (best_proj.x, best_proj.y)])
+                        seg_b = LineString([(best_proj.x, best_proj.y), (v[0], v[1])])
+                    G.add_edge(u, new_key, length=d1, geometry=seg_a, **extra)
+                    G.add_edge(new_key, v, length=d2, geometry=seg_b, **extra)
                 if new_key in G:
                     return new_key
 
@@ -502,7 +542,7 @@ def route_pa_to_pb(
                         )
                     continue
 
-            # Collect edges along the path (PR #23 Feature D: deduplicate)
+            # Collect edges along the path (PR #26: use stored geometry, fix attribs)
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 edge_data = G.get_edge_data(u, v)
@@ -510,19 +550,101 @@ def route_pa_to_pb(
                     continue
                 ekey = _edge_key(u, v)
                 if ekey not in edges_out:
+                    # ── Resolve attributes with QML / CDC compliance ──────
+                    raw_src = edge_data.get("src", edge_data.get("type", ""))
+                    raw_type = edge_data.get("type", "")
+                    raw_infra = edge_data.get("infra_type", "")
+
+                    # PR #26: gc_neuf_runtime → gc_neuf (must not leak into GPKG)
+                    if raw_src == "gc_neuf_runtime":
+                        raw_src = "gc_neuf"
+
+                    # PR #26: pure IGN edges delivered as infra must become C0
+                    if raw_type == "ign_route" and raw_infra != "gc_neuf":
+                        mode_pose = "C0"
+                        infra_type = "gc_neuf"
+                        src = "gc_neuf"
+                    elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
+                        mode_pose = "C0"
+                        infra_type = "gc_neuf"
+                        src = "gc_neuf"
+                    else:
+                        mode_pose = edge_data.get("mode_pose", "")
+                        infra_type = raw_infra or raw_src or raw_type
+                        src = raw_src or raw_type
+
+                    # ── Use stored geometry, fallback to naive reconstruction ──
+                    stored_geom = edge_data.get("geometry")
+                    if stored_geom is not None and isinstance(stored_geom, LineString) and not stored_geom.is_empty:
+                        out_geom = stored_geom
+                    else:
+                        out_geom = LineString([(u[0], u[1]), (v[0], v[1])])
+
+                    # ── Normalize statut: never None in the GPKG (PR #26 amend)
+                    out_statut = edge_data.get("statut")
+                    if out_statut is None:
+                        out_statut = ""
+
                     edges_out[ekey] = {
                         "sro": sro,
                         "pa_id": pa_id,
                         "pb_id": pb_id,
-                        "statut": edge_data.get("statut", ""),
-                        "mode_pose": edge_data.get("mode_pose", ""),
-                        "infra_type": edge_data.get("infra_type", edge_data.get("src", edge_data.get("type", ""))),
-                        "src": edge_data.get("src", edge_data.get("type", "")),
+                        "statut": out_statut,
+                        "mode_pose": mode_pose,
+                        "infra_type": infra_type,
+                        "src": src,
                         "length_m": edge_data.get("length", 0.0),
-                        "geometry": LineString([Point(u[0], u[1]), Point(v[0], v[1])]),
+                        "geometry": out_geom,
                     }
 
     if not edges_out:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
-    return gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
+    result = gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
+
+    # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
+    _log_infra_qa(result, pa_sro)
+
+    return result
+
+
+def _log_infra_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
+    """Log quality-assurance breakdown for livrable_infra (PR #26)."""
+    if df.empty:
+        log.warning("[INFRA QA] livrable_infra vide")
+        return
+
+    sro_code = df.iloc[0].get("sro", "?") if len(df) > 0 else "?"
+    n_total = len(df)
+
+    # coalesce style_key = statut + mode_pose (PR #26 amend: replaces empty_statut)
+    df_sk = df.copy()
+    df_sk["statut_str"] = df_sk["statut"].fillna("").astype(str)
+    df_sk["mp_str"] = df_sk["mode_pose"].fillna("").astype(str)
+    df_sk["style_key"] = df_sk["statut_str"].str.cat(df_sk["mp_str"], sep="")
+
+    n_empty_style = int((df_sk["style_key"] == "").sum())
+
+    # style_key breakdown
+    sk_counts = df_sk["style_key"].value_counts().to_dict()
+    sk_str = ", ".join(f"{k}={v}" for k, v in sorted(sk_counts.items()))
+    log.info("[INFRA QA] %s style_key: %s", sro_code, sk_str or "(vide)")
+
+    # infra_type breakdown
+    it_counts = df["infra_type"].value_counts().to_dict()
+    it_str = ", ".join(f"{k}={v}" for k, v in sorted(it_counts.items()))
+    log.info("[INFRA QA] %s infra_type: %s", sro_code, it_str or "(vide)")
+
+    # Problematic attributes
+    n_ign_route = int((df["src"] == "ign_route").sum())
+    n_gc_neuf_runtime = int((df["src"] == "gc_neuf_runtime").sum())
+    n_statut_none = int(df["statut"].isna().sum())
+
+    total_length = float(df["length_m"].sum()) if "length_m" in df.columns else 0.0
+
+    log.info(
+        "[INFRA QA] %s total=%d features, %.0f m | "
+        "empty_style_key=%d src_ign_route=%d src_gc_neuf_runtime=%d statut_null=%d",
+        sro_code, n_total, total_length,
+        n_empty_style, n_ign_route, n_gc_neuf_runtime, n_statut_none,
+    )

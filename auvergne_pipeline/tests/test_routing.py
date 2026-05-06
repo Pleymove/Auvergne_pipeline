@@ -99,24 +99,24 @@ def test_weld_close_nodes_merges_disjoint_islands():
 
 
 def test_bridge_gc_neuf_when_no_path():
-    """PR #22 Spec B: disconnected PA/PB get a C0 bridge edge."""
+    """PR #22 Spec B: disconnected PA/PB get a C0 bridge edge (short gap < 50m)."""
     import networkx as nx
 
     G = nx.Graph()
     # Edge from (0,0) to (10,0) — PA can snap here
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    # Isolated node — PB
-    G.add_node((100.0, 100.0))
+    # Isolated node — PB at 30m (within 50m threshold, PR #26 amend)
+    G.add_node((30.0, 0.0))
 
-    # Bridge should be created (nodes in different CCs)
+    # Bridge should be created (nodes in different CCs, gap < 50m)
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (100.0, 100.0)
+        G, (0.0, 0.0), (30.0, 0.0)
     )
     assert bridged
-    assert G.has_edge((0.0, 0.0), (100.0, 100.0))
-    edge = G[(0.0, 0.0)][(100.0, 100.0)]
+    assert G.has_edge((0.0, 0.0), (30.0, 0.0))
+    edge = G[(0.0, 0.0)][(30.0, 0.0)]
     assert edge["mode_pose"] == "C0"
-    assert edge["src"] == "gc_neuf_runtime"
+    assert edge["src"] == "gc_neuf"  # PR #26: gc_neuf_runtime -> gc_neuf
 
 
 def test_no_self_loop_after_welding():
