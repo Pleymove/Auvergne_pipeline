@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 SNAP_TOLERANCE_M = 50.0         # nearest-node lookup radius (PR #21: was 0.5)
 SNAP_PROJECTION_RADIUS_M = 200.0  # edge-projection fallback radius (PR #21)
 WELD_RADIUS_M = 2.0             # node fusion radius for topology welding (PR #22)
+SNAP_ENDPOINT_RADIUS_M = 3.0    # A/Z endpoint snap radius (PR #27: close gaps)
 EDGE_KEY_SEP = "::"
 
 def _explode_to_linestrings(geom):
@@ -152,6 +153,163 @@ def _weld_close_nodes(
     )
     return G_welded
 
+
+# ---------------------------------------------------------------------------
+# PR #27 Part B — A/Z endpoint topology snap
+# ---------------------------------------------------------------------------
+
+
+def _snap_endpoints_topology(
+    G: nx.Graph,
+    snap_radius_m: float = SNAP_ENDPOINT_RADIUS_M,
+) -> dict:
+    """Snap close A/Z endpoints (degree-1 nodes) into shared nodes.
+
+    Extracts only true A/Z endpoints (nodes connected to exactly 1 edge),
+    finds pairs within *snap_radius_m* via cKDTree, and merges them into
+    the same graph node. Internal vertices (degree >= 2) are NEVER merged.
+
+    After merging, stored geometries on affected edges are patched so their
+    endpoint coordinates match the canonical representative node — this
+    eliminates visible gaps in QGIS output.
+
+    Returns a stats dict for QA logging.
+    """
+    if G.number_of_nodes() < 2:
+        return {"endpoints_snapped": 0, "cc_before": 0, "cc_after": 0}
+
+    from scipy.spatial import cKDTree
+
+    # ── 1) Extract only degree-1 nodes (true A/Z endpoints) ──────────
+    endpoint_indices = []
+    endpoint_coords = []
+    endpoint_nodes = []
+    nodes = list(G.nodes())
+    for i, n in enumerate(nodes):
+        if G.degree(n) == 1:  # true A/Z endpoint
+            endpoint_indices.append(i)
+            endpoint_nodes.append(n)
+            endpoint_coords.append((n[0], n[1]))
+
+    if len(endpoint_nodes) < 2:
+        cc = nx.number_connected_components(G)
+        return {"endpoints_snapped": 0, "cc_before": cc, "cc_after": cc}
+
+    coords_arr = np.array(endpoint_coords, dtype=float)
+    cc_before = nx.number_connected_components(G)
+
+    # ── 2) Find close endpoint pairs ──────────────────────────────────
+    tree = cKDTree(coords_arr)
+    pairs = tree.query_pairs(r=snap_radius_m, output_type="ndarray")
+
+    if len(pairs) == 0:
+        return {"endpoints_snapped": 0, "cc_before": cc_before, "cc_after": cc_before}
+
+    # ── 3) Union-find to group close endpoints ────────────────────────
+    parent = list(range(len(endpoint_nodes)))
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+    for a, b in pairs:
+        _union(int(a), int(b))
+
+    # Canonical representative per cluster
+    rep = {}
+    for i, n in enumerate(endpoint_nodes):
+        root = _find(i)
+        if root not in rep:
+            rep[root] = n
+    ep_old_to_new = {
+        endpoint_nodes[i]: rep[_find(i)]
+        for i in range(len(endpoint_nodes))
+    }
+
+    # ── 4) Build full mapping (internal nodes → identity) ────────────
+    old_to_new = {n: n for n in nodes}
+    old_to_new.update(ep_old_to_new)
+    n_changed = sum(1 for o, n in old_to_new.items() if o != n)
+
+    # ── 5) Rebuild graph with merged nodes + patch geometries ────────
+    G2 = nx.Graph()
+    for u, v, data in G.edges(data=True):
+        nu, nv = old_to_new.get(u, u), old_to_new.get(v, v)
+        if nu == nv:
+            continue
+        # PR #27 amend: patch geometry endpoints to match canonical nodes
+        geom = data.get("geometry")
+        if geom is not None and isinstance(geom, LineString) and not geom.is_empty:
+            coords_list = list(geom.coords)
+            changed = False
+            # Use proximity to match coords[0]/coords[-1] to nu/nv,
+            # since NetworkX may flip edge direction in undirected graphs.
+            from shapely.geometry import Point as _Point
+            p_first = _Point(coords_list[0])
+            p_last = _Point(coords_list[-1])
+            if u != nu and v != nv:
+                # Both endpoints remapped — match by proximity
+                if p_first.distance(_Point(nu)) <= p_first.distance(_Point(nv)):
+                    coords_list[0] = (nu[0], nu[1])
+                    coords_list[-1] = (nv[0], nv[1])
+                else:
+                    coords_list[0] = (nv[0], nv[1])
+                    coords_list[-1] = (nu[0], nu[1])
+                changed = True
+            elif u != nu:
+                # Only u changed
+                if p_first.distance(_Point(nu)) <= p_last.distance(_Point(nu)):
+                    coords_list[0] = (nu[0], nu[1])
+                else:
+                    coords_list[-1] = (nu[0], nu[1])
+                changed = True
+            elif v != nv:
+                # Only v changed
+                if p_first.distance(_Point(nv)) <= p_last.distance(_Point(nv)):
+                    coords_list[0] = (nv[0], nv[1])
+                else:
+                    coords_list[-1] = (nv[0], nv[1])
+                changed = True
+            if changed:
+                data = dict(data)
+                data["geometry"] = LineString(coords_list)
+        if G2.has_edge(nu, nv):
+            if data.get("length", 0) < G2[nu][nv].get("length", float("inf")):
+                G2[nu][nv].update(data)
+        else:
+            G2.add_edge(nu, nv, **data)
+
+    # Copy isolated nodes
+    for n in G.nodes():
+        if G.degree(n) == 0:
+            nn = old_to_new.get(n, n)
+            if nn not in G2:
+                G2.add_node(nn)
+
+    G.clear()
+    G.add_nodes_from(G2.nodes())
+    G.add_edges_from(G2.edges(data=True))
+
+    cc_after = nx.number_connected_components(G)
+
+    log.info(
+        "[TOPO SNAP] %d endpoints snapés (-%d uniques), "
+        "%d -> %d composantes connexes",
+        len(endpoint_nodes), n_changed, cc_before, cc_after,
+    )
+
+    return {
+        "endpoints_snapped": n_changed,
+        "cc_before": cc_before,
+        "cc_after": cc_after,
+    }
+
+
+# ---------------------------------------------------------------------------
 
 def _build_graph(
     infra: gpd.GeoDataFrame,
@@ -273,23 +431,24 @@ def _add_gc_neuf_to_graph(
 # ---------------------------------------------------------------------------
 
 
+# PR #27 Part A: sentinel to distinguish "not provided" from "explicitly None"
+_SENTINEL = object()
+
+
 def _bridge_components_with_gc_neuf(
     G: nx.Graph,
     pa_node: tuple[float, float],
     pb_node: tuple[float, float],
     flag_collector=None,
     max_bridge_length_m: float = 50.0,
+    public_area: object = _SENTINEL,  # PR #27 Part A: spatial validation
 ) -> bool:
     """If pa_node and pb_node belong to different connected components
-    AND the direct distance is within *max_bridge_length_m*, add a short
-    GC neuf C0 bridge and return True.
+    AND the direct distance is within *max_bridge_length_m* AND the bridge
+    lies within *public_area*, add a GC neuf C0 edge and return True.
 
-    Otherwise only flag the disconnection — NEVER create a long diagonal
-    across private parcels (PR #26: CDC compliance).
-
-    PR #22: in rural areas the welded graph may still be disconnected
-    by short gaps. Bridging resolves those gaps ONLY when the direct
-    distance is small enough to be a plausible public-domain connector.
+    Otherwise only flag the disconnection — NEVER create a diagonal
+    across private parcels (PR #26 / PR #27: CDC compliance).
     """
     try:
         cc_pa = nx.node_connected_component(G, pa_node)
@@ -303,7 +462,6 @@ def _bridge_components_with_gc_neuf(
     )
 
     if direct_length > max_bridge_length_m:
-        # Too far — flag instead of inventing a diagonal
         if flag_collector is not None:
             flag_collector.add(
                 "GC_NEUF_ROUTING_IMPOSSIBLE",
@@ -312,11 +470,33 @@ def _bridge_components_with_gc_neuf(
             )
         return False
 
-    # Short connector, geometrically plausible as a public-domain link
     bridge_geom = LineString([
         (pa_node[0], pa_node[1]),
         (pb_node[0], pb_node[1]),
     ])
+
+    # PR #27 Part A: spatial check — bridge must be in public domain
+    if public_area is not _SENTINEL:
+        if public_area is None or public_area.is_empty:
+            # No public domain info — fail closed, never create blind bridges
+            if flag_collector is not None:
+                flag_collector.add(
+                    "GC_NEUF_ROUTING_IMPOSSIBLE",
+                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
+                    message=f"Pont GC neuf impossible — domaine public inconnu, length={direct_length:.0f}m",
+                )
+            return False
+
+        # Use covers with small buffer tolerance for boundary cases
+        if not public_area.buffer(0.01).covers(bridge_geom):
+            if flag_collector is not None:
+                flag_collector.add(
+                    "GC_NEUF_PRIVATE_CROSSING",
+                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
+                    message=f"Bridge C0 rejete — traverse domaine prive, length={direct_length:.0f}m",
+                )
+            return False
+
     G.add_edge(
         pa_node, pb_node,
         length=direct_length,
@@ -331,12 +511,35 @@ def _bridge_components_with_gc_neuf(
         flag_collector.add(
             "GC_NEUF_GENERE_DIJKSTRA",
             target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-            message=f"Pont GC neuf C0 short-range, length={direct_length:.0f}m",
+            message=f"Pont GC neuf C0, length={direct_length:.0f}m",
         )
     return True
 
 
 # ---------------------------------------------------------------------------
+
+
+def _rebuild_strtree_indices(
+    G: nx.Graph,
+) -> tuple:
+    """Rebuild STRtree and edge_list after graph mutations (PR #27 Part C).
+
+    Returns (node_tree, edge_tree, nodes_list, edge_list) — non-None
+    when G has nodes/edges, otherwise (None, None, [], []).
+    """
+    nodes_list = list(G.nodes())
+    node_geoms = [Point(n[0], n[1]) for n in nodes_list]
+    node_tree = STRtree(node_geoms) if node_geoms else None
+
+    edge_list: list[tuple] = []
+    edge_geoms: list[LineString] = []
+    for u, v, data in G.edges(data=True):
+        line = LineString([(u[0], u[1]), (v[0], v[1])])
+        edge_list.append((u, v, data))
+        edge_geoms.append(line)
+    edge_tree = STRtree(edge_geoms) if edge_geoms else None
+
+    return node_tree, edge_tree, nodes_list, edge_list
 
 
 def route_pa_to_pb(
@@ -346,11 +549,16 @@ def route_pa_to_pb(
     ign_routes: gpd.GeoDataFrame,
     flag_collector=None,
     gc_neuf: gpd.GeoDataFrame | None = None,
+    public_area=None,  # PR #27 Part A: public domain for C0 validation
 ) -> gpd.GeoDataFrame:
     """Route all (PA, PB) pairs via Dijkstra and return traversed edges.
 
     *gc_neuf* (optional) — new C0 edges generated by pb_fictif, injected
     into the routing graph so they can be traversed by PA→PB paths.
+
+    *public_area* (optional, PR #27) — Shapely geometry of public domain
+    (communal parcels ∪ IGN route buffers). Bridges that cross outside
+    this area are rejected instead of creating private diagonals.
 
     Returns a GeoDataFrame of LineStrings with columns:
     ``sro``, ``pa_id``, ``pb_id``, ``statut``, ``mode_pose``, ``infra_type``,
@@ -372,6 +580,9 @@ def route_pa_to_pb(
     if G.number_of_nodes() == 0:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
+    # PR #27 Part B: snap close A/Z endpoints before routing
+    _topo_stats = _snap_endpoints_topology(G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M)
+
     # Spec C (PR #22): diagnostic on connected components
     n_cc = nx.number_connected_components(G)
     if n_cc > 0:
@@ -384,23 +595,9 @@ def route_pa_to_pb(
     edges_out: dict[str, dict] = {}  # PR #23 Feature D: deduplicate via edge key
 
     # Build STRtree indices for fast PA/PB snapping (PR #21)
-    node_tree = None
-    edge_tree = None
-    nodes_list = list(G.nodes())
+    # PR #27 Part C: use rebuild helper (avoids stale indices)
+    node_tree, edge_tree, nodes_list, edge_list = _rebuild_strtree_indices(G)
     node_coords_to_geom = {n: Point(n[0], n[1]) for n in nodes_list}
-    node_geoms = [node_coords_to_geom[n] for n in nodes_list]
-    if node_geoms:
-        node_tree = STRtree(node_geoms)
-
-    # Build edge list + STRtree for edge projection
-    edge_list: list[tuple] = []
-    edge_geoms: list = []
-    for u, v, data in G.edges(data=True):
-        line = LineString([(u[0], u[1]), (v[0], v[1])])
-        edge_list.append((u, v, data))
-        edge_geoms.append(line)
-    if edge_geoms:
-        edge_tree = STRtree(edge_geoms)
 
     def _snap(_pt: Point) -> Optional[tuple[float, float]]:
         # 0) Exact key
@@ -409,6 +606,7 @@ def route_pa_to_pb(
             return pk
 
         # 1) Nearest node
+        nonlocal node_tree, edge_tree, nodes_list, edge_list
         if node_tree is not None:
             buf = _pt.buffer(SNAP_TOLERANCE_M)
             candidates = node_tree.query(buf)
@@ -445,7 +643,6 @@ def route_pa_to_pb(
                     # PR #26: build proper sub-geometries from the original edge
                     orig_geom = edata.get("geometry")
                     if orig_geom is not None and isinstance(orig_geom, LineString):
-                        # Split the original LineString at the projection point
                         proj_dist = orig_geom.project(best_proj)
                         seg_a = shapely.ops.substring(orig_geom, 0, proj_dist)
                         seg_b = shapely.ops.substring(orig_geom, proj_dist, orig_geom.length)
@@ -454,6 +651,8 @@ def route_pa_to_pb(
                         seg_b = LineString([(best_proj.x, best_proj.y), (v[0], v[1])])
                     G.add_edge(u, new_key, length=d1, geometry=seg_a, **extra)
                     G.add_edge(new_key, v, length=d2, geometry=seg_b, **extra)
+                    # PR #27 Part C: rebuild indices after edge split
+                    node_tree, edge_tree, nodes_list, edge_list = _rebuild_strtree_indices(G)
                 if new_key in G:
                     return new_key
 
@@ -518,7 +717,9 @@ def route_pa_to_pb(
             else:
                 # Spec B (PR #22): bridge components with GC neuf C0
                 bridged = _bridge_components_with_gc_neuf(
-                    G, pa_node, pb_node, flag_collector=flag_collector
+                    G, pa_node, pb_node,
+                    flag_collector=flag_collector,
+                    public_area=public_area,  # PR #27
                 )
                 if bridged:
                     # Recompute tree after bridge insertion
@@ -605,7 +806,25 @@ def route_pa_to_pb(
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
 
+    # ── PR #27 Part D [GC QA] bridge diagnostics ─────────────────────────
+    _log_gc_qa(result, pa_sro)
+
     return result
+
+
+def _log_gc_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
+    """Log GC neuf bridge diagnostics (PR #27 Part D)."""
+    if df.empty:
+        return
+    sro_code = df.iloc[0].get("sro", "?")
+    n_total = len(df)
+    n_gc = int((df["infra_type"] == "gc_neuf").sum())
+    n_c0 = int((df["mode_pose"] == "C0").sum())
+    n_gc_neuf_src = int((df["src"] == "gc_neuf").sum())
+    log.info(
+        "[GC QA] %s total=%d gc_neuf_infra=%d C0_mode_pose=%d gc_neuf_src=%d",
+        sro_code, n_total, n_gc, n_c0, n_gc_neuf_src,
+    )
 
 
 def _log_infra_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
