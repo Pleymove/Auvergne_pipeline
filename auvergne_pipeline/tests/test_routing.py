@@ -146,3 +146,73 @@ def test_weld_uses_scipy_not_sklearn():
     assert 'sklearn' not in src, "routing.py ne doit plus importer sklearn"
     assert 'DBSCAN' not in src, "routing.py ne doit plus utiliser DBSCAN"
     assert 'cKDTree' in src, "routing.py doit utiliser scipy cKDTree"
+
+
+# ---------------------------------------------------------------------------
+# PR #23 — Bug A + Feature D tests
+# ---------------------------------------------------------------------------
+
+
+def test_infra_propagates_statut_mode_pose():
+    """Bug A : edges in the graph must carry statut/mode_pose from sources."""
+    import networkx as nx
+    from shapely.geometry import LineString
+    import geopandas as gpd
+    from auvergne_pipeline.routing import _build_graph
+
+    bt = gpd.GeoDataFrame({
+        "geometry": [LineString([(0, 0), (10, 0)])],
+        "statut": [None],
+        "mode_pose": ["E1"],
+        "src": ["bt"],
+    }, crs="EPSG:2154")
+    ign = gpd.GeoDataFrame(geometry=[], crs="EPSG:2154")
+    G = _build_graph(bt, ign)
+    edge_data = list(G.edges(data=True))[0][2]
+    assert edge_data.get("mode_pose") == "E1"
+    assert edge_data.get("infra_type") == "bt"
+
+
+def test_pa_to_pbs_share_common_path():
+    """Feature D : 2 neighbouring PBs must share edges (mutualisation)."""
+    import networkx as nx
+    from shapely.geometry import Point
+    import geopandas as gpd
+    import pandas as pd
+    from auvergne_pipeline.routing import route_pa_to_pb
+
+    G_test = nx.Graph()
+    # PA at (0,0), common trunk to (10,0), then branches to (12,2) and (12,-2)
+    G_test.add_edge((0.0, 0.0), (5.0, 0.0), length=5, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((5.0, 0.0), (10.0, 0.0), length=5, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((10.0, 0.0), (12.0, 2.0), length=2.83, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((10.0, 0.0), (12.0, -2.0), length=2.83, type="infra", statut="E", mode_pose="1")
+
+    pa = gpd.GeoDataFrame(
+        pd.DataFrame({"id_metier": ["PA1"], "sro": ["TEST"], "geometry": [Point(0, 0)]}),
+        geometry="geometry", crs="EPSG:2154",
+    )
+    pb = gpd.GeoDataFrame(
+        pd.DataFrame({
+            "pb_id": ["PB1", "PB2"], "pa_id": ["PA1", "PA1"],
+            "geometry": [Point(12, 2), Point(12, -2)],
+        }),
+        geometry="geometry", crs="EPSG:2154",
+    )
+
+    # Hack: replace _build_graph to return our test graph
+    import auvergne_pipeline.routing as routing_mod
+    _orig_build = routing_mod._build_graph
+    routing_mod._build_graph = lambda infra, ign, **kw: G_test
+    try:
+        routed = route_pa_to_pb(
+            pa, pb,
+            gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+        )
+    finally:
+        routing_mod._build_graph = _orig_build
+
+    # Mutualisation: 4 unique edges (not 6 = 2 paths x 3 edges each)
+    # Common trunk: (0,0)-(5,0)-(10,0) shared
+    assert len(routed) == 4, f"Expected 4 edges, got {len(routed)}"

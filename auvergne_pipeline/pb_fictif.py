@@ -141,6 +141,33 @@ def _snap_pb_to_infra(
 
 
 # ---------------------------------------------------------------------------
+# PR #23 Bug C — PB public-domain enforcement
+# ---------------------------------------------------------------------------
+
+
+def _ensure_pb_on_public_domain(
+    pb_geom: Point,
+    parcelle_publique_union,
+    ign_routes_buffered,
+    re_snap_radius_m: float = 50.0,
+):
+    """Verify PB is on public domain, else re-snap within 50 m.
+
+    Returns:
+        (pb_geom_corrected, flag) where flag is None (ok) or
+        'PB_PLACEMENT_PRIVE' (re-snap failed, needs manual review).
+    """
+    public = parcelle_publique_union.union(ign_routes_buffered)
+    if pb_geom.intersects(public.buffer(2)):
+        return pb_geom, None
+    # Re-snap: nearest point on public domain within re_snap_radius_m
+    _, nearest = nearest_points(pb_geom, public)
+    if pb_geom.distance(nearest) <= re_snap_radius_m:
+        return nearest, None  # re-snap succeeded, no flag
+    return pb_geom, "PB_PLACEMENT_PRIVE"  # failed, flag for manual review
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -150,6 +177,8 @@ def build_pb_fictifs(
     zapa_sro: gpd.GeoDataFrame,
     infra_edges: gpd.GeoDataFrame,
     flag_collector: Optional["flags_mod.FlagCollector"] = None,
+    parcelle_publique_union=None,     # PR #23 Bug C
+    ign_routes_buffered=None,         # PR #23 Bug C
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Generate fictitious PBs and any required GC neuf (C0) segments.
 
@@ -235,6 +264,20 @@ def build_pb_fictifs(
                         "PB_PLACEMENT_INCERTAIN",
                         target_url=pa_id,
                         message=f"PB non snapable sur infra (cluster {len(cl)} BAT)",
+                    )
+
+            # PR #23 Bug C: ensure PB is on public domain
+            if parcelle_publique_union is not None and pb_pt is not None:
+                pb_pt, pb_flag = _ensure_pb_on_public_domain(
+                    pb_pt,
+                    parcelle_publique_union,
+                    ign_routes_buffered or parcelle_publique_union.buffer(0),
+                )
+                if pb_flag is not None and flag_collector is not None:
+                    flag_collector.add(
+                        pb_flag,
+                        target_url=pa_id,
+                        message=f"PB place en parcelle privee pour cluster {len(cl)} BAT",
                     )
 
             pb_counter += 1

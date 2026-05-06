@@ -170,13 +170,22 @@ def _build_graph(
                     a = coords[i]
                     b = coords[i + 1]
                     length = Point(a).distance(Point(b))
+                    edge_attrs = {
+                        k: row.get(k)
+                        for k in ("statut", "mode_pose", "src", "sro_code")
+                        if k in gdf.columns
+                    }
+                    # PR #23 Bug A: tag infra_type for QML coloring
+                    edge_attrs.setdefault(
+                        "infra_type",
+                        edge_attrs.get("src") or attrs.get("type", "?"),
+                    )
                     G.add_edge(
                         _point_key(a),
                         _point_key(b),
                         length=length,
                         **attrs,
-                        **{k: row.get(k) for k in ("statut", "mode_pose", "src", "sro_code")
-                           if k in gdf.columns},
+                        **edge_attrs,
                     )
 
     _add_edges(infra, {"type": "infra"})
@@ -337,7 +346,7 @@ def route_pa_to_pb(
             n_cc, len(largest_cc), G.number_of_nodes(),
         )
 
-    edges_out: List[dict] = []
+    edges_out: dict[str, dict] = {}  # PR #23 Feature D: deduplicate via edge key
 
     # Build STRtree indices for fast PA/PB snapping (PR #21)
     node_tree = None
@@ -406,7 +415,7 @@ def route_pa_to_pb(
 
         return None
 
-    # ── For each PA, route all PA → PB ──────────────────────────────
+    # ── For each PA, route all PA → PB (PR #23 Feature D: single-source Dijkstra per PA) ──
     for _, pa in pa_sro.iterrows():
         pa_id = pa.get("id_metier", f"pa#{pa.name}")
         sro = pa.get("sro", "?")
@@ -426,32 +435,53 @@ def route_pa_to_pb(
         if pb4pa.empty:
             continue
 
+        # ── Snap all PBs first (may mutate G via edge projection) ─────
+        pb_snapped: list[tuple] = []  # (pb_row, pb_node, pb_id, pb_geom)
         for _, pb in pb4pa.iterrows():
-            pb_id = pb.get("pb_id", f"pb#{pb.name}")
-            pb_geom = pb.geometry
-
-            pb_node = _snap(pb_geom)
+            pb_node = _snap(pb.geometry)
             if pb_node is None:
+                # PB unreachable — flag immediately
                 if flag_collector is not None:
                     flag_collector.add(
                         "PA_PB_DECONNECTES",
-                        target_url=pb_id,
+                        target_url=pb.get("pb_id", f"pb#{pb.name}"),
                         message="PB non connectable au graphe",
                     )
                 continue
+            pb_snapped.append((pb, pb_node))
 
-            # Dijkstra
+        if not pb_snapped:
+            continue
+
+        # ── One Dijkstra tree per PA (after all PB snaps) ──────────────
+        def _dijkstra_tree():
             try:
-                path = nx.shortest_path(G, source=pa_node, target=pb_node, weight="length")
-            except nx.NetworkXNoPath:
+                _, paths = nx.single_source_dijkstra(
+                    G, source=pa_node, weight="length"
+                )
+                return paths
+            except (nx.NetworkXError, KeyError):
+                return {}
+
+        _paths = _dijkstra_tree()
+
+        for pb, pb_node in pb_snapped:
+            pb_id = pb.get("pb_id", f"pb#{pb.name}")
+
+            # Check if PB reachable from PA in current tree
+            if pb_node in _paths:
+                path = _paths[pb_node]
+            else:
                 # Spec B (PR #22): bridge components with GC neuf C0
                 bridged = _bridge_components_with_gc_neuf(
                     G, pa_node, pb_node, flag_collector=flag_collector
                 )
                 if bridged:
-                    try:
-                        path = nx.shortest_path(G, source=pa_node, target=pb_node, weight="length")
-                    except nx.NetworkXNoPath:
+                    # Recompute tree after bridge insertion
+                    _paths = _dijkstra_tree()
+                    if pb_node in _paths:
+                        path = _paths[pb_node]
+                    else:
                         if flag_collector is not None:
                             flag_collector.add(
                                 "PA_PB_DECONNECTES",
@@ -468,24 +498,27 @@ def route_pa_to_pb(
                         )
                     continue
 
-            # Collect edges along the path
+            # Collect edges along the path (PR #23 Feature D: deduplicate)
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 edge_data = G.get_edge_data(u, v)
                 if edge_data is None:
                     continue
-                edges_out.append({
-                    "sro": sro,
-                    "pa_id": pa_id,
-                    "pb_id": pb_id,
-                    "statut": edge_data.get("statut", ""),
-                    "mode_pose": edge_data.get("mode_pose", ""),
-                    "src": edge_data.get("src", edge_data.get("type", "")),
-                    "length_m": edge_data.get("length", 0.0),
-                    "geometry": LineString([Point(u[0], u[1]), Point(v[0], v[1])]),
-                })
+                ekey = _edge_key(u, v)
+                if ekey not in edges_out:
+                    edges_out[ekey] = {
+                        "sro": sro,
+                        "pa_id": pa_id,
+                        "pb_id": pb_id,
+                        "statut": edge_data.get("statut", ""),
+                        "mode_pose": edge_data.get("mode_pose", ""),
+                        "infra_type": edge_data.get("infra_type", edge_data.get("src", edge_data.get("type", ""))),
+                        "src": edge_data.get("src", edge_data.get("type", "")),
+                        "length_m": edge_data.get("length", 0.0),
+                        "geometry": LineString([Point(u[0], u[1]), Point(v[0], v[1])]),
+                    }
 
     if not edges_out:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
-    return gpd.GeoDataFrame(edges_out, geometry="geometry", crs=config.PROJECT_CRS)
+    return gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
