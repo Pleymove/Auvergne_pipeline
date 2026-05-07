@@ -259,3 +259,105 @@ def test_routing_no_sklearn_dependency():
     src = inspect.getsource(routing)
     assert "sklearn" not in src
     assert "DBSCAN" not in src
+
+
+# ---------------------------------------------------------------------------
+# Amend — [ROUTING QA] counts IGN BEFORE the IGN→gc_neuf conversion
+# ---------------------------------------------------------------------------
+
+
+def test_routing_qa_counts_ign_before_conversion(monkeypatch, caplog):
+    """Regression for the false-zero bug: ``ign_route_length_used_m`` must
+    be > 0 when Dijkstra actually traverses an IGN edge, even though the
+    final livrable_infra row reports ``src='gc_neuf'`` after conversion.
+
+    Setup: graph with ONLY an IGN edge between PA and PB, so Dijkstra is
+    forced to use it. The output GeoDataFrame will have ``src=='gc_neuf'``
+    (CDC conversion), but the raw-source counters must record
+    ``ign_route_length_used_m=20``.
+    """
+    import logging
+
+    G = nx.Graph()
+    G.add_edge(
+        (0.0, 0.0), (20.0, 0.0),
+        length=20, type="ign_route", src="ign_route",
+        infra_type="ign_route", statut="", mode_pose="",
+        geometry=LineString([(0, 0), (20, 0)]),
+    )
+    monkeypatch.setattr(routing, "_build_graph", lambda *a, **k: G)
+
+    pa = _pa()
+    pb = _pb([(20, 0, "PB1", "PA1")])
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        out = routing.route_pa_to_pb(
+            pa, pb,
+            gpd.GeoDataFrame(geometry=[], crs=CRS),
+            gpd.GeoDataFrame(geometry=[], crs=CRS),
+        )
+
+    # 1) The output is converted to gc_neuf (CDC), so reading src would lie.
+    assert len(out) == 1
+    assert out.iloc[0]["src"] == "gc_neuf"
+    assert out.iloc[0]["infra_type"] == "gc_neuf"
+    assert out.iloc[0]["mode_pose"] == "C0"
+
+    # 2) The new ROUTING QA log line must contain a non-zero
+    #    ign_route_length_used_m AND a converted_ign_to_gc_length_m.
+    qa_lines = [r.getMessage() for r in caplog.records if "[ROUTING QA]" in r.getMessage()]
+    assert qa_lines, "no [ROUTING QA] log line emitted"
+    ign_qa_lines = [m for m in qa_lines if "ign_route_length_used_m" in m]
+    assert ign_qa_lines, qa_lines
+    msg = ign_qa_lines[0]
+    # ign_route_length_used_m=20 (length=20)
+    assert "ign_route_length_used_m=20" in msg, msg
+    assert "converted_ign_to_gc_length_m=20" in msg, msg
+
+    # 3) raw_src_counts must surface ign_route as a raw family.
+    raw_count_lines = [m for m in qa_lines if "raw_src_counts" in m]
+    assert raw_count_lines, qa_lines
+    assert "ign_route=1" in raw_count_lines[0], raw_count_lines[0]
+
+    # 4) A WARNING line must flag the IGN traversal so Pierre sees it.
+    warn_lines = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and "ign_route_used_before_conversion" in r.getMessage()
+    ]
+    assert warn_lines, "expected a [ROUTING WARNING] for ign_route_used_before_conversion"
+
+
+def test_routing_qa_zero_when_no_ign_used(monkeypatch, caplog):
+    """Symmetric: when the path uses only existing infra, the IGN counter
+    is 0 and no IGN warning is emitted.
+    """
+    import logging
+
+    G = nx.Graph()
+    G.add_edge(
+        (0.0, 0.0), (20.0, 0.0),
+        length=20, type="infra", src="bt", infra_type="bt",
+        statut="E", mode_pose="1",
+        geometry=LineString([(0, 0), (20, 0)]),
+    )
+    monkeypatch.setattr(routing, "_build_graph", lambda *a, **k: G)
+
+    pa = _pa()
+    pb = _pb([(20, 0, "PB1", "PA1")])
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        out = routing.route_pa_to_pb(
+            pa, pb,
+            gpd.GeoDataFrame(geometry=[], crs=CRS),
+            gpd.GeoDataFrame(geometry=[], crs=CRS),
+        )
+
+    assert len(out) == 1
+    assert out.iloc[0]["src"] == "bt"
+    msgs = " || ".join(r.getMessage() for r in caplog.records)
+    assert "ign_route_length_used_m=0" in msgs, msgs
+    assert "converted_ign_to_gc_length_m=0" in msgs, msgs
+    # No IGN warning when no IGN was used.
+    ign_warns = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and "ign_route_used_before_conversion" in r.getMessage()
+    ]
+    assert not ign_warns

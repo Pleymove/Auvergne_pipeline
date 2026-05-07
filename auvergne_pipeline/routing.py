@@ -744,6 +744,17 @@ def route_pa_to_pb(
 
     edges_out: dict[str, dict] = {}  # PR #23 Feature D: deduplicate via edge key
 
+    # PR #29 amend — raw-source telemetry collected DURING path collection,
+    # BEFORE the output conversion (raw_type=="ign_route" → src="gc_neuf").
+    # Reading these counters from the final GeoDataFrame would always
+    # report 0 IGN since the conversion has happened by then. We therefore
+    # accumulate per-edge length grouped by raw_type/raw_src here and pass
+    # the result to ``_log_routing_qa`` at the end.
+    raw_src_lengths: dict[str, float] = {}
+    raw_src_counts: dict[str, int] = {}
+    raw_type_lengths: dict[str, float] = {}
+    converted_ign_to_gc_length_m = 0.0
+
     # Build STRtree indices for fast PA/PB snapping (PR #21)
     # PR #27 Part C: use rebuild helper (avoids stale indices)
     node_tree, edge_tree, nodes_list, edge_list = _rebuild_strtree_indices(G)
@@ -911,6 +922,23 @@ def route_pa_to_pb(
                     raw_src = edge_data.get("src", edge_data.get("type", ""))
                     raw_type = edge_data.get("type", "")
                     raw_infra = edge_data.get("infra_type", "")
+                    raw_length = float(edge_data.get("length", 0.0))
+
+                    # PR #29 amend — accumulate raw-source telemetry BEFORE
+                    # any conversion. ign_route_length_used_m is computed
+                    # from raw_type, not from the converted output src.
+                    raw_src_norm = (
+                        "gc_neuf" if raw_src == "gc_neuf_runtime" else raw_src
+                    ) or raw_type or ""
+                    raw_src_lengths[raw_src_norm] = (
+                        raw_src_lengths.get(raw_src_norm, 0.0) + raw_length
+                    )
+                    raw_src_counts[raw_src_norm] = (
+                        raw_src_counts.get(raw_src_norm, 0) + 1
+                    )
+                    raw_type_lengths[raw_type or ""] = (
+                        raw_type_lengths.get(raw_type or "", 0.0) + raw_length
+                    )
 
                     # PR #26: gc_neuf_runtime → gc_neuf (must not leak into GPKG)
                     if raw_src == "gc_neuf_runtime":
@@ -921,6 +949,8 @@ def route_pa_to_pb(
                         mode_pose = "C0"
                         infra_type = "gc_neuf"
                         src = "gc_neuf"
+                        # PR #29 amend — count IGN→GC conversion explicitly.
+                        converted_ign_to_gc_length_m += raw_length
                     elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
                         mode_pose = "C0"
                         infra_type = "gc_neuf"
@@ -950,7 +980,7 @@ def route_pa_to_pb(
                         "mode_pose": mode_pose,
                         "infra_type": infra_type,
                         "src": src,
-                        "length_m": edge_data.get("length", 0.0),
+                        "length_m": raw_length,
                         "geometry": out_geom,
                     }
 
@@ -996,8 +1026,16 @@ def route_pa_to_pb(
     # ── PR #28 [MUTUAL QA] mutualisation diagnostics ─────────────────────
     _log_mutual_qa(n_before_dedup, n_after_dedup, pa_sro)
 
-    # ── PR #29 A2: [ROUTING QA] src + length breakdown + private bridge WARNING ──
-    _log_routing_qa(result, sro_code_log)
+    # ── PR #29 A2 / amend: [ROUTING QA] uses RAW counters collected during
+    # path collection (BEFORE the ign_route → gc_neuf conversion), so
+    # ign_route_length_used_m reflects what Dijkstra actually traversed.
+    _log_routing_qa(
+        result, sro_code_log,
+        raw_src_lengths=raw_src_lengths,
+        raw_src_counts=raw_src_counts,
+        raw_type_lengths=raw_type_lengths,
+        converted_ign_to_gc_length_m=converted_ign_to_gc_length_m,
+    )
 
     # ── PR #29 B4: per-step + total perf logs ───────────────────────────
     perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start
@@ -1273,59 +1311,89 @@ def _log_gc_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
     )
 
 
-def _log_routing_qa(df: gpd.GeoDataFrame, sro_code: str) -> None:
-    """PR #29 A2 — log the share of routed length per source family.
+def _log_routing_qa(
+    df: gpd.GeoDataFrame,
+    sro_code: str,
+    *,
+    raw_src_lengths: dict[str, float] | None = None,
+    raw_src_counts: dict[str, int] | None = None,
+    raw_type_lengths: dict[str, float] | None = None,
+    converted_ign_to_gc_length_m: float = 0.0,
+) -> None:
+    """PR #29 A2 / amend — log routed length per RAW source family.
 
-    A high share of ``gc_neuf`` (or, if it ever leaks, ``ign_route``) is the
-    symptom of the it.17 metier bug where Dijkstra was preferring IGN over
-    existing aerial infrastructure. We log the breakdown unconditionally
-    so Pierre can spot the regression at a glance, and emit a
-    ``[ROUTING WARNING]`` line when the gc_neuf ratio is unusually high.
+    The breakdown is computed from the *raw* counters accumulated during
+    path collection (i.e. BEFORE the conversion that maps every
+    ``raw_type=="ign_route"`` edge to ``src="gc_neuf"``). Reading
+    ``df["src"]`` would always show ``ign_route_length_used_m=0`` since
+    by then every IGN edge has been rewritten — exactly the false-zero
+    bug Pierre asked us to fix.
+
+    Existing length stays based on the raw ``src`` family (bt/ft/athd/chem)
+    so the metric matches the natural infra inventory shown in
+    ``filters.build_reusable_infra``.
+
+    A ``[ROUTING WARNING]`` is emitted whenever:
+      * the gc_neuf share of total routed length exceeds 50 %, or
+      * any ign_route length was actually traversed by Dijkstra
+        (``ign_route_used_before_conversion``).
+
+    Both warnings are diagnostics; the final livrable_infra format is
+    unchanged (IGN→gc_neuf conversion stays in place per CDC).
     """
     if df is None or df.empty:
         return
 
-    src_col = df["src"] if "src" in df.columns else pd.Series(dtype=str)
-    length_col = df["length_m"] if "length_m" in df.columns else pd.Series(dtype=float)
-
-    # ── Length per src family ───────────────────────────────────────────
-    grouped = df.groupby(src_col).agg(
-        count=("length_m", "size"),
-        total_m=("length_m", "sum"),
-    )
-    counts = {str(idx): int(row["count"]) for idx, row in grouped.iterrows()}
-    lengths = {str(idx): float(row["total_m"]) for idx, row in grouped.iterrows()}
+    raw_src_lengths = raw_src_lengths or {}
+    raw_src_counts = raw_src_counts or {}
+    raw_type_lengths = raw_type_lengths or {}
 
     existing_keys = ("bt", "ft", "athd", "chem")
-    existing_length = sum(lengths.get(k, 0.0) for k in existing_keys)
-    gc_length = lengths.get("gc_neuf", 0.0)
-    ign_length = lengths.get("ign_route", 0.0)
-    total = float(length_col.sum()) if not length_col.empty else 0.0
+    existing_length = sum(raw_src_lengths.get(k, 0.0) for k in existing_keys)
 
-    # Single-line breakdown of existing/gc/ign lengths for easy log scrubbing.
-    log.info(
-        "[ROUTING QA] sro=%s existing_length_m=%.0f gc_neuf_length_m=%.0f "
-        "ign_route_length_used_m=%.0f total_length_m=%.0f",
-        sro_code, existing_length, gc_length, ign_length, total,
+    # "True" gc_neuf = pre-existing GC neuf injected via _add_gc_neuf_to_graph
+    # OR generated as a runtime bridge. Both end up with raw_src=="gc_neuf"
+    # AND raw_type=="gc_neuf"; we take the max so a column missing in one
+    # of the two counters does not under-report the share. This is
+    # explicitly independent of the IGN-to-C0 conversion.
+    true_gc_length = max(
+        raw_src_lengths.get("gc_neuf", 0.0),
+        raw_type_lengths.get("gc_neuf", 0.0),
     )
 
-    # Counts per src — so it shows clearly how many segments by source.
-    src_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    log.info("[ROUTING QA] sro=%s src_counts %s", sro_code, src_str or "(vide)")
+    ign_length = raw_type_lengths.get("ign_route", 0.0)
+    total = float(df["length_m"].sum()) if "length_m" in df.columns else 0.0
 
-    # Symptom check: gc_neuf should not be the majority on a normal SRO.
-    # Threshold 50 % of the total routed length is conservative and matches
-    # the it.17 anomaly Pierre flagged on 63048/QBO/PMZ/56826.
-    if total > 0 and gc_length / total > 0.50:
+    log.info(
+        "[ROUTING QA] sro=%s existing_length_m=%.0f true_gc_neuf_length_m=%.0f "
+        "ign_route_length_used_m=%.0f converted_ign_to_gc_length_m=%.0f "
+        "total_length_m=%.0f",
+        sro_code, existing_length, true_gc_length, ign_length,
+        converted_ign_to_gc_length_m, total,
+    )
+
+    # Per-raw-src counts: show every family present, including ign_route
+    # so a leak is visible at a glance.
+    if raw_src_counts:
+        src_str = ", ".join(f"{k}={v}" for k, v in sorted(raw_src_counts.items()))
+        log.info("[ROUTING QA] sro=%s raw_src_counts %s", sro_code, src_str)
+
+    # ── WARNINGs ─────────────────────────────────────────────────────────
+    # 1) gc_neuf share of the total routed length (CDC threshold = 50 %).
+    if total > 0 and (true_gc_length + converted_ign_to_gc_length_m) / total > 0.50:
         log.warning(
-            "[ROUTING WARNING] sro=%s high_gc_ratio=%.2f gc_length=%.0fm total=%.0fm",
-            sro_code, gc_length / total, gc_length, total,
+            "[ROUTING WARNING] sro=%s high_gc_ratio=%.2f true_gc=%.0fm "
+            "converted_ign=%.0fm total=%.0fm",
+            sro_code,
+            (true_gc_length + converted_ign_to_gc_length_m) / total,
+            true_gc_length, converted_ign_to_gc_length_m, total,
         )
+    # 2) Any IGN length actually traversed by Dijkstra is suspicious — even
+    #    though the output converts it to C0/gc_neuf, a non-zero value here
+    #    means the routing relied on IGN despite the ×30 weight.
     if ign_length > 0:
-        # ign_route should never appear in livrable_infra (PR #26: converted
-        # to C0/gc_neuf at output). If it does, log a warning.
         log.warning(
-            "[ROUTING WARNING] sro=%s ign_route_in_livrable_infra=%.0fm — devrait etre 0",
+            "[ROUTING WARNING] sro=%s ign_route_used_before_conversion=%.0fm",
             sro_code, ign_length,
         )
 
