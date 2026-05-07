@@ -10,6 +10,7 @@ Business rules (Pierre, 05/05/2026):
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List, Optional
 
@@ -20,6 +21,8 @@ from shapely.geometry import LineString, MultiPoint, Point
 from shapely.ops import nearest_points
 
 from . import config, flags as flags_mod
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -276,22 +279,31 @@ def build_pb_fictifs(
                         message=f"PB non snapable sur infra (cluster {len(cl)} BAT)",
                     )
 
-            # PR #23 Bug C: ensure PB is on public domain
+            pb_counter += 1
+            pb_id = f"PB_{sro_code}_{pb_counter}"
+
+            # Determine placement status for QA and routing safety
+            placement_status = "PB_PLACEMENT_PUBLIC"
             if parcelle_publique_union is not None and pb_pt is not None:
-                pb_pt, pb_flag = _ensure_pb_on_public_domain(
+                pb_pt_corrected, pb_flag = _ensure_pb_on_public_domain(
                     pb_pt,
                     parcelle_publique_union,
                     ign_routes_buffered or parcelle_publique_union.buffer(0),
                 )
-                if pb_flag is not None and flag_collector is not None:
-                    flag_collector.add(
-                        pb_flag,
-                        target_url=pa_id,
-                        message=f"PB place en parcelle privee pour cluster {len(cl)} BAT",
-                    )
-
-            pb_counter += 1
-            pb_id = f"PB_{sro_code}_{pb_counter}"
+                if pb_flag is not None:
+                    # Re-snap failed — PB stays in private land, flag only
+                    placement_status = pb_flag
+                    if flag_collector is not None:
+                        flag_collector.add(
+                            pb_flag,
+                            target_url=pa_id,
+                            message=f"PB place en parcelle privee pour cluster {len(cl)} BAT",
+                        )
+                else:
+                    pb_pt = pb_pt_corrected
+            elif pb_pt is not None:
+                # No public domain info — mark uncertain
+                placement_status = "PB_PLACEMENT_INCERTAIN"
 
             pb_rows.append({
                 "pb_id": pb_id,
@@ -300,8 +312,13 @@ def build_pb_fictifs(
                 "nb_prises": int(cl_w),
                 "bat_count": len(cl),
                 "farthest_bat_d3_m": round(farthest_dist, 1),
+                "placement_status": placement_status,  # PR #28 BLOQUANT 3
                 "geometry": pb_pt,
             })
+
+            # PR #28 BLOQUANT 3: NEVER create gc_line for private PBs
+            if placement_status == "PB_PLACEMENT_PRIVE":
+                continue
 
             # If PB is not on existing infra, create GC neuf (C0) from
             # the PA to the PB
@@ -327,5 +344,16 @@ def build_pb_fictifs(
     gc_gdf = gpd.GeoDataFrame(
         gc_rows, geometry="geometry", crs=config.PROJECT_CRS
     ) if gc_rows else gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
+
+    # ── PR #28 BLOQUANT 3 [PB QA] diagnostics ──────────────────────────
+    if not pb_gdf.empty:
+        n_total = len(pb_gdf)
+        n_public = int((pb_gdf["placement_status"] == "PB_PLACEMENT_PUBLIC").sum())
+        n_private = int((pb_gdf["placement_status"] == "PB_PLACEMENT_PRIVE").sum())
+        n_uncertain = n_total - n_public - n_private
+        log.info(
+            "[PB QA] total=%d public=%d private_flagged=%d uncertain=%d",
+            n_total, n_public, n_private, n_uncertain,
+        )
 
     return pb_gdf, gc_gdf
