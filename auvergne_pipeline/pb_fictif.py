@@ -148,36 +148,133 @@ def _snap_pb_to_infra(
 # ---------------------------------------------------------------------------
 
 
+# PR #29 A4 — explicit PB placement statuses
+PB_PLACEMENT_PUBLIC_PARCELLE = "PB_PLACEMENT_PUBLIC_PARCELLE"
+PB_PLACEMENT_PUBLIC_ROUTE_BUFFER = "PB_PLACEMENT_PUBLIC_ROUTE_BUFFER"
+PB_PLACEMENT_PRIVE = "PB_PLACEMENT_PRIVE"
+PB_PLACEMENT_INCERTAIN = "PB_PLACEMENT_INCERTAIN"
+
+# Status families that allow GC neuf creation. Private / uncertain MUST NOT
+# emit a GC neuf row — those PBs are flagged for manual review only.
+PB_PLACEMENT_PUBLIC_FAMILY = (
+    PB_PLACEMENT_PUBLIC_PARCELLE,
+    PB_PLACEMENT_PUBLIC_ROUTE_BUFFER,
+)
+
+
+def _classify_pb_placement(
+    pb_geom: Point,
+    parcelle_publique_union,
+    ign_routes_buffered,
+    re_snap_radius_m: float = 50.0,
+) -> tuple[Point, str]:
+    """Classify a PB placement and snap onto public geometry if needed.
+
+    PR #29 A4: distinguish four explicit statuses instead of merging
+    "PB on parcelle publique" with "PB merely inside the IGN buffer".
+
+    Returns
+    -------
+    (pb_geom_corrected, status)
+
+    status is one of :
+    - PB_PLACEMENT_PUBLIC_PARCELLE     — PB lies on a communal parcel
+    - PB_PLACEMENT_PUBLIC_ROUTE_BUFFER — PB only via the IGN road buffer,
+                                         snapped to the nearest public point
+    - PB_PLACEMENT_PRIVE               — re-snap failed within
+                                         ``re_snap_radius_m``
+    - PB_PLACEMENT_INCERTAIN           — no public reference available
+
+    The status is computed AFTER any required re-snap, so an initially
+    private PB that lands on a parcelle publique after the re-snap is
+    classified as PUBLIC_PARCELLE (not PRIVE).
+    """
+    has_parc = (
+        parcelle_publique_union is not None
+        and not parcelle_publique_union.is_empty
+    )
+    has_ign = (
+        ign_routes_buffered is not None
+        and not ign_routes_buffered.is_empty
+    )
+
+    if not has_parc and not has_ign:
+        return pb_geom, PB_PLACEMENT_INCERTAIN
+
+    # Step 1 — already on a parcelle publique?
+    if has_parc and pb_geom.intersects(parcelle_publique_union.buffer(2)):
+        return pb_geom, PB_PLACEMENT_PUBLIC_PARCELLE
+
+    # Step 2 — accepted via IGN buffer but NOT on a parcelle publique:
+    # snap to the nearest exact public geometry (parcelle publique edge or
+    # IGN buffer edge) so the PB sits on a real public reference, not in
+    # the middle of a buffered void.
+    if has_ign and pb_geom.intersects(ign_routes_buffered):
+        # Snap target = union(parcelle_publique, ign_routes_buffered.boundary)
+        # so we land either on a public parcel or on a road centre/edge,
+        # never floating in the middle of an arbitrary buffer.
+        boundary = ign_routes_buffered.boundary
+        if has_parc:
+            try:
+                snap_target = parcelle_publique_union.union(boundary)
+            except Exception:
+                snap_target = boundary
+        else:
+            snap_target = boundary
+        if snap_target is None or snap_target.is_empty:
+            return pb_geom, PB_PLACEMENT_PRIVE
+        _, nearest = nearest_points(pb_geom, snap_target)
+        # If the snap result happens to land on a parcelle publique,
+        # promote the status accordingly.
+        if has_parc and nearest.intersects(parcelle_publique_union.buffer(0.5)):
+            return nearest, PB_PLACEMENT_PUBLIC_PARCELLE
+        return nearest, PB_PLACEMENT_PUBLIC_ROUTE_BUFFER
+
+    # Step 3 — outside both references: try a 50 m re-snap onto the public
+    # union. If it lands close enough, prefer the parcelle publique side.
+    parts = []
+    if has_parc:
+        parts.append(parcelle_publique_union)
+    if has_ign:
+        parts.append(ign_routes_buffered)
+    public_union = parts[0] if len(parts) == 1 else parts[0].union(parts[1])
+    if public_union is None or public_union.is_empty:
+        return pb_geom, PB_PLACEMENT_PRIVE
+    _, nearest = nearest_points(pb_geom, public_union)
+    if pb_geom.distance(nearest) <= re_snap_radius_m:
+        if has_parc and nearest.intersects(parcelle_publique_union.buffer(0.5)):
+            return nearest, PB_PLACEMENT_PUBLIC_PARCELLE
+        return nearest, PB_PLACEMENT_PUBLIC_ROUTE_BUFFER
+
+    # Re-snap failed — the PB stays in private land for manual review.
+    return pb_geom, PB_PLACEMENT_PRIVE
+
+
 def _ensure_pb_on_public_domain(
     pb_geom: Point,
     parcelle_publique_union,
     ign_routes_buffered,
     re_snap_radius_m: float = 50.0,
 ):
-    """Verify PB is on public domain, else re-snap within 50 m.
+    """Backwards-compatible wrapper around :func:`_classify_pb_placement`.
 
-    Returns:
-        (pb_geom_corrected, flag) where flag is None (ok) or
-        'PB_PLACEMENT_PRIVE' (re-snap failed, needs manual review).
+    Returns ``(pb_geom_corrected, flag)`` where *flag* is ``None`` when the
+    PB ends up on the public domain (any flavour) and
+    ``"PB_PLACEMENT_PRIVE"`` when the re-snap fails.
+
+    PR #29 A4 keeps this function for the existing PR23 unit tests; the
+    new four-statut classifier ``_classify_pb_placement`` is what the
+    pipeline calls.
     """
-    if parcelle_publique_union is None or parcelle_publique_union.is_empty:
-        public = ign_routes_buffered
-    elif ign_routes_buffered is None or ign_routes_buffered.is_empty:
-        public = parcelle_publique_union
-    else:
-        public = parcelle_publique_union.union(ign_routes_buffered)
-
-    # If we have no public reference at all, can't verify — flag and keep PB.
-    if public is None or public.is_empty:
+    pb_geom_out, status = _classify_pb_placement(
+        pb_geom, parcelle_publique_union, ign_routes_buffered, re_snap_radius_m,
+    )
+    if status in PB_PLACEMENT_PUBLIC_FAMILY:
+        return pb_geom_out, None
+    if status == PB_PLACEMENT_INCERTAIN:
+        # Historical behaviour was to flag PRIVE on missing public references.
         return pb_geom, "PB_PLACEMENT_PRIVE"
-
-    if pb_geom.intersects(public.buffer(2)):
-        return pb_geom, None
-    # Re-snap: nearest point on public domain within re_snap_radius_m
-    _, nearest = nearest_points(pb_geom, public)
-    if pb_geom.distance(nearest) <= re_snap_radius_m:
-        return nearest, None  # re-snap succeeded, no flag
-    return pb_geom, "PB_PLACEMENT_PRIVE"  # failed, flag for manual review
+    return pb_geom, status  # PB_PLACEMENT_PRIVE
 
 
 # ---------------------------------------------------------------------------
@@ -282,28 +379,41 @@ def build_pb_fictifs(
             pb_counter += 1
             pb_id = f"PB_{sro_code}_{pb_counter}"
 
-            # Determine placement status for QA and routing safety
-            placement_status = "PB_PLACEMENT_PUBLIC"
-            if parcelle_publique_union is not None and pb_pt is not None:
-                pb_pt_corrected, pb_flag = _ensure_pb_on_public_domain(
-                    pb_pt,
-                    parcelle_publique_union,
-                    ign_routes_buffered or parcelle_publique_union.buffer(0),
+            # PR #29 A4: 4-statut classification (PUBLIC_PARCELLE /
+            # PUBLIC_ROUTE_BUFFER / PRIVE / INCERTAIN). PUBLIC_ROUTE_BUFFER
+            # PBs are snapped onto exact public geometry (parcelle publique
+            # boundary or IGN road), they no longer float inside a buffer.
+            placement_status = PB_PLACEMENT_PUBLIC_PARCELLE
+            if pb_pt is not None and (
+                (parcelle_publique_union is not None
+                 and not parcelle_publique_union.is_empty)
+                or (ign_routes_buffered is not None
+                    and not ign_routes_buffered.is_empty)
+            ):
+                pb_pt_corrected, placement_status = _classify_pb_placement(
+                    pb_pt, parcelle_publique_union, ign_routes_buffered,
                 )
-                if pb_flag is not None:
-                    # Re-snap failed — PB stays in private land, flag only
-                    placement_status = pb_flag
+                if placement_status in PB_PLACEMENT_PUBLIC_FAMILY:
+                    pb_pt = pb_pt_corrected
+                else:
+                    # PRIVE / INCERTAIN — flag for manual review and keep
+                    # the original PB geometry (do NOT use a phantom snap).
                     if flag_collector is not None:
                         flag_collector.add(
-                            pb_flag,
+                            placement_status,
                             target_url=pa_id,
-                            message=f"PB place en parcelle privee pour cluster {len(cl)} BAT",
+                            message=(
+                                f"PB place en parcelle privee pour cluster "
+                                f"{len(cl)} BAT"
+                                if placement_status == PB_PLACEMENT_PRIVE
+                                else (
+                                    f"PB placement incertain pour cluster "
+                                    f"{len(cl)} BAT (domaine public inconnu)"
+                                )
+                            ),
                         )
-                else:
-                    pb_pt = pb_pt_corrected
             elif pb_pt is not None:
-                # No public domain info — mark uncertain
-                placement_status = "PB_PLACEMENT_INCERTAIN"
+                placement_status = PB_PLACEMENT_INCERTAIN
 
             pb_rows.append({
                 "pb_id": pb_id,
@@ -312,12 +422,12 @@ def build_pb_fictifs(
                 "nb_prises": int(cl_w),
                 "bat_count": len(cl),
                 "farthest_bat_d3_m": round(farthest_dist, 1),
-                "placement_status": placement_status,  # PR #28 BLOQUANT 3
+                "placement_status": placement_status,  # PR #28 BLOQUANT 3 + PR #29 A4
                 "geometry": pb_pt,
             })
 
-            # PR #28 BLOQUANT 3: NEVER create gc_line for private PBs
-            if placement_status == "PB_PLACEMENT_PRIVE":
+            # PR #28 BLOQUANT 3 / PR #29 A4: only PUBLIC_* PBs trigger gc_line.
+            if placement_status not in PB_PLACEMENT_PUBLIC_FAMILY:
                 continue
 
             # If PB is not on existing infra, create GC neuf (C0) from
@@ -345,15 +455,22 @@ def build_pb_fictifs(
         gc_rows, geometry="geometry", crs=config.PROJECT_CRS
     ) if gc_rows else gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
-    # ── PR #28 BLOQUANT 3 [PB QA] diagnostics ──────────────────────────
+    # ── PR #28 BLOQUANT 3 / PR #29 A4 [PB QA] diagnostics ──────────────
     if not pb_gdf.empty:
         n_total = len(pb_gdf)
-        n_public = int((pb_gdf["placement_status"] == "PB_PLACEMENT_PUBLIC").sum())
-        n_private = int((pb_gdf["placement_status"] == "PB_PLACEMENT_PRIVE").sum())
-        n_uncertain = n_total - n_public - n_private
+        statuses = pb_gdf["placement_status"]
+        n_parc = int((statuses == PB_PLACEMENT_PUBLIC_PARCELLE).sum())
+        n_buf = int((statuses == PB_PLACEMENT_PUBLIC_ROUTE_BUFFER).sum())
+        n_priv = int((statuses == PB_PLACEMENT_PRIVE).sum())
+        n_unc = int((statuses == PB_PLACEMENT_INCERTAIN).sum())
+        # Backwards-compat: any leftover legacy "PB_PLACEMENT_PUBLIC" still
+        # counts as parcelle publique for the breakdown total.
+        n_legacy_public = int((statuses == "PB_PLACEMENT_PUBLIC").sum())
+        n_parc += n_legacy_public
         log.info(
-            "[PB QA] total=%d public=%d private_flagged=%d uncertain=%d",
-            n_total, n_public, n_private, n_uncertain,
+            "[PB QA] total=%d public_parcelle=%d public_route_buffer=%d "
+            "private=%d uncertain=%d",
+            n_total, n_parc, n_buf, n_priv, n_unc,
         )
 
     return pb_gdf, gc_gdf

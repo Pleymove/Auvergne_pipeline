@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import List, Optional
 
 import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+import shapely
 from shapely.geometry import LineString, Point
 from shapely import STRtree
 import shapely.ops  # PR #26: substring for edge geometry splitting
@@ -36,6 +38,54 @@ SNAP_PROJECTION_RADIUS_M = 200.0  # edge-projection fallback radius (PR #21)
 WELD_RADIUS_M = 2.0             # node fusion radius for topology welding (PR #22)
 SNAP_ENDPOINT_RADIUS_M = 3.0    # A/Z endpoint snap radius (PR #27: close gaps)
 EDGE_KEY_SEP = "::"
+
+# PR #28: sentinel to distinguish "not provided" from "explicitly None"
+_SENTINEL = object()
+
+# ---------------------------------------------------------------------------
+# PR #29 — Routing weight hierarchy (CDC: prefer existing over IGN/GC neuf)
+# ---------------------------------------------------------------------------
+# Existing infrastructure (bt/ft/athd/chem) gets the natural length cost.
+# GC neuf (artificial bridges) is heavily penalised so Dijkstra only takes
+# them as a last resort when there is no existing path.
+# IGN BD TOPO routes (raw road centrelines) are penalised even more, since
+# any IGN traversal that ends up in livrable_infra is converted to C0 — we
+# only want IGN as a last-resort topological connector.
+WEIGHT_FACTOR_GC_NEUF = 10.0
+WEIGHT_FACTOR_IGN_ROUTE = 30.0
+
+
+def _routing_weight_for(data: dict) -> float:
+    """Compute the Dijkstra weight for an edge based on its source type.
+
+    Strict hierarchy: existing < gc_neuf < ign_route. The base unit is the
+    geometric length so that a path through existing infra is always picked
+    when one exists, even if a few extra metres longer than an IGN/C0 path.
+    """
+    base = float(data.get("length", 1.0))
+    edge_type = data.get("type")
+    if edge_type == "gc_neuf":
+        return base * WEIGHT_FACTOR_GC_NEUF
+    if edge_type == "ign_route":
+        return base * WEIGHT_FACTOR_IGN_ROUTE
+    return base
+
+
+def _public_area_safe(public_area):
+    """Pre-compute ``public_area.buffer(0.01)`` once per SRO (PR #29 B1).
+
+    Returns ``None`` when *public_area* is missing/empty so callers can
+    short-circuit without recomputing the buffer in inner loops.
+    """
+    if public_area is None or public_area is _SENTINEL:
+        return None
+    if hasattr(public_area, "is_empty") and public_area.is_empty:
+        return None
+    try:
+        return public_area.buffer(0.01)
+    except Exception:
+        return None
+
 
 def _explode_to_linestrings(geom):
     """Yield LineString parts from a (Multi)LineString geometry."""
@@ -384,15 +434,12 @@ def _build_graph(
 # ---------------------------------------------------------------------------
 
 
-# PR #28: sentinel to distinguish "not provided" from "explicitly None"
-_SENTINEL = object()
-
-
 def _add_gc_neuf_to_graph(
     G: nx.Graph,
     gc_neuf: gpd.GeoDataFrame,
     snap_tol: float = SNAP_TOLERANCE_M,
     public_area: object = _SENTINEL,  # PR #28: spatial validation
+    public_area_safe=None,            # PR #29 B1: pre-buffered for perf
     flag_collector=None,
 ) -> int:
     """Add GC neuf C0 edges into graph, snapping endpoints to nearest nodes.
@@ -403,9 +450,17 @@ def _add_gc_neuf_to_graph(
 
     PR #28 BLOQUANT 2: edges crossing outside *public_area* are rejected
     with flag GC_NEUF_PRIVATE_CROSSING. Returns count of rejected edges.
+
+    PR #29 B1: when ``public_area_safe`` is provided, it MUST equal
+    ``public_area.buffer(0.01)`` and is used directly to avoid recomputing
+    the buffer per edge (was N×buffer in inner loop).
     """
     if gc_neuf is None or gc_neuf.empty:
         return 0
+
+    # Pre-compute buffered public area if not provided (B1).
+    if public_area is not _SENTINEL and public_area_safe is None:
+        public_area_safe = _public_area_safe(public_area)
 
     n_rejected = 0
 
@@ -435,10 +490,10 @@ def _add_gc_neuf_to_graph(
         pk_a = _snap_endpoint(coords[0])
         pk_b = _snap_endpoint(coords[-1])
 
-        # ── PR #28 BLOQUANT 2: spatial check on GC neuf geometry ──────
+        # ── PR #28 BLOQUANT 2 / PR #29 B1: spatial check on GC neuf geometry ──
         gc_geom = LineString(coords)
         if public_area is not _SENTINEL:
-            if public_area is None or public_area.is_empty:
+            if public_area_safe is None:
                 if flag_collector is not None:
                     flag_collector.add(
                         "GC_NEUF_ROUTING_IMPOSSIBLE",
@@ -447,7 +502,7 @@ def _add_gc_neuf_to_graph(
                     )
                 n_rejected += 1
                 continue
-            if not public_area.buffer(0.01).covers(gc_geom):
+            if not public_area_safe.covers(gc_geom):
                 if flag_collector is not None:
                     flag_collector.add(
                         "GC_NEUF_PRIVATE_CROSSING",
@@ -493,6 +548,7 @@ def _bridge_components_with_gc_neuf(
     flag_collector=None,
     max_bridge_length_m: float = 50.0,
     public_area: object = _SENTINEL,  # PR #27 Part A: spatial validation
+    public_area_safe=None,             # PR #29 B1: pre-buffered for perf
 ) -> bool:
     """If pa_node and pb_node belong to different connected components
     AND the direct distance is within *max_bridge_length_m* AND the bridge
@@ -526,9 +582,11 @@ def _bridge_components_with_gc_neuf(
         (pb_node[0], pb_node[1]),
     ])
 
-    # PR #27 Part A: spatial check — bridge must be in public domain
+    # PR #27 Part A / PR #29 B1: spatial check — bridge must be in public domain
     if public_area is not _SENTINEL:
-        if public_area is None or public_area.is_empty:
+        if public_area_safe is None:
+            public_area_safe = _public_area_safe(public_area)
+        if public_area_safe is None:
             # No public domain info — fail closed, never create blind bridges
             if flag_collector is not None:
                 flag_collector.add(
@@ -538,8 +596,7 @@ def _bridge_components_with_gc_neuf(
                 )
             return False
 
-        # Use covers with small buffer tolerance for boundary cases
-        if not public_area.buffer(0.01).covers(bridge_geom):
+        if not public_area_safe.covers(bridge_geom):
             if flag_collector is not None:
                 flag_collector.add(
                     "GC_NEUF_PRIVATE_CROSSING",
@@ -557,7 +614,8 @@ def _bridge_components_with_gc_neuf(
         src="gc_neuf",
         infra_type="gc_neuf",
         geometry=bridge_geom,
-        _routing_weight=direct_length * 10.0,  # PR #28 amend B2
+        # PR #29 A1: weight follows hierarchy (gc_neuf factor 10).
+        _routing_weight=direct_length * WEIGHT_FACTOR_GC_NEUF,
     )
     if flag_collector is not None:
         flag_collector.add(
@@ -622,35 +680,58 @@ def route_pa_to_pb(
     if pa_sro is None or pa_sro.empty or pb_sro is None or pb_sro.empty:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
+    # PR #29 B4: per-step timing for [ROUTING PERF] logs
+    sro_code_log = pa_sro.iloc[0].get("sro", "?") if len(pa_sro) > 0 else "?"
+    t_total_start = time.perf_counter()
+    perf: dict[str, float] = {}
+
+    # PR #29 B1: pre-compute the buffered public area ONCE per SRO.
+    public_area_safe = _public_area_safe(public_area)
+
     # Build combined graph
+    t0 = time.perf_counter()
     G = _build_graph(infra_filtered, ign_routes, snap_tol=SNAP_TOLERANCE_M)
+    perf["build_graph"] = time.perf_counter() - t0
 
     # Inject GC neuf C0 edges (snaps endpoints to existing nodes first)
+    t0 = time.perf_counter()
     n_rejected = 0
     if gc_neuf is not None and not gc_neuf.empty:
         n_rejected = _add_gc_neuf_to_graph(
             G, gc_neuf, snap_tol=SNAP_TOLERANCE_M,
-            public_area=public_area, flag_collector=flag_collector,  # PR #28
+            public_area=public_area,
+            public_area_safe=public_area_safe,  # PR #29 B1
+            flag_collector=flag_collector,
         )
     if n_rejected:
         log.info("[GC QA] %d GC neuf edges rejected (private crossing)", n_rejected)
+    perf["add_gc_neuf"] = time.perf_counter() - t0
 
     if G.number_of_nodes() == 0:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     # PR #27 Part B: snap close A/Z endpoints before routing
+    t0 = time.perf_counter()
     _topo_stats = _snap_endpoints_topology(G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M)
+    perf["snap_endpoints_topology"] = time.perf_counter() - t0
 
     # PR #28 BLOQUANT 4: snap degree-1 endpoints onto nearby lines
+    t0 = time.perf_counter()
     _line_snap_stats = _snap_endpoints_to_lines(
         G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M,
-        public_area=public_area, flag_collector=flag_collector,  # PR #28 amend B1
+        public_area=public_area,
+        public_area_safe=public_area_safe,  # PR #29 B1
+        flag_collector=flag_collector,
     )
+    perf["snap_endpoints_to_lines"] = time.perf_counter() - t0
 
-    # PR #28 BLOQUANT 5: penalize gc_neuf in routing (priority to existing infra)
+    # PR #29 A1: hierarchical routing weights — prefer existing infra over
+    # gc_neuf, and gc_neuf over IGN routes. The factors are documented
+    # at module top (WEIGHT_FACTOR_*).
+    t0 = time.perf_counter()
     for u, v, data in G.edges(data=True):
-        base = data.get("length", 1.0)
-        data["_routing_weight"] = base * 10.0 if data.get("type") == "gc_neuf" else base
+        data["_routing_weight"] = _routing_weight_for(data)
+    perf["prepare_weights"] = time.perf_counter() - t0
 
     # Spec C (PR #22): diagnostic on connected components
     n_cc = nx.number_connected_components(G)
@@ -662,6 +743,17 @@ def route_pa_to_pb(
         )
 
     edges_out: dict[str, dict] = {}  # PR #23 Feature D: deduplicate via edge key
+
+    # PR #29 amend — raw-source telemetry collected DURING path collection,
+    # BEFORE the output conversion (raw_type=="ign_route" → src="gc_neuf").
+    # Reading these counters from the final GeoDataFrame would always
+    # report 0 IGN since the conversion has happened by then. We therefore
+    # accumulate per-edge length grouped by raw_type/raw_src here and pass
+    # the result to ``_log_routing_qa`` at the end.
+    raw_src_lengths: dict[str, float] = {}
+    raw_src_counts: dict[str, int] = {}
+    raw_type_lengths: dict[str, float] = {}
+    converted_ign_to_gc_length_m = 0.0
 
     # Build STRtree indices for fast PA/PB snapping (PR #21)
     # PR #27 Part C: use rebuild helper (avoids stale indices)
@@ -728,7 +820,11 @@ def route_pa_to_pb(
         return None
 
     # ── For each PA, route all PA → PB (PR #23 Feature D: single-source Dijkstra per PA) ──
+    t0_dijkstra = time.perf_counter()
+    pa_count = 0
+    pb_count = 0
     for _, pa in pa_sro.iterrows():
+        pa_count += 1
         pa_id = pa.get("id_metier", f"pa#{pa.name}")
         sro = pa.get("sro", "?")
         pa_geom = pa.geometry
@@ -778,6 +874,7 @@ def route_pa_to_pb(
         _paths = _dijkstra_tree()
 
         for pb, pb_node in pb_snapped:
+            pb_count += 1
             pb_id = pb.get("pb_id", f"pb#{pb.name}")
 
             # Check if PB reachable from PA in current tree
@@ -788,7 +885,8 @@ def route_pa_to_pb(
                 bridged = _bridge_components_with_gc_neuf(
                     G, pa_node, pb_node,
                     flag_collector=flag_collector,
-                    public_area=public_area,  # PR #27
+                    public_area=public_area,             # PR #27
+                    public_area_safe=public_area_safe,   # PR #29 B1
                 )
                 if bridged:
                     # Recompute tree after bridge insertion
@@ -824,6 +922,23 @@ def route_pa_to_pb(
                     raw_src = edge_data.get("src", edge_data.get("type", ""))
                     raw_type = edge_data.get("type", "")
                     raw_infra = edge_data.get("infra_type", "")
+                    raw_length = float(edge_data.get("length", 0.0))
+
+                    # PR #29 amend — accumulate raw-source telemetry BEFORE
+                    # any conversion. ign_route_length_used_m is computed
+                    # from raw_type, not from the converted output src.
+                    raw_src_norm = (
+                        "gc_neuf" if raw_src == "gc_neuf_runtime" else raw_src
+                    ) or raw_type or ""
+                    raw_src_lengths[raw_src_norm] = (
+                        raw_src_lengths.get(raw_src_norm, 0.0) + raw_length
+                    )
+                    raw_src_counts[raw_src_norm] = (
+                        raw_src_counts.get(raw_src_norm, 0) + 1
+                    )
+                    raw_type_lengths[raw_type or ""] = (
+                        raw_type_lengths.get(raw_type or "", 0.0) + raw_length
+                    )
 
                     # PR #26: gc_neuf_runtime → gc_neuf (must not leak into GPKG)
                     if raw_src == "gc_neuf_runtime":
@@ -834,6 +949,8 @@ def route_pa_to_pb(
                         mode_pose = "C0"
                         infra_type = "gc_neuf"
                         src = "gc_neuf"
+                        # PR #29 amend — count IGN→GC conversion explicitly.
+                        converted_ign_to_gc_length_m += raw_length
                     elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
                         mode_pose = "C0"
                         infra_type = "gc_neuf"
@@ -863,32 +980,42 @@ def route_pa_to_pb(
                         "mode_pose": mode_pose,
                         "infra_type": infra_type,
                         "src": src,
-                        "length_m": edge_data.get("length", 0.0),
+                        "length_m": raw_length,
                         "geometry": out_geom,
                     }
 
+    perf["dijkstra_total"] = time.perf_counter() - t0_dijkstra
+
     if not edges_out:
+        # PR #29 B4: log perf even on empty output so a slow empty SRO is visible.
+        log.info("[ROUTING PERF] sro=%s step=dijkstra_total seconds=%.2f pa_count=%d pb_count=%d",
+                 sro_code_log, perf.get("dijkstra_total", 0.0), pa_count, pb_count)
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     result = gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
 
-    # ── PR #28 BLOQUANT 2: final check — strip any C0/gc_neuf still outside public_area ──
-    if public_area is not _SENTINEL and public_area is not None and not public_area.is_empty:
+    # ── PR #28 BLOQUANT 2 / PR #29 B1: final check — strip any C0/gc_neuf still outside public_area ──
+    t0 = time.perf_counter()
+    if public_area_safe is not None:
         n_before = len(result)
         # Only filter C0 / gc_neuf edges; keep existing infra untouched
         mask_c0 = (result["mode_pose"] == "C0") | (result["infra_type"] == "gc_neuf")
+        # PR #29 B1: use pre-buffered public_area_safe instead of buffering per row.
         mask_ok = ~mask_c0 | result.geometry.apply(
-            lambda g: public_area.buffer(0.01).covers(g) if g is not None else False
+            lambda g: public_area_safe.covers(g) if g is not None else False
         )
         result = result[mask_ok].copy()
         n_after = len(result)
         if n_before != n_after:
             log.info("[GC QA] Final pass removed %d C0/gc_neuf edges outside public domain", n_before - n_after)
+    perf["final_filter"] = time.perf_counter() - t0
 
     # ── PR #28 BLOQUANT 5: deduplicate near-identical geometries ──────
+    t0 = time.perf_counter()
     n_before_dedup = len(result)
     result = _dedup_geometries(result)
     n_after_dedup = len(result)
+    perf["dedup"] = time.perf_counter() - t0
 
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
@@ -898,6 +1025,28 @@ def route_pa_to_pb(
 
     # ── PR #28 [MUTUAL QA] mutualisation diagnostics ─────────────────────
     _log_mutual_qa(n_before_dedup, n_after_dedup, pa_sro)
+
+    # ── PR #29 A2 / amend: [ROUTING QA] uses RAW counters collected during
+    # path collection (BEFORE the ign_route → gc_neuf conversion), so
+    # ign_route_length_used_m reflects what Dijkstra actually traversed.
+    _log_routing_qa(
+        result, sro_code_log,
+        raw_src_lengths=raw_src_lengths,
+        raw_src_counts=raw_src_counts,
+        raw_type_lengths=raw_type_lengths,
+        converted_ign_to_gc_length_m=converted_ign_to_gc_length_m,
+    )
+
+    # ── PR #29 B4: per-step + total perf logs ───────────────────────────
+    perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start
+    for step, sec in perf.items():
+        if step == "dijkstra_total":
+            log.info(
+                "[ROUTING PERF] sro=%s step=%s seconds=%.2f pa_count=%d pb_count=%d",
+                sro_code_log, step, sec, pa_count, pb_count,
+            )
+        else:
+            log.info("[ROUTING PERF] sro=%s step=%s seconds=%.2f", sro_code_log, step, sec)
 
     return result
 
@@ -912,15 +1061,16 @@ _SNAP_TO_LINE_RADIUS_M = 3.0  # max distance for endpoint→line projection
 def _snap_endpoints_to_lines(
     G: nx.Graph,
     snap_radius_m: float = _SNAP_TO_LINE_RADIUS_M,
-    public_area: object = _SENTINEL,  # PR #28 amend B1
+    public_area: object = _SENTINEL,   # PR #28 amend B1
+    public_area_safe=None,              # PR #29 B1: pre-buffered for perf
     flag_collector=None,
 ) -> dict:
     """Snap remaining degree-1 endpoints onto nearby edges (project+split).
 
     After endpoint→endpoint merge, some dangling endpoints may still sit
     close to a line without touching. This step projects each endpoint
-    onto the nearest qualifying edge, splits that edge at the projection
-    point, and connects the graph.
+    onto the nearest qualifying edge, validates the resulting connector,
+    splits the line, and connects the graph.
 
     Conservative rules:
     - Only degree-1 nodes (true A/Z endpoints after earlier merges)
@@ -928,45 +1078,61 @@ def _snap_endpoints_to_lines(
     - Distance must be <= snap_radius_m
     - Projection point must be between edge endpoints, not extension
 
+    PR #29 B2: validate the public-domain check on the connector BEFORE
+    splitting the target line. A rejected connector no longer leaves the
+    graph in a half-split state, and the original line stays intact.
+
+    PR #29 A3: when the original edge has a stored polyline geometry,
+    project onto that real geometry to keep visual continuity (the
+    connector + sub-segments use the actual road/infra shape).
+
     Returns stats dict for QA logging.
     """
     if G.number_of_nodes() < 2 or G.number_of_edges() < 1:
-        return {"endpoints_to_lines": 0}
+        return {"endpoints_to_lines": 0, "endpoints_rejected_private": 0}
 
-    from scipy.spatial import cKDTree
+    from scipy.spatial import cKDTree  # noqa: F401  (used elsewhere; keeps import warm)
     from shapely.geometry import Point as _Point
 
-    # Collect degree-1 nodes and edges
+    # PR #29 B1: pre-compute buffered public area once.
+    if public_area is not _SENTINEL and public_area_safe is None:
+        public_area_safe = _public_area_safe(public_area)
+
+    # Collect degree-1 nodes and edges (PR #29 A3: prefer existing infra).
     endpoint_nodes = [n for n in G.nodes() if G.degree(n) == 1]
     if len(endpoint_nodes) == 0:
-        return {"endpoints_to_lines": 0}
+        return {"endpoints_to_lines": 0, "endpoints_rejected_private": 0}
 
     edge_index: list[tuple] = []
     edge_lines: list[LineString] = []
     for u, v, data in G.edges(data=True):
         if data.get("type") == "gc_neuf":
             continue  # don't split artificial bridges
-        line = LineString([(u[0], u[1]), (v[0], v[1])])
-        edge_index.append((u, v, data))
+        # PR #29 A3: prefer the stored real geometry if available so that
+        # the projection respects the actual line shape (curves, etc.).
+        stored = data.get("geometry")
+        if stored is not None and isinstance(stored, LineString) and not stored.is_empty:
+            line = stored
+        else:
+            line = LineString([(u[0], u[1]), (v[0], v[1])])
+        edge_index.append((u, v, data, line))
         edge_lines.append(line)
 
     if len(edge_lines) == 0:
-        return {"endpoints_to_lines": 0}
+        return {"endpoints_to_lines": 0, "endpoints_rejected_private": 0}
 
     edge_tree = STRtree(edge_lines)
     n_snapped = 0
+    n_rejected_private = 0
 
     for ep in endpoint_nodes:
         ep_pt = _Point(ep[0], ep[1])
-        # Find nearby edges
         buf = ep_pt.buffer(snap_radius_m)
         candidates = edge_tree.query(buf)
 
-        best = None  # (u, v, data, proj_pt, proj_dist_on_line, segment_dist)
+        best = None  # (u, v, data, line, proj_pt, proj_dist_on_line, segment_dist)
         for idx in candidates:
-            u, v, data = edge_index[idx]
-            line = edge_lines[idx]
-            # ── Skip if endpoint is already on this edge ──
+            u, v, data, line = edge_index[idx]
             if ep == u or ep == v:
                 continue
             proj_dist = line.project(ep_pt)
@@ -977,60 +1143,67 @@ def _snap_endpoints_to_lines(
             # ── Projection must be inside the segment (not at endpoint extension) ──
             if proj_dist <= 0 or proj_dist >= line.length:
                 continue
-            if best is None or d < best[5]:  # index 5 = segment distance
-                best = (u, v, data, proj_pt, proj_dist, d)
+            if best is None or d < best[6]:  # segment distance
+                best = (u, v, data, line, proj_pt, proj_dist, d)
 
         if best is None:
             continue
 
-        u, v, data, proj_pt, proj_dist, _ = best
+        u, v, data, line, proj_pt, proj_dist, _ = best
         proj_key = _point_key(proj_pt)
 
         # ── Skip if projection already a node ──
         if proj_key in G:
             continue
 
-        # ── Split the edge ──
         if not G.has_edge(u, v):
             continue
-        G.remove_edge(u, v)
 
+        # ── PR #29 B2: validate connector BEFORE splitting ──────────────
+        connector = LineString([(ep[0], ep[1]), (proj_pt.x, proj_pt.y)])
+        ep_dist = ep_pt.distance(proj_pt)
+
+        if public_area is not _SENTINEL:
+            if public_area_safe is None:
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "GC_NEUF_ROUTING_IMPOSSIBLE",
+                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
+                        message="Endpoint→line connector rejected — no public domain",
+                    )
+                n_rejected_private += 1
+                continue
+            if not public_area_safe.covers(connector):
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "GC_NEUF_PRIVATE_CROSSING",
+                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
+                        message=f"Endpoint→line connector rejected — traverses private, len={ep_dist:.0f}m",
+                    )
+                n_rejected_private += 1
+                continue
+
+        # ── Connector accepted: now split the line and add edges ────────
+        G.remove_edge(u, v)
         extra = {k: data[k] for k in data if k not in ("length", "geometry")}
         d1 = _Point(u[0], u[1]).distance(proj_pt)
         d2 = _Point(v[0], v[1]).distance(proj_pt)
 
-        # Build sub-geometries
+        # Build sub-geometries from the original edge geometry when possible.
         orig_geom = data.get("geometry")
         if orig_geom is not None and isinstance(orig_geom, LineString) and not orig_geom.is_empty:
-            seg_a = shapely.ops.substring(orig_geom, 0, proj_dist)
-            seg_b = shapely.ops.substring(orig_geom, proj_dist, orig_geom.length)
+            try:
+                seg_a = shapely.ops.substring(orig_geom, 0, proj_dist)
+                seg_b = shapely.ops.substring(orig_geom, proj_dist, orig_geom.length)
+            except Exception:
+                seg_a = LineString([(u[0], u[1]), (proj_pt.x, proj_pt.y)])
+                seg_b = LineString([(proj_pt.x, proj_pt.y), (v[0], v[1])])
         else:
             seg_a = LineString([(u[0], u[1]), (proj_pt.x, proj_pt.y)])
             seg_b = LineString([(proj_pt.x, proj_pt.y), (v[0], v[1])])
 
         G.add_edge(u, proj_key, length=d1, geometry=seg_a, **extra)
         G.add_edge(proj_key, v, length=d2, geometry=seg_b, **extra)
-
-        # ── Connect the endpoint to the split point (PR #28 B1: spatial check) ──
-        connector = LineString([(ep[0], ep[1]), (proj_pt.x, proj_pt.y)])
-        ep_dist = ep_pt.distance(proj_pt)
-
-        if public_area is not _SENTINEL:
-            if public_area is None or public_area.is_empty:
-                if flag_collector is not None:
-                    flag_collector.add("GC_NEUF_ROUTING_IMPOSSIBLE",
-                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
-                        message="Endpoint→line connector rejected — no public domain")
-                n_snapped += 1  # count attempt but don't connect
-                continue
-            if not public_area.buffer(0.01).covers(connector):
-                if flag_collector is not None:
-                    flag_collector.add("GC_NEUF_PRIVATE_CROSSING",
-                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
-                        message=f"Endpoint→line connector rejected — traverses private, len={ep_dist:.0f}m")
-                n_snapped += 1  # count attempt but don't connect
-                continue
-
         G.add_edge(
             ep, proj_key,
             length=ep_dist,
@@ -1043,14 +1216,18 @@ def _snap_endpoints_to_lines(
         )
         n_snapped += 1
 
-    if n_snapped:
+    if n_snapped or n_rejected_private:
         cc_after = nx.number_connected_components(G)
         log.info(
-            "[TOPO SNAP] %d endpoints projected onto lines, "
-            "%d composantes connexes", n_snapped, cc_after,
+            "[TOPO SNAP] %d endpoints projected onto lines (rejected private=%d), "
+            "%d composantes connexes",
+            n_snapped, n_rejected_private, cc_after,
         )
 
-    return {"endpoints_to_lines": n_snapped}
+    return {
+        "endpoints_to_lines": n_snapped,
+        "endpoints_rejected_private": n_rejected_private,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1309,93 @@ def _log_gc_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
         "[GC QA] %s total=%d gc_neuf_infra=%d C0_mode_pose=%d gc_neuf_src=%d",
         sro_code, n_total, n_gc, n_c0, n_gc_neuf_src,
     )
+
+
+def _log_routing_qa(
+    df: gpd.GeoDataFrame,
+    sro_code: str,
+    *,
+    raw_src_lengths: dict[str, float] | None = None,
+    raw_src_counts: dict[str, int] | None = None,
+    raw_type_lengths: dict[str, float] | None = None,
+    converted_ign_to_gc_length_m: float = 0.0,
+) -> None:
+    """PR #29 A2 / amend — log routed length per RAW source family.
+
+    The breakdown is computed from the *raw* counters accumulated during
+    path collection (i.e. BEFORE the conversion that maps every
+    ``raw_type=="ign_route"`` edge to ``src="gc_neuf"``). Reading
+    ``df["src"]`` would always show ``ign_route_length_used_m=0`` since
+    by then every IGN edge has been rewritten — exactly the false-zero
+    bug Pierre asked us to fix.
+
+    Existing length stays based on the raw ``src`` family (bt/ft/athd/chem)
+    so the metric matches the natural infra inventory shown in
+    ``filters.build_reusable_infra``.
+
+    A ``[ROUTING WARNING]`` is emitted whenever:
+      * the gc_neuf share of total routed length exceeds 50 %, or
+      * any ign_route length was actually traversed by Dijkstra
+        (``ign_route_used_before_conversion``).
+
+    Both warnings are diagnostics; the final livrable_infra format is
+    unchanged (IGN→gc_neuf conversion stays in place per CDC).
+    """
+    if df is None or df.empty:
+        return
+
+    raw_src_lengths = raw_src_lengths or {}
+    raw_src_counts = raw_src_counts or {}
+    raw_type_lengths = raw_type_lengths or {}
+
+    existing_keys = ("bt", "ft", "athd", "chem")
+    existing_length = sum(raw_src_lengths.get(k, 0.0) for k in existing_keys)
+
+    # "True" gc_neuf = pre-existing GC neuf injected via _add_gc_neuf_to_graph
+    # OR generated as a runtime bridge. Both end up with raw_src=="gc_neuf"
+    # AND raw_type=="gc_neuf"; we take the max so a column missing in one
+    # of the two counters does not under-report the share. This is
+    # explicitly independent of the IGN-to-C0 conversion.
+    true_gc_length = max(
+        raw_src_lengths.get("gc_neuf", 0.0),
+        raw_type_lengths.get("gc_neuf", 0.0),
+    )
+
+    ign_length = raw_type_lengths.get("ign_route", 0.0)
+    total = float(df["length_m"].sum()) if "length_m" in df.columns else 0.0
+
+    log.info(
+        "[ROUTING QA] sro=%s existing_length_m=%.0f true_gc_neuf_length_m=%.0f "
+        "ign_route_length_used_m=%.0f converted_ign_to_gc_length_m=%.0f "
+        "total_length_m=%.0f",
+        sro_code, existing_length, true_gc_length, ign_length,
+        converted_ign_to_gc_length_m, total,
+    )
+
+    # Per-raw-src counts: show every family present, including ign_route
+    # so a leak is visible at a glance.
+    if raw_src_counts:
+        src_str = ", ".join(f"{k}={v}" for k, v in sorted(raw_src_counts.items()))
+        log.info("[ROUTING QA] sro=%s raw_src_counts %s", sro_code, src_str)
+
+    # ── WARNINGs ─────────────────────────────────────────────────────────
+    # 1) gc_neuf share of the total routed length (CDC threshold = 50 %).
+    if total > 0 and (true_gc_length + converted_ign_to_gc_length_m) / total > 0.50:
+        log.warning(
+            "[ROUTING WARNING] sro=%s high_gc_ratio=%.2f true_gc=%.0fm "
+            "converted_ign=%.0fm total=%.0fm",
+            sro_code,
+            (true_gc_length + converted_ign_to_gc_length_m) / total,
+            true_gc_length, converted_ign_to_gc_length_m, total,
+        )
+    # 2) Any IGN length actually traversed by Dijkstra is suspicious — even
+    #    though the output converts it to C0/gc_neuf, a non-zero value here
+    #    means the routing relied on IGN despite the ×30 weight.
+    if ign_length > 0:
+        log.warning(
+            "[ROUTING WARNING] sro=%s ign_route_used_before_conversion=%.0fm",
+            sro_code, ign_length,
+        )
 
 
 def _log_infra_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:

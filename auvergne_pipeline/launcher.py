@@ -3,12 +3,16 @@
 PyQt6 est livre nativement avec QGIS 4.0.1 (a la difference de Tkinter qui
 est absent du Python embedded OSGeo4W : ni `_tkinter.pyd`, ni le dossier
 `tcl/` ne sont packages par OSGeo4W).
+
+PR #29 partie C — barre de progression + parsing stdout pour donner une
+visibilite sur l'avancement (SRO courant, etape courante, temps ecoule).
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -54,7 +58,7 @@ def _init_qt_env() -> None:
 
 _init_qt_env()
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -66,12 +70,14 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from . import config
+from .launcher_progress import ProgressState  # PR #29 partie C
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -118,12 +124,19 @@ class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Auvergne Pipeline - Launcher")
-        self.resize(700, 600)
+        self.resize(700, 700)
 
         self.selected_sros: set[str] = set()
         self.thread: QThread | None = None
         self.worker: PipelineWorker | None = None
         self._syncing = False
+
+        # PR #29 partie C — progress state + elapsed timer
+        self.progress: ProgressState | None = None
+        self._t_start: float | None = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)  # 1 s
+        self._elapsed_timer.timeout.connect(self._tick_elapsed)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -167,6 +180,25 @@ class LauncherWindow(QMainWindow):
         sel_row.addWidget(uncheck_btn)
         sel_row.addStretch()
         layout.addLayout(sel_row)
+
+        # --- Progression (PR #29 partie C) ---
+        layout.addWidget(QLabel("Progression :"))
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+        progress_row = QHBoxLayout()
+        self.label_current_sro = QLabel("SRO : -")
+        progress_row.addWidget(self.label_current_sro)
+        self.label_step = QLabel("Etape : -")
+        progress_row.addWidget(self.label_step)
+        progress_row.addStretch()
+        self.label_elapsed = QLabel("Ecoule : 00:00")
+        progress_row.addWidget(self.label_elapsed)
+        layout.addLayout(progress_row)
 
         # --- Console ---
         layout.addWidget(QLabel("Console :"))
@@ -288,23 +320,75 @@ class LauncherWindow(QMainWindow):
         self.console.appendPlainText(f"$ {' '.join(argv)}")
         self.console.appendPlainText(f"[i] Log : {log_path}")
 
+        # PR #29 partie C — reset progress UI
+        self.progress = ProgressState(total_sros=len(self.selected_sros))
+        self.progress_bar.setValue(0)
+        self.label_current_sro.setText(f"SRO : 0/{len(self.selected_sros)}")
+        self.label_step.setText("Etape : -")
+        self.label_elapsed.setText("Ecoule : 00:00")
+        self._t_start = time.monotonic()
+        self._elapsed_timer.start()
+
         self.launch_btn.setEnabled(False)
         self.thread = QThread()
         self.worker = PipelineWorker(argv, log_path)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.output_ready.connect(self.console.appendPlainText)
+        self.worker.output_ready.connect(self._on_output_line)  # PR #29: console + progress
         self.worker.finished.connect(self._on_finished)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
+    def _on_output_line(self, line: str) -> None:
+        """PR #29 partie C — append to console AND update progress UI.
+
+        The console behaviour is unchanged (every line is appended). The
+        progress UI is updated by feeding the line to the parser; we only
+        repaint when the parser actually advanced something.
+        """
+        self.console.appendPlainText(line)
+        if self.progress is None:
+            return
+        prev_step = self.progress.current_step_id
+        prev_pct = self.progress.progress_percent()
+        prev_sro = self.progress.current_sro
+        self.progress.update(line)
+        new_pct = self.progress.progress_percent()
+        if (
+            self.progress.current_step_id != prev_step
+            or new_pct != prev_pct
+            or self.progress.current_sro != prev_sro
+        ):
+            self.progress_bar.setValue(new_pct)
+            sro = self.progress.current_sro or "-"
+            self.label_current_sro.setText(
+                f"SRO : {self.progress.sro_index}/{self.progress.total_sros} {sro}"
+            )
+            self.label_step.setText(f"Etape : {self.progress.current_step_label}")
+
+    def _tick_elapsed(self) -> None:
+        if self._t_start is None:
+            return
+        elapsed = int(time.monotonic() - self._t_start)
+        m, s = divmod(elapsed, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            self.label_elapsed.setText(f"Ecoule : {h:02d}:{m:02d}:{s:02d}")
+        else:
+            self.label_elapsed.setText(f"Ecoule : {m:02d}:{s:02d}")
+
     def _on_finished(self, code: int) -> None:
         self.console.appendPlainText(f"[i] Exit code: {code}")
         self.launch_btn.setEnabled(True)
         self.thread = None
         self.worker = None
+        # PR #29 partie C — finalise progress UI
+        self._elapsed_timer.stop()
+        if self.progress is not None and code == 0:
+            self.progress_bar.setValue(100)
+            self.label_step.setText("Etape : Termine")
 
     def closeEvent(self, event):
         """Attendre proprement la fin du thread avant de fermer la fenetre."""
