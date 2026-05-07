@@ -1037,6 +1037,25 @@ def route_pa_to_pb(
         converted_ign_to_gc_length_m=converted_ign_to_gc_length_m,
     )
 
+    # PR #29 amend post-review: emit a single per-SRO flag when any IGN
+    # length was converted to C0/gc_neuf in the livrable. The detailed
+    # length is in [ROUTING QA] and the WARNING line; this flag goes
+    # through flag_collector so it surfaces in livrable_flags for manual
+    # review without spamming one entry per edge.
+    if (
+        flag_collector is not None
+        and converted_ign_to_gc_length_m > 0
+    ):
+        flag_collector.add(
+            "IGN_ROUTE_CONVERTED_TO_GC",
+            target_url=sro_code_log,
+            message=(
+                f"IGN BD TOPO traversee par Dijkstra puis converted to C0: "
+                f"{converted_ign_to_gc_length_m:.0f} m "
+                f"(ign_route_used_before_conversion)"
+            ),
+        )
+
     # ── PR #29 B4: per-step + total perf logs ───────────────────────────
     perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start
     for step, sec in perf.items():
@@ -1125,12 +1144,25 @@ def _snap_endpoints_to_lines(
     n_snapped = 0
     n_rejected_private = 0
 
+    # PR #29 amend post-review (BLOQUANT 4): prefer existant infra over
+    # ign_route when both are within snap_radius_m. The selection is
+    # therefore a 2-key sort: (priority_tier, segment_distance) where
+    # tier 0 = existant (type == "infra"), tier 1 = ign_route, tier 2 =
+    # everything else. gc_neuf is already excluded above.
+    def _priority_tier(data: dict) -> int:
+        t = data.get("type")
+        if t == "infra":
+            return 0
+        if t == "ign_route":
+            return 1
+        return 2
+
     for ep in endpoint_nodes:
         ep_pt = _Point(ep[0], ep[1])
         buf = ep_pt.buffer(snap_radius_m)
         candidates = edge_tree.query(buf)
 
-        best = None  # (u, v, data, line, proj_pt, proj_dist_on_line, segment_dist)
+        best = None  # (priority_tier, u, v, data, line, proj_pt, proj_dist, seg_d)
         for idx in candidates:
             u, v, data, line = edge_index[idx]
             if ep == u or ep == v:
@@ -1143,13 +1175,22 @@ def _snap_endpoints_to_lines(
             # ── Projection must be inside the segment (not at endpoint extension) ──
             if proj_dist <= 0 or proj_dist >= line.length:
                 continue
-            if best is None or d < best[6]:  # segment distance
-                best = (u, v, data, line, proj_pt, proj_dist, d)
+            tier = _priority_tier(data)
+            cand = (tier, u, v, data, line, proj_pt, proj_dist, d)
+            # Prefer lower tier first; within the same tier, prefer the
+            # closer projection. Pre-existing behaviour is recovered when
+            # only one tier is present in the candidate set.
+            if best is None:
+                best = cand
+            elif tier < best[0]:
+                best = cand
+            elif tier == best[0] and d < best[7]:
+                best = cand
 
         if best is None:
             continue
 
-        u, v, data, line, proj_pt, proj_dist, _ = best
+        _tier, u, v, data, line, proj_pt, proj_dist, _seg_d = best
         proj_key = _point_key(proj_pt)
 
         # ── Skip if projection already a node ──
@@ -1376,7 +1417,7 @@ def _log_routing_qa(
     # so a leak is visible at a glance.
     if raw_src_counts:
         src_str = ", ".join(f"{k}={v}" for k, v in sorted(raw_src_counts.items()))
-        log.info("[ROUTING QA] sro=%s raw_src_counts %s", sro_code, src_str)
+        log.info("[ROUTING QA] sro=%s path_src_counts %s", sro_code, src_str)
 
     # ── WARNINGs ─────────────────────────────────────────────────────────
     # 1) gc_neuf share of the total routed length (CDC threshold = 50 %).

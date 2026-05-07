@@ -313,8 +313,8 @@ def test_routing_qa_counts_ign_before_conversion(monkeypatch, caplog):
     assert "ign_route_length_used_m=20" in msg, msg
     assert "converted_ign_to_gc_length_m=20" in msg, msg
 
-    # 3) raw_src_counts must surface ign_route as a raw family.
-    raw_count_lines = [m for m in qa_lines if "raw_src_counts" in m]
+    # 3) path_src_counts must surface ign_route as a raw family.
+    raw_count_lines = [m for m in qa_lines if "path_src_counts" in m]
     assert raw_count_lines, qa_lines
     assert "ign_route=1" in raw_count_lines[0], raw_count_lines[0]
 
@@ -324,6 +324,86 @@ def test_routing_qa_counts_ign_before_conversion(monkeypatch, caplog):
         if r.levelno >= logging.WARNING and "ign_route_used_before_conversion" in r.getMessage()
     ]
     assert warn_lines, "expected a [ROUTING WARNING] for ign_route_used_before_conversion"
+
+
+def test_ign_route_traversal_emits_flag(monkeypatch):
+    """PR #29 amend post-review: when Dijkstra has traversed any IGN length
+    (and therefore ``converted_ign_to_gc_length_m`` > 0), a single per-SRO
+    ``IGN_ROUTE_CONVERTED_TO_GC`` flag must surface in livrable_flags so
+    Pierre can find them via the QGIS flags layer.
+    """
+    from auvergne_pipeline import flags as flags_mod
+
+    G = nx.Graph()
+    G.add_edge(
+        (0.0, 0.0), (20.0, 0.0),
+        length=20, type="ign_route", src="ign_route",
+        infra_type="ign_route", statut="", mode_pose="",
+        geometry=LineString([(0, 0), (20, 0)]),
+    )
+    monkeypatch.setattr(routing, "_build_graph", lambda *a, **k: G)
+
+    pa = _pa()
+    pb = _pb([(20, 0, "PB1", "PA1")])
+    fc = flags_mod.FlagCollector("SRO1")
+    routing.route_pa_to_pb(
+        pa, pb,
+        gpd.GeoDataFrame(geometry=[], crs=CRS),
+        gpd.GeoDataFrame(geometry=[], crs=CRS),
+        flag_collector=fc,
+    )
+    flags_df = fc.to_dataframe()
+    types = set(flags_df["flag_type"].tolist())
+    assert "IGN_ROUTE_CONVERTED_TO_GC" in types, types
+    # Exactly ONE flag per SRO (not one per edge).
+    assert int((flags_df["flag_type"] == "IGN_ROUTE_CONVERTED_TO_GC").sum()) == 1
+
+
+def test_snap_endpoints_to_lines_prefers_existant_over_ign(monkeypatch):
+    """PR #29 amend post-review (BLOQUANT 4): when a dangling endpoint sits
+    within snap_radius_m of BOTH an existant infra line and a slightly
+    closer IGN line, the snap targets the existant line (priority tier 0
+    beats tier 1 even at the cost of a tiny extra segment distance).
+    """
+    G = nx.Graph()
+    # Existant infra line at y=0 (tier 0), distance to (5, 1) = 1 m.
+    G.add_edge(
+        (0.0, 0.0), (10.0, 0.0),
+        length=10, type="infra", src="bt", infra_type="bt",
+        statut="E", mode_pose="1",
+        geometry=LineString([(0, 0), (10, 0)]),
+    )
+    # IGN route line at y=1.5 (tier 1), distance to (5, 1) = 0.5 m.
+    G.add_edge(
+        (0.0, 1.5), (10.0, 1.5),
+        length=10, type="ign_route", src="ign_route", infra_type="ign_route",
+        statut="", mode_pose="",
+        geometry=LineString([(0, 1.5), (10, 1.5)]),
+    )
+    # Dangling endpoint at (5, 1) — IGN is nominally closer (0.5 m), the
+    # existant line is 1 m away; without the priority tier the IGN would win.
+    G.add_edge(
+        (5.0, 1.0), (5.5, 1.5),
+        length=0.71, type="infra", src="bt", infra_type="bt",
+        statut="E", mode_pose="1",
+        geometry=LineString([(5.0, 1.0), (5.5, 1.5)]),
+    )
+
+    public_area = Polygon([(-5, -5), (15, -5), (15, 5), (-5, 5)])
+
+    routing._snap_endpoints_to_lines(
+        G, snap_radius_m=3.0,
+        public_area=public_area,
+    )
+    # The existant edge (0,0)-(10,0) must have been split (replaced by 2
+    # sub-edges + a connector). The IGN edge (0,1.5)-(10,1.5) must stay
+    # intact because the snap preferred the existant target.
+    assert not G.has_edge((0.0, 0.0), (10.0, 0.0)), (
+        "existant edge should have been split by the prefered snap"
+    )
+    assert G.has_edge((0.0, 1.5), (10.0, 1.5)), (
+        "IGN edge must remain intact when an existant target is available"
+    )
 
 
 def test_routing_qa_zero_when_no_ign_used(monkeypatch, caplog):
