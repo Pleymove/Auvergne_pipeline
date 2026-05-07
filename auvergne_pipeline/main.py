@@ -249,9 +249,19 @@ def run_for_sro(
         )
 
         # 9. Routing PA→PB on combined graph (includes gc_neuf C0 edges)
+        # PR #27: build public_routing_area = public parcels ∪ IGN buffer
+        from shapely.ops import unary_union as _uu
+        _parts = []
+        if public_geom is not None and not public_geom.is_empty:
+            _parts.append(public_geom)
+        if ign_routes_buffered is not None and not ign_routes_buffered.is_empty:
+            _parts.append(ign_routes_buffered)
+        public_routing_area = _uu(_parts) if _parts else None
+
         routed_infra = routing.route_pa_to_pb(
             pa_all, pb_gdf, reusable, ign_roads, flag_collector,
             gc_neuf=gc_neuf,
+            public_area=public_routing_area,  # PR #27
         )
 
         # livrable_infra = routed edges only (strict PA→PB paths)

@@ -182,11 +182,11 @@ def test_pa_to_pbs_share_common_path():
     from auvergne_pipeline.routing import route_pa_to_pb
 
     G_test = nx.Graph()
-    # PA at (0,0), common trunk to (10,0), then branches to (12,2) and (12,-2)
-    G_test.add_edge((0.0, 0.0), (5.0, 0.0), length=5, type="infra", statut="E", mode_pose="1")
-    G_test.add_edge((5.0, 0.0), (10.0, 0.0), length=5, type="infra", statut="E", mode_pose="1")
-    G_test.add_edge((10.0, 0.0), (12.0, 2.0), length=2.83, type="infra", statut="E", mode_pose="1")
-    G_test.add_edge((10.0, 0.0), (12.0, -2.0), length=2.83, type="infra", statut="E", mode_pose="1")
+    # PA at (0,0), common trunk to (30,0), then branches to (35,10) and (35,-10)
+    G_test.add_edge((0.0, 0.0), (15.0, 0.0), length=15, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((15.0, 0.0), (30.0, 0.0), length=15, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((30.0, 0.0), (35.0, 10.0), length=11.18, type="infra", statut="E", mode_pose="1")
+    G_test.add_edge((30.0, 0.0), (35.0, -10.0), length=11.18, type="infra", statut="E", mode_pose="1")
 
     pa = gpd.GeoDataFrame(
         pd.DataFrame({"id_metier": ["PA1"], "sro": ["TEST"], "geometry": [Point(0, 0)]}),
@@ -195,7 +195,7 @@ def test_pa_to_pbs_share_common_path():
     pb = gpd.GeoDataFrame(
         pd.DataFrame({
             "pb_id": ["PB1", "PB2"], "pa_id": ["PA1", "PA1"],
-            "geometry": [Point(12, 2), Point(12, -2)],
+            "geometry": [Point(35, 10), Point(35, -10)],
         }),
         geometry="geometry", crs="EPSG:2154",
     )
