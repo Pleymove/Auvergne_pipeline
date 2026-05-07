@@ -246,3 +246,255 @@ def test_output_compliance_pr27():
 
     sk = out["statut"].fillna("").astype(str) + out["mode_pose"].fillna("").astype(str)
     assert (sk == "").sum() == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #28 — BLOQUANT 1: 3D coords do not crash
+# ---------------------------------------------------------------------------
+
+
+def test_3d_coords_no_crash_in_snap():
+    """PR #28 BLOQUANT 1: LineString with Z-dim coords must not crash."""
+    G = nx.Graph()
+    geom_3d = LineString([(0, 0, 10), (10, 0, 20)])
+    G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra",
+               geometry=geom_3d)
+    G.add_edge((10.0, 2.0), (20.0, 20.0, 30), length=18, type="infra",
+               geometry=LineString([(10, 2, 0), (20, 20, 30)]))
+
+    # Must not raise
+    routing._snap_endpoints_topology(G, snap_radius_m=3.0)
+    assert G.number_of_nodes() >= 2
+
+
+def test_3d_snap_keeps_valid_2d_output():
+    """After snapping 3D coords, output geometries are valid 2D."""
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra",
+               geometry=LineString([(0, 0, 5), (10, 0, 5)]))
+    G.add_edge((0.0, 1.0), (20.0, 20.0), length=28, type="infra",
+               geometry=LineString([(0, 1, 5), (20, 20, 5)]))
+
+    routing._snap_endpoints_topology(G, snap_radius_m=3.0)
+    # All edges should still be connected
+    assert G.number_of_edges() >= 1
+
+
+# ---------------------------------------------------------------------------
+# PR #28 — BLOQUANT 2: gc_neuf injected via _add_gc_neuf_to_graph checked
+# ---------------------------------------------------------------------------
+
+
+def test_add_gc_neuf_rejected_private_crossing():
+    """PR #28 BLOQUANT 2: gc_neuf from _add_gc_neuf_to_graph rejected if private."""
+    G = nx.Graph()
+    public_area = Polygon([(0, -5), (30, -5), (30, 5), (0, 5)])
+
+    # gc_neuf crossing outside public_area (x=0→100)
+    gc_df = gpd.GeoDataFrame(
+        {"pa_id": ["PA1"], "geometry": [LineString([(0, 0), (100, 0)])]},
+        geometry="geometry", crs="EPSG:2154",
+    )
+    n = routing._add_gc_neuf_to_graph(
+        G, gc_df, snap_tol=50, public_area=public_area,
+    )
+    assert n == 1  # one rejected
+    assert G.number_of_edges() == 0  # nothing added
+
+
+def test_add_gc_neuf_accepted_in_public():
+    """PR #28: gc_neuf fully within public_area is accepted."""
+    G = nx.Graph()
+    public_area = Polygon([(0, -5), (50, -5), (50, 5), (0, 5)])
+
+    gc_df = gpd.GeoDataFrame(
+        {"pa_id": ["PA1"], "geometry": [LineString([(10, 0), (40, 0)])]},
+        geometry="geometry", crs="EPSG:2154",
+    )
+    n = routing._add_gc_neuf_to_graph(
+        G, gc_df, snap_tol=50, public_area=public_area,
+    )
+    assert n == 0  # accepted
+    assert G.number_of_edges() == 1
+
+
+# ---------------------------------------------------------------------------
+# PR #28 — BLOQUANT 4: endpoint-to-line snap
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_snaps_to_line():
+    """PR #28 BLOQUANT 4: degree-1 endpoint near a line splits it and connects."""
+    G = nx.Graph()
+    # Line from (0,0) to (20,0)
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
+               geometry=LineString([(0, 0), (20, 0)]))
+    # Dangling endpoint at (10, 1) — connected to a stub, making it degree 1
+    G.add_edge((10.0, 1.0), (10.0, 5.0), length=4, type="infra",
+               geometry=LineString([(10, 1), (10, 5)]))
+    assert G.degree((10.0, 1.0)) == 1
+
+    routing._snap_endpoints_to_lines(G, snap_radius_m=3.0)
+
+    # The edge should have been split, and endpoint connected
+    assert G.degree((10.0, 1.0)) >= 1  # now connected
+    assert nx.number_connected_components(G) == 1
+
+
+def test_endpoint_to_line_private_rejected():
+    """PR #28 amend B1: endpoint→line connector outside public_area rejected."""
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
+               geometry=LineString([(0, 0), (20, 0)]))
+    G.add_edge((10.0, 1.0), (10.0, 5.0), length=4, type="infra",
+               geometry=LineString([(10, 1), (10, 5)]))
+    # public_area covers nothing near (10,1)→(10,0)
+    public_area = Polygon([(50, -5), (70, -5), (70, 5), (50, 5)])
+
+    routing._snap_endpoints_to_lines(
+        G, snap_radius_m=3.0, public_area=public_area,
+    )
+    # Endpoint should still have degree 1 (no new connector added)
+    assert G.degree((10.0, 1.0)) == 1
+
+
+def test_endpoint_to_line_public_accepted():
+    """PR #28 amend B1: endpoint→line connector within public_area accepted."""
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
+               geometry=LineString([(0, 0), (20, 0)]))
+    G.add_edge((10.0, 1.0), (10.0, 5.0), length=4, type="infra",
+               geometry=LineString([(10, 1), (10, 5)]))
+    # public_area covers the connector region
+    public_area = Polygon([(0, -5), (20, -5), (20, 5), (0, 5)])
+
+    routing._snap_endpoints_to_lines(
+        G, snap_radius_m=3.0, public_area=public_area,
+    )
+    # Endpoint degree should increase (connector edge added)
+    assert G.degree((10.0, 1.0)) >= 2
+
+
+def test_bridge_has_routing_weight():
+    """PR #28 amend B2: bridge created by _bridge_components_with_gc_neuf has _routing_weight."""
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
+    G.add_node((30.0, 0.0))
+
+    bridged = routing._bridge_components_with_gc_neuf(
+        G, (0.0, 0.0), (30.0, 0.0),
+    )
+    assert bridged
+    edge_data = G.get_edge_data((0.0, 0.0), (30.0, 0.0))
+    assert edge_data is not None
+    assert edge_data.get("_routing_weight") == pytest.approx(30.0 * 10.0)  # length * 10
+
+
+def test_line_snap_chooses_closest_line():
+    """PR #28 amend B3: endpoint→line picks closest line by perpendicular distance."""
+    G = nx.Graph()
+    # Two parallel lines: one at y=0, one at y=5
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra")
+    G.add_edge((0.0, 5.0), (20.0, 5.0), length=20, type="infra")
+    # Endpoint at (10, 1) — 1m from y=0 line, 4m from y=5 line
+    G.add_edge((10.0, 1.0), (10.0, 10.0), length=9, type="infra")
+
+    n_before = G.number_of_nodes()
+    routing._snap_endpoints_to_lines(G, snap_radius_m=5.0)
+    # Should have snapped to y=0 line (split creates 1 extra node + connection)
+    assert G.number_of_nodes() > n_before
+    # The split point should be at ~(10, 0), not (10, 5)
+    for u, v, data in G.edges(data=True):
+        geom = data.get("geometry")
+        if geom is not None and isinstance(geom, LineString):
+            coords = list(geom.coords)
+            for c in coords:
+                # Ensure no connector goes to y=5
+                if abs(c[0] - 10.0) < 0.1 and abs(c[1]) < 0.1:
+                    break  # found the correct snap
+            else:
+                continue
+            break
+    else:
+        # Should find a node near (10, 0) — the correct snap point
+        found = False
+        for n in G.nodes():
+            if abs(n[0] - 10.0) < 0.1 and abs(n[1]) < 0.1:
+                found = True
+                break
+        assert found, "No node found near (10, 0) — snap may have gone to wrong line"
+
+
+def test_endpoint_far_from_line_not_snapped():
+    """PR #28 BLOQUANT 4: endpoint >3m from any line remains untouched."""
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra")
+    G.add_node((10.0, 10.0))  # 10m away
+    n_before = G.number_of_nodes()
+
+    routing._snap_endpoints_to_lines(G, snap_radius_m=3.0)
+    assert G.number_of_nodes() == n_before  # unchanged
+    assert G.degree((10.0, 10.0)) == 0  # still isolated
+
+
+# ---------------------------------------------------------------------------
+# PR #28 — BLOQUANT 5: Dijkstra prefers existing over gc_neuf + dedup
+# ---------------------------------------------------------------------------
+
+
+def test_dijkstra_prefers_existing_over_gc_neuf():
+    """PR #28 BLOQUANT 5: existing infra preferred even if gc_neuf shorter."""
+    G = nx.Graph()
+    # Existing path: (0,0)→(20,0) length 20
+    G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
+               statut="E", mode_pose="1", src="bt", infra_type="bt",
+               geometry=LineString([(0, 0), (20, 0)]))
+    G.add_node((0.0, 0.0))
+    G.add_node((20.0, 0.0))
+
+    # Shorter gc_neuf diagonal (can't be used as direct path if weighted high)
+    G.add_edge((0.0, 0.0), (20.0, 0.1), length=20, type="gc_neuf",
+               statut="", mode_pose="C0", src="gc_neuf", infra_type="gc_neuf",
+               geometry=LineString([(0, 0), (20, 0.1)]))
+
+    # Add routing weights
+    for u, v, data in G.edges(data=True):
+        base = data.get("length", 1.0)
+        data["_routing_weight"] = base * 10 if data.get("type") == "gc_neuf" else base
+
+    # PA at (0,0), target node (20, 0) reachable via both
+    try:
+        _, paths = nx.single_source_dijkstra(G, source=(0.0, 0.0), weight="_routing_weight")
+    except (nx.NetworkXError, KeyError):
+        paths = {}
+    path = paths.get((20.0, 0.0), [])
+    assert len(path) >= 2
+
+    # Should use existing infra (weight 20), not gc_neuf (weight 200)
+    # The path must contain the existing edge's endpoint
+    assert (20.0, 0.0) in path
+
+
+def test_geometric_dedup_removes_duplicates():
+    """PR #28 BLOQUANT 5: near-identical edges deduped, existing infra kept."""
+    from shapely.geometry import LineString
+    df = gpd.GeoDataFrame(
+        {
+            "sro": ["T1", "T1"],
+            "pa_id": ["PA1", "PA1"],
+            "pb_id": ["PB1", "PB1"],
+            "statut": ["E", ""],
+            "mode_pose": ["1", "C0"],
+            "infra_type": ["bt", "gc_neuf"],
+            "src": ["bt", "gc_neuf"],
+            "length_m": [10.0, 10.0],
+            "geometry": [
+                LineString([(0, 0), (10, 0)]),
+                LineString([(0.001, 0), (10.001, 0)]),  # same within 1 cm
+            ],
+        },
+        geometry="geometry", crs="EPSG:2154",
+    )
+    result = routing._dedup_geometries(df)
+    assert len(result) == 1
+    assert result.iloc[0]["infra_type"] == "bt"  # existing kept

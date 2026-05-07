@@ -66,6 +66,11 @@ def _point_key(pt) -> tuple[float, float]:
     return (round(pt[0], 6), round(pt[1], 6))
 
 
+def _coord2d(c) -> tuple[float, float]:
+    """Project any coordinate to 2-D (drops Z/M dims)."""
+    return (float(c[0]), float(c[1]))
+
+
 # ---------------------------------------------------------------------------
 # Topology welding (PR #22 / PR #22.5)
 # ---------------------------------------------------------------------------
@@ -244,7 +249,10 @@ def _snap_endpoints_topology(
         # PR #27 amend: patch geometry endpoints to match canonical nodes
         geom = data.get("geometry")
         if geom is not None and isinstance(geom, LineString) and not geom.is_empty:
-            coords_list = list(geom.coords)
+            # PR #28 BLOQUANT 1: force all coords to 2-D (Shapely rejects mixed 2D/3D)
+            coords_list = [_coord2d(c) for c in geom.coords]
+            if len(coords_list) < 2:
+                continue  # degenerate, skip
             changed = False
             # Use proximity to match coords[0]/coords[-1] to nu/nv,
             # since NetworkX may flip edge direction in undirected graphs.
@@ -253,30 +261,41 @@ def _snap_endpoints_topology(
             p_last = _Point(coords_list[-1])
             if u != nu and v != nv:
                 # Both endpoints remapped — match by proximity
-                if p_first.distance(_Point(nu)) <= p_first.distance(_Point(nv)):
-                    coords_list[0] = (nu[0], nu[1])
-                    coords_list[-1] = (nv[0], nv[1])
+                d_first_nu = p_first.distance(_Point(nu))
+                d_first_nv = p_first.distance(_Point(nv))
+                if d_first_nu <= d_first_nv:
+                    coords_list[0] = (float(nu[0]), float(nu[1]))
+                    coords_list[-1] = (float(nv[0]), float(nv[1]))
                 else:
-                    coords_list[0] = (nv[0], nv[1])
-                    coords_list[-1] = (nu[0], nu[1])
+                    coords_list[0] = (float(nv[0]), float(nv[1]))
+                    coords_list[-1] = (float(nu[0]), float(nu[1]))
                 changed = True
             elif u != nu:
                 # Only u changed
                 if p_first.distance(_Point(nu)) <= p_last.distance(_Point(nu)):
-                    coords_list[0] = (nu[0], nu[1])
+                    coords_list[0] = (float(nu[0]), float(nu[1]))
                 else:
-                    coords_list[-1] = (nu[0], nu[1])
+                    coords_list[-1] = (float(nu[0]), float(nu[1]))
                 changed = True
             elif v != nv:
                 # Only v changed
                 if p_first.distance(_Point(nv)) <= p_last.distance(_Point(nv)):
-                    coords_list[0] = (nv[0], nv[1])
+                    coords_list[0] = (float(nv[0]), float(nv[1]))
                 else:
-                    coords_list[-1] = (nv[0], nv[1])
+                    coords_list[-1] = (float(nv[0]), float(nv[1]))
                 changed = True
             if changed:
+                # Validate before creating LineString (PR #28 BLOQUANT 1)
+                if len(coords_list) < 2:
+                    continue
+                if coords_list[0] == coords_list[-1]:
+                    continue  # degenerate zero-length line
                 data = dict(data)
-                data["geometry"] = LineString(coords_list)
+                try:
+                    data["geometry"] = LineString(coords_list)
+                except (ValueError, TypeError):
+                    log.warning("[TOPO SNAP] Invalid geometry skipped for edge %s-%s", u, v)
+                    continue
         if G2.has_edge(nu, nv):
             if data.get("length", 0) < G2[nu][nv].get("length", float("inf")):
                 G2[nu][nv].update(data)
@@ -365,19 +384,30 @@ def _build_graph(
 # ---------------------------------------------------------------------------
 
 
+# PR #28: sentinel to distinguish "not provided" from "explicitly None"
+_SENTINEL = object()
+
+
 def _add_gc_neuf_to_graph(
     G: nx.Graph,
     gc_neuf: gpd.GeoDataFrame,
     snap_tol: float = SNAP_TOLERANCE_M,
-) -> None:
+    public_area: object = _SENTINEL,  # PR #28: spatial validation
+    flag_collector=None,
+) -> int:
     """Add GC neuf C0 edges into graph, snapping endpoints to nearest nodes.
 
     PR #21: endpoints are snapped to existing graph nodes first so that
     Dijkstra can traverse through GC neuf segments. If no node within
     snap_tol, the raw _point_key is added as a new isolated node.
+
+    PR #28 BLOQUANT 2: edges crossing outside *public_area* are rejected
+    with flag GC_NEUF_PRIVATE_CROSSING. Returns count of rejected edges.
     """
     if gc_neuf is None or gc_neuf.empty:
-        return
+        return 0
+
+    n_rejected = 0
 
     # Quick node lookup
     node_coords = np.array([(x, y) for x, y in G.nodes()])
@@ -398,12 +428,34 @@ def _add_gc_neuf_to_graph(
         line = row.geometry
         if line is None or line.is_empty:
             continue
-        coords = list(line.coords)
+        coords = [_coord2d(c) for c in line.coords]
         if len(coords) < 2:
             continue
 
         pk_a = _snap_endpoint(coords[0])
         pk_b = _snap_endpoint(coords[-1])
+
+        # ── PR #28 BLOQUANT 2: spatial check on GC neuf geometry ──────
+        gc_geom = LineString(coords)
+        if public_area is not _SENTINEL:
+            if public_area is None or public_area.is_empty:
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "GC_NEUF_ROUTING_IMPOSSIBLE",
+                        target_url=row.get("pa_id", "?"),
+                        message="GC neuf rejeté — domaine public inconnu",
+                    )
+                n_rejected += 1
+                continue
+            if not public_area.buffer(0.01).covers(gc_geom):
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "GC_NEUF_PRIVATE_CROSSING",
+                        target_url=row.get("pa_id", "?"),
+                        message=f"GC neuf rejeté — traverse domaine privé, length={gc_geom.length:.0f}m",
+                    )
+                n_rejected += 1
+                continue
 
         # Ensure both endpoints exist as nodes in G
         if pk_a not in G:
@@ -418,8 +470,8 @@ def _add_gc_neuf_to_graph(
             "mode_pose": "C0",
             "src": "gc_neuf",
             "infra_type": "gc_neuf",
-            "geometry": row.geometry
-            if row.geometry is not None and not row.geometry.is_empty
+            "geometry": gc_geom
+            if not gc_geom.is_empty
             else LineString([(pk_a[0], pk_a[1]), (pk_b[0], pk_b[1])]),
         }
         for col in ("sro_code", "pa_id", "pb_id"):
@@ -427,12 +479,11 @@ def _add_gc_neuf_to_graph(
                 attrs[col] = row.get(col)
         G.add_edge(pk_a, pk_b, **attrs)
 
+    return n_rejected
+
 
 # ---------------------------------------------------------------------------
 
-
-# PR #27 Part A: sentinel to distinguish "not provided" from "explicitly None"
-_SENTINEL = object()
 
 
 def _bridge_components_with_gc_neuf(
@@ -506,6 +557,7 @@ def _bridge_components_with_gc_neuf(
         src="gc_neuf",
         infra_type="gc_neuf",
         geometry=bridge_geom,
+        _routing_weight=direct_length * 10.0,  # PR #28 amend B2
     )
     if flag_collector is not None:
         flag_collector.add(
@@ -574,14 +626,31 @@ def route_pa_to_pb(
     G = _build_graph(infra_filtered, ign_routes, snap_tol=SNAP_TOLERANCE_M)
 
     # Inject GC neuf C0 edges (snaps endpoints to existing nodes first)
+    n_rejected = 0
     if gc_neuf is not None and not gc_neuf.empty:
-        _add_gc_neuf_to_graph(G, gc_neuf, snap_tol=SNAP_TOLERANCE_M)
+        n_rejected = _add_gc_neuf_to_graph(
+            G, gc_neuf, snap_tol=SNAP_TOLERANCE_M,
+            public_area=public_area, flag_collector=flag_collector,  # PR #28
+        )
+    if n_rejected:
+        log.info("[GC QA] %d GC neuf edges rejected (private crossing)", n_rejected)
 
     if G.number_of_nodes() == 0:
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     # PR #27 Part B: snap close A/Z endpoints before routing
     _topo_stats = _snap_endpoints_topology(G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M)
+
+    # PR #28 BLOQUANT 4: snap degree-1 endpoints onto nearby lines
+    _line_snap_stats = _snap_endpoints_to_lines(
+        G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M,
+        public_area=public_area, flag_collector=flag_collector,  # PR #28 amend B1
+    )
+
+    # PR #28 BLOQUANT 5: penalize gc_neuf in routing (priority to existing infra)
+    for u, v, data in G.edges(data=True):
+        base = data.get("length", 1.0)
+        data["_routing_weight"] = base * 10.0 if data.get("type") == "gc_neuf" else base
 
     # Spec C (PR #22): diagnostic on connected components
     n_cc = nx.number_connected_components(G)
@@ -700,7 +769,7 @@ def route_pa_to_pb(
         def _dijkstra_tree():
             try:
                 _, paths = nx.single_source_dijkstra(
-                    G, source=pa_node, weight="length"
+                    G, source=pa_node, weight="_routing_weight"  # PR #28 BLOQUANT 5
                 )
                 return paths
             except (nx.NetworkXError, KeyError):
@@ -803,14 +872,252 @@ def route_pa_to_pb(
 
     result = gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
 
+    # ── PR #28 BLOQUANT 2: final check — strip any C0/gc_neuf still outside public_area ──
+    if public_area is not _SENTINEL and public_area is not None and not public_area.is_empty:
+        n_before = len(result)
+        # Only filter C0 / gc_neuf edges; keep existing infra untouched
+        mask_c0 = (result["mode_pose"] == "C0") | (result["infra_type"] == "gc_neuf")
+        mask_ok = ~mask_c0 | result.geometry.apply(
+            lambda g: public_area.buffer(0.01).covers(g) if g is not None else False
+        )
+        result = result[mask_ok].copy()
+        n_after = len(result)
+        if n_before != n_after:
+            log.info("[GC QA] Final pass removed %d C0/gc_neuf edges outside public domain", n_before - n_after)
+
+    # ── PR #28 BLOQUANT 5: deduplicate near-identical geometries ──────
+    n_before_dedup = len(result)
+    result = _dedup_geometries(result)
+    n_after_dedup = len(result)
+
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
 
     # ── PR #27 Part D [GC QA] bridge diagnostics ─────────────────────────
     _log_gc_qa(result, pa_sro)
 
+    # ── PR #28 [MUTUAL QA] mutualisation diagnostics ─────────────────────
+    _log_mutual_qa(n_before_dedup, n_after_dedup, pa_sro)
+
     return result
 
+
+# ---------------------------------------------------------------------------
+# PR #28 BLOQUANT 4 — Endpoint-to-line snap
+# ---------------------------------------------------------------------------
+
+_SNAP_TO_LINE_RADIUS_M = 3.0  # max distance for endpoint→line projection
+
+
+def _snap_endpoints_to_lines(
+    G: nx.Graph,
+    snap_radius_m: float = _SNAP_TO_LINE_RADIUS_M,
+    public_area: object = _SENTINEL,  # PR #28 amend B1
+    flag_collector=None,
+) -> dict:
+    """Snap remaining degree-1 endpoints onto nearby edges (project+split).
+
+    After endpoint→endpoint merge, some dangling endpoints may still sit
+    close to a line without touching. This step projects each endpoint
+    onto the nearest qualifying edge, splits that edge at the projection
+    point, and connects the graph.
+
+    Conservative rules:
+    - Only degree-1 nodes (true A/Z endpoints after earlier merges)
+    - Edge must NOT be gc_neuf (don't split artificial bridges)
+    - Distance must be <= snap_radius_m
+    - Projection point must be between edge endpoints, not extension
+
+    Returns stats dict for QA logging.
+    """
+    if G.number_of_nodes() < 2 or G.number_of_edges() < 1:
+        return {"endpoints_to_lines": 0}
+
+    from scipy.spatial import cKDTree
+    from shapely.geometry import Point as _Point
+
+    # Collect degree-1 nodes and edges
+    endpoint_nodes = [n for n in G.nodes() if G.degree(n) == 1]
+    if len(endpoint_nodes) == 0:
+        return {"endpoints_to_lines": 0}
+
+    edge_index: list[tuple] = []
+    edge_lines: list[LineString] = []
+    for u, v, data in G.edges(data=True):
+        if data.get("type") == "gc_neuf":
+            continue  # don't split artificial bridges
+        line = LineString([(u[0], u[1]), (v[0], v[1])])
+        edge_index.append((u, v, data))
+        edge_lines.append(line)
+
+    if len(edge_lines) == 0:
+        return {"endpoints_to_lines": 0}
+
+    edge_tree = STRtree(edge_lines)
+    n_snapped = 0
+
+    for ep in endpoint_nodes:
+        ep_pt = _Point(ep[0], ep[1])
+        # Find nearby edges
+        buf = ep_pt.buffer(snap_radius_m)
+        candidates = edge_tree.query(buf)
+
+        best = None  # (u, v, data, proj_pt, proj_dist_on_line, segment_dist)
+        for idx in candidates:
+            u, v, data = edge_index[idx]
+            line = edge_lines[idx]
+            # ── Skip if endpoint is already on this edge ──
+            if ep == u or ep == v:
+                continue
+            proj_dist = line.project(ep_pt)
+            proj_pt = line.interpolate(proj_dist)
+            d = ep_pt.distance(proj_pt)
+            if d > snap_radius_m:
+                continue
+            # ── Projection must be inside the segment (not at endpoint extension) ──
+            if proj_dist <= 0 or proj_dist >= line.length:
+                continue
+            if best is None or d < best[5]:  # index 5 = segment distance
+                best = (u, v, data, proj_pt, proj_dist, d)
+
+        if best is None:
+            continue
+
+        u, v, data, proj_pt, proj_dist, _ = best
+        proj_key = _point_key(proj_pt)
+
+        # ── Skip if projection already a node ──
+        if proj_key in G:
+            continue
+
+        # ── Split the edge ──
+        if not G.has_edge(u, v):
+            continue
+        G.remove_edge(u, v)
+
+        extra = {k: data[k] for k in data if k not in ("length", "geometry")}
+        d1 = _Point(u[0], u[1]).distance(proj_pt)
+        d2 = _Point(v[0], v[1]).distance(proj_pt)
+
+        # Build sub-geometries
+        orig_geom = data.get("geometry")
+        if orig_geom is not None and isinstance(orig_geom, LineString) and not orig_geom.is_empty:
+            seg_a = shapely.ops.substring(orig_geom, 0, proj_dist)
+            seg_b = shapely.ops.substring(orig_geom, proj_dist, orig_geom.length)
+        else:
+            seg_a = LineString([(u[0], u[1]), (proj_pt.x, proj_pt.y)])
+            seg_b = LineString([(proj_pt.x, proj_pt.y), (v[0], v[1])])
+
+        G.add_edge(u, proj_key, length=d1, geometry=seg_a, **extra)
+        G.add_edge(proj_key, v, length=d2, geometry=seg_b, **extra)
+
+        # ── Connect the endpoint to the split point (PR #28 B1: spatial check) ──
+        connector = LineString([(ep[0], ep[1]), (proj_pt.x, proj_pt.y)])
+        ep_dist = ep_pt.distance(proj_pt)
+
+        if public_area is not _SENTINEL:
+            if public_area is None or public_area.is_empty:
+                if flag_collector is not None:
+                    flag_collector.add("GC_NEUF_ROUTING_IMPOSSIBLE",
+                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
+                        message="Endpoint→line connector rejected — no public domain")
+                n_snapped += 1  # count attempt but don't connect
+                continue
+            if not public_area.buffer(0.01).covers(connector):
+                if flag_collector is not None:
+                    flag_collector.add("GC_NEUF_PRIVATE_CROSSING",
+                        target_url=f"endpoint=({ep[0]:.0f},{ep[1]:.0f})",
+                        message=f"Endpoint→line connector rejected — traverses private, len={ep_dist:.0f}m")
+                n_snapped += 1  # count attempt but don't connect
+                continue
+
+        G.add_edge(
+            ep, proj_key,
+            length=ep_dist,
+            type="gc_neuf",
+            statut="",
+            mode_pose="C0",
+            src="gc_neuf",
+            infra_type="gc_neuf",
+            geometry=connector,
+        )
+        n_snapped += 1
+
+    if n_snapped:
+        cc_after = nx.number_connected_components(G)
+        log.info(
+            "[TOPO SNAP] %d endpoints projected onto lines, "
+            "%d composantes connexes", n_snapped, cc_after,
+        )
+
+    return {"endpoints_to_lines": n_snapped}
+
+
+# ---------------------------------------------------------------------------
+# PR #28 BLOQUANT 5 — Geometric dedup
+# ---------------------------------------------------------------------------
+
+
+def _dedup_geometries(df: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Remove near-duplicate geometries, keeping existing infra over gc_neuf.
+
+    Rounds coordinates to 1 cm, normalizes, and hashes the WKT representation.
+    When two geometries match, keeps non-gc_neuf edges first, then shortest.
+    """
+    if df.empty or len(df) < 2:
+        return df
+
+    import hashlib
+
+    def _norm_hash(geom, precision: int = 2):
+        """Normalize and hash WKT rounded to *precision* cm."""
+        if geom is None or geom.is_empty:
+            return None
+        try:
+            normalized = shapely.normalize(geom)
+        except Exception:
+            normalized = geom
+        # Round coordinates
+        fmt = f"{{:.{precision}f}}"
+        coords = []
+        for c in normalized.coords:
+            # Support 2-D and 3-D coords
+            parts = [fmt.format(float(c[i])) for i in range(min(len(c), 2))]
+            coords.append(" ".join(parts))
+        wkt = "LINESTRING (" + ", ".join(coords) + ")"
+        return hashlib.md5(wkt.encode()).hexdigest()
+
+    # Sort: existing infra first (not gc_neuf), then shorter length
+    df["_is_gc"] = (df["infra_type"] == "gc_neuf") | (df["mode_pose"] == "C0")
+    df["_sort_len"] = df["length_m"].fillna(0)
+    df = df.sort_values(["_is_gc", "_sort_len"]).reset_index(drop=True)
+
+    seen = set()
+    keep_idx: list[int] = []
+    for i in range(len(df)):
+        h = _norm_hash(df.geometry.iloc[i])
+        if h is None or h not in seen:
+            seen.add(h)
+            keep_idx.append(i)
+
+    result = df.iloc[keep_idx].drop(columns=["_is_gc", "_sort_len"]).copy()
+    result.reset_index(drop=True, inplace=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PR #28 — Mutualisation QA log
+# ---------------------------------------------------------------------------
+
+
+def _log_mutual_qa(before: int, after: int, pa_sro: gpd.GeoDataFrame) -> None:
+    """Log mutualisation / dedup statistics (PR #28 BLOQUANT 5)."""
+    sro_code = pa_sro.iloc[0].get("sro", "?") if len(pa_sro) > 0 else "?"
+    removed = before - after
+    log.info(
+        "[MUTUAL QA] %s before=%d after=%d duplicates_removed=%d",
+        sro_code, before, after, removed,
+    )
 
 def _log_gc_qa(df: gpd.GeoDataFrame, pa_sro: gpd.GeoDataFrame) -> None:
     """Log GC neuf bridge diagnostics (PR #27 Part D)."""
