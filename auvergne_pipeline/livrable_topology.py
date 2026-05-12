@@ -50,6 +50,16 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+# Target CRS — EPSG:2154 (RGF93 / Lambert-93) for all livrable outputs.
+OUTPUT_CRS = 2154
+
+# Max length (m) for a C0 terminal connector. Beyond this, C0 is rejected.
+C0_MAX_LENGTH_M = 100.0
+
+# Existing-infrastructure coincidence tolerance (m). A C0 within this distance
+# of an equivalent existing edge can be dropped.
+EXISTING_COINCIDENCE_M = 2.0
+
 # Two endpoints within this distance are considered the same node and
 # snapped to one another. Matches the weld radius used during routing.
 ENDPOINT_SNAP_TOL_M = 0.5
@@ -107,6 +117,47 @@ def _support_family_of(row) -> str:
     if src == "ft" and str(mp) == "0":
         return "aerial_telecom"
     return SUPPORT_FAMILY.get(str(src), "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — enforce_crs  (PR32 Section A)
+# ---------------------------------------------------------------------------
+
+
+def enforce_crs(
+    gdf: gpd.GeoDataFrame,
+    *,
+    target_crs: str = "EPSG:2154",
+) -> gpd.GeoDataFrame:
+    """Force the CRS to the target (default EPSG:2154 / Lambert-93).
+
+    If the gdf has no CRS, use bounds-based detection to guess whether
+    the data is already in Lambert-93 (meter-scale extents cover France)
+    or in lon/lat (WGS84, degrees).  If bounds are clearly degree-range
+    (|x| < 180 and |y| < 90) assume EPSG:4326 and transform.
+    Otherwise treat as Lambert-93 native if extents match France.
+    If already target CRS, return unchanged.
+    """
+    if gdf is None or gdf.empty:
+        return gdf
+    gdf = gdf.copy()
+    if gdf.crs is None:
+        bounds = gdf.total_bounds  # (minx, miny, maxx, maxy)
+        # Heuristic: coordinate magnitudes within degree ranges → lon/lat.
+        if (abs(bounds[0]) < 180 and abs(bounds[1]) < 180
+                and abs(bounds[2]) < 180 and abs(bounds[3]) < 180):
+            log.warning("GeoDataFrame sans CRS — bounds suggest lon/lat, "
+                         "assume EPSG:4326 (WGS84)")
+            gdf.set_crs(epsg=4326, inplace=True)
+        else:
+            log.warning("GeoDataFrame sans CRS — meter-scale bounds, "
+                         "assume native EPSG:2154 (Lambert-93)")
+            gdf.set_crs(epsg=2154, inplace=True)
+    target_epsg = int(target_crs.replace("EPSG:", "").strip())
+    if gdf.crs.to_epsg() != target_epsg:
+        log.info("Converting CRS from %s → %s", gdf.crs.to_epsg(), target_crs)
+        gdf = gdf.to_crs(epsg=target_epsg)
+    return gdf
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +321,8 @@ def _ensure_terminals_connected(
         "pb_connected": 0,
         "terminal_connectors_added": 0,
         "terminal_snap_failed": 0,
+        "c0_rejected_too_long": 0,
+        "terminals_connected_via_existing": 0,
     }
     if df is None or df.empty:
         return df, stats
@@ -348,6 +401,7 @@ def _ensure_terminals_connected(
         d_to_proj = terminal_geom.distance(best_proj)
         if d_to_proj < 0.01:
             # Basically on the line after split — no connector needed
+            stats["terminals_connected_via_existing"] += 1
             if label == "pa":
                 stats["pa_connected"] += 1
             else:
@@ -366,6 +420,28 @@ def _ensure_terminals_connected(
                 flag_collector.add(
                     flag_key, target_url=target_url,
                     message=f"{label.upper()} non connecte (connecteur traverse prive)")
+            return
+
+        # PR32-B: reject zero-length C0
+        if connector.length < 0.01:
+            if label == "pa":
+                stats["pa_connected"] += 1
+            else:
+                stats["pb_connected"] += 1
+            return
+
+        # PR32-B: reject C0 exceeding maximum length
+        if connector.length > C0_MAX_LENGTH_M:
+            log.warning(
+                "Connecteur C0 refuse: %.1f m > %.1f m max",
+                connector.length, C0_MAX_LENGTH_M,
+            )
+            stats["c0_rejected_too_long"] += 1
+            stats["terminal_snap_failed"] += 1
+            if flag_collector is not None:
+                flag_collector.add(
+                    flag_key, target_url=target_url,
+                    message=f"{label.upper()} non connecte (C0 > {C0_MAX_LENGTH_M}m)")
             return
 
         # Add connector
@@ -482,11 +558,15 @@ def _split_livrableedges_at_endpoint_projections(
                 seg_a_coords[-1] = proj_tuple
                 seg_b_coords[0] = proj_tuple
 
-                # Rewrite SOURCE line endpoint to exact projection
+                # Rewrite SOURCE line endpoint to exact projection.
+                # The source line is the one whose endpoint projected here.
+                # If it has already been processed, it's in new_rows at index src_idx.
+                # If it hasn't been processed yet (src_idx >= len(new_rows)), we fix it
+                # in the original rows list so future passes will see the corrected coords.
                 if src_idx is not None and src_idx < len(new_rows):
                     src_r = new_rows[src_idx]
                     src_g = src_r.get("geometry")
-                    if src_g and isinstance(src_g, LineString):
+                    if src_g is not None and isinstance(src_g, LineString):
                         src_cs = list(src_g.coords)
                         if is_first:
                             src_cs[0] = proj_tuple
@@ -494,6 +574,20 @@ def _split_livrableedges_at_endpoint_projections(
                             src_cs[-1] = proj_tuple
                         new_rows[src_idx] = {**src_r, "geometry": LineString(src_cs),
                                              "length_m": LineString(src_cs).length}
+
+                # PR32-B3: Also rewrite source in the original rows list for
+                # source-after-target case (src not yet in new_rows).
+                if src_idx is not None and src_idx < len(rows):
+                    orig_r = rows[src_idx]
+                    orig_g = orig_r.get("geometry")
+                    if orig_g is not None and isinstance(orig_g, LineString):
+                        orig_cs = list(orig_g.coords)
+                        if is_first:
+                            orig_cs[0] = proj_tuple
+                        else:
+                            orig_cs[-1] = proj_tuple
+                        orig_r["geometry"] = LineString(orig_cs)
+                        orig_r["length_m"] = LineString(orig_cs).length
 
                 # Also update endpoints list for source line
                 for ei, (ec, si, if_) in enumerate(endpoints):
@@ -516,6 +610,8 @@ def _split_livrableedges_at_endpoint_projections(
                 new_rows.append(row_b)
                 splits_added += 1
                 changed = True
+                # PR32-C: mark the source row as successfully split
+                is_split = True
                 break
 
             if not is_split:
@@ -1125,6 +1221,7 @@ def _reconnect_after_energy_removal(
     """
     stats = {
         "energy_reconnectors_added": 0,
+        "energy_reconnected_by_existing": 0,
         "energy_reconnect_failed": 0,
     }
     if df_after is None or df_after.empty:
@@ -1202,6 +1299,28 @@ def _reconnect_after_energy_removal(
         if best_node is None:
             continue
         connector = LineString([rem_ep, best_node])
+        # PR32-D: Before creating a C0, check if an existing
+        # equivalent passes nearby within EXISTING_COINCIDENCE_M (2 m).
+        existing_equiv = False
+        for _, erow in df_after.iterrows():
+            egeom = erow.get("geometry")
+            if egeom is None or egeom.is_empty:
+                continue
+            if not isinstance(egeom, LineString):
+                continue
+            if connector.distance(egeom) < EXISTING_COINCIDENCE_M:
+                existing_equiv = True
+                break
+        if existing_equiv:
+            log.debug(
+                "Energy reconnect: equivalent existing edge at %.2f m "
+                "— no C0 needed",
+                best_d,
+            )
+            stats["energy_reconnected_by_existing"] += 1
+            reconnected = True
+            continue
+
         if (delivery_public_area_safe is not None
                 and delivery_public_area_safe.covers(connector)):
             row_template = dict(rows[0]) if rows else {}
@@ -1222,7 +1341,7 @@ def _reconnect_after_energy_removal(
             break
 
     # If no reconnect possible, flag
-    if stats["energy_reconnectors_added"] == 0:
+    if stats["energy_reconnectors_added"] == 0 and stats["energy_reconnected_by_existing"] == 0:
         remaining_ccs = len(set(cc.values()))
         if remaining_ccs > 1:
             stats["energy_reconnect_failed"] += remaining_ccs - 1
@@ -1235,6 +1354,100 @@ def _reconnect_after_energy_removal(
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df_after.crs)
     return out, stats
+
+
+# ---------------------------------------------------------------------------
+# Step 3b — Drop C0 when existing equivalent available (PR32 Section E)
+# ---------------------------------------------------------------------------
+
+
+def _drop_c0_when_existing_equivalent(
+    df: gpd.GeoDataFrame,
+    *,
+    hausdorff_tol_m: float = EXISTING_COINCIDENCE_M,
+) -> tuple[gpd.GeoDataFrame, dict]:
+    """Drop C0 connectors that have an existing equivalent nearby.
+
+    For every row with src='gc_neuf' and mode_pose='C0', check whether
+    an existing (non-gc_neuf) edge passes within ``hausdorff_tol_m``
+    and has a compatible angle (< 45 deg / > 135 deg).
+    If so, the C0 is dropped because the existing network already
+    serves that connection.
+    """
+    stats = {
+        "c0_removed_existing_parallel": 0,
+        "c0_kept_last_resort": 0,
+        "ign_route_delivered_as_gc_m_sum": 0.0,
+    }
+    if df is None or df.empty:
+        return df, stats
+
+    if "src" not in df.columns or "mode_pose" not in df.columns:
+        return df, stats
+
+    c0_mask = (df["src"] == "gc_neuf") & (df["mode_pose"] == "C0")
+    non_c0_mask = ~c0_mask
+    if non_c0_mask.sum() == 0:
+        # No existing infra to compare → keep all C0s as last resort
+        stats["c0_kept_last_resort"] = int(c0_mask.sum())
+        return df, stats
+
+    existing = df.loc[non_c0_mask]
+
+    keep_mask = ~c0_mask
+    for idx in df.index[c0_mask]:
+        geom = df.loc[idx, "geometry"]
+        if geom is None or not isinstance(geom, LineString):
+            keep_mask[idx] = True
+            stats["c0_kept_last_resort"] += 1
+            continue
+
+        overlaps = False
+        for _, erow in existing.iterrows():
+            egeom = erow.get("geometry")
+            if egeom is None or egeom.is_empty or not isinstance(egeom, LineString):
+                continue
+            if geom.distance(egeom) >= hausdorff_tol_m:
+                continue
+            # Angle check via dot-product
+            c0c = list(geom.coords)
+            ec = list(egeom.coords)
+            dx1 = c0c[-1][0] - c0c[0][0]
+            dy1 = c0c[-1][1] - c0c[0][1]
+            dx2 = ec[-1][0] - ec[0][0]
+            dy2 = ec[-1][1] - ec[0][1]
+            n1 = (dx1 ** 2 + dy1 ** 2) ** 0.5
+            n2 = (dx2 ** 2 + dy2 ** 2) ** 0.5
+            if n1 > 0 and n2 > 0:
+                cos_a = (dx1 * dx2 + dy1 * dy2) / (n1 * n2)
+                cos_a = max(-1.0, min(1.0, cos_a))
+                angle = float(np.degrees(np.arccos(cos_a)))
+                if angle < 45.0 or angle > 135.0:
+                    overlaps = True
+                    break
+            else:
+                overlaps = True
+                break
+
+        if overlaps:
+            keep_mask[idx] = False
+            stats["c0_removed_existing_parallel"] += 1
+        else:
+            keep_mask[idx] = True
+            stats["c0_kept_last_resort"] += 1
+
+    if "length_m" in df.columns:
+        stats["ign_route_delivered_as_gc_m_sum"] = float(
+            df.loc[keep_mask & c0_mask, "length_m"].sum()
+        )
+
+    log.info(
+        "=== QA — drop_c0 ===  removed=%d kept=%d gc_m_sum=%.1f",
+        stats["c0_removed_existing_parallel"],
+        stats["c0_kept_last_resort"],
+        stats["ign_route_delivered_as_gc_m_sum"],
+    )
+    return df.loc[keep_mask].copy(), stats
 
 
 # ---------------------------------------------------------------------------
@@ -1261,6 +1474,9 @@ def finalize_livrable_topology(
     stats: dict = {}
     if df is None or df.empty:
         return df, stats
+
+    # PR32-A: enforce CRS at the head of the pipeline.
+    df = enforce_crs(df)
 
     # 1) Snap endpoints to exact identical coordinates.
     df1, n_snapped = _snap_endpoints_to_exact(df)
@@ -1319,8 +1535,13 @@ def finalize_livrable_topology(
     else:
         df8b = df8
 
+    # 8a) Drop C0 when existing equivalent available (PR32 Section E).
+    df_c0 = df8 if n_re_snap else (df8b if isinstance(df8b, gpd.GeoDataFrame) else df7)
+    df_c0, c0_drop_stats = _drop_c0_when_existing_equivalent(df_c0)
+    stats.update(c0_drop_stats)
+
     # 9) Continuity audit (PA→PB reachability + micro-gaps).
-    final_df = df8 if n_re_snap else (df8b if isinstance(df8b, gpd.GeoDataFrame) else df7)
+    final_df = df_c0
     cont_stats = _audit_continuity(
         final_df, pa_sro, pb_sro,
         flag_collector=flag_collector,
@@ -1392,12 +1613,14 @@ def _log_pr31_block(sro_code: str, s: dict) -> None:
     log.info(
         "[ENERGY QA] sro=%s energy_private_crossing_count=%d "
         "energy_private_crossing_length_m=%.0f removed_or_penalized=%d "
-        "energy_reconnectors_added=%d energy_reconnect_failed=%d",
+        "energy_reconnectors_added=%d energy_reconnected_by_existing=%d "
+        "energy_reconnect_failed=%d",
         sro_code,
         s.get("energy_private_crossing_count", 0),
         float(s.get("energy_private_crossing_length_m", 0.0) or 0.0),
         s.get("energy_edges_removed_or_penalized", 0),
         s.get("energy_reconnectors_added", 0),
+        s.get("energy_reconnected_by_existing", 0),
         s.get("energy_reconnect_failed", 0),
     )
     log.info(

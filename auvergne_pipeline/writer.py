@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -46,6 +46,30 @@ QML_MAPPING = {
     LAYER_ZASRO: "za_sro_style.qml",
 }
 
+
+# ---------------------------------------------------------------------------
+# CRS enforcement helper (PR #32-hotfix)
+# ---------------------------------------------------------------------------
+
+def _ensure_crs(
+    gdf: gpd.GeoDataFrame, target_crs: str
+) -> Optional[gpd.GeoDataFrame]:
+    """Force a GeoDataFrame to the target CRS before GPKG write."""
+    if gdf is None or gdf.empty:
+        return gdf
+    if gdf.crs is None:
+        return gdf.set_crs(target_crs)
+    target_epsg = int(
+        str(target_crs).split(":")[1] if ":" in str(target_crs) else target_crs
+    )
+    if gdf.crs.to_epsg() != target_epsg:
+        return gdf.to_crs(target_crs)
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# Layer CRS enforcement before write (PR #32-hotfix)
+# ---------------------------------------------------------------------------
 
 def _ensure_layer_exists(
     gdf: gpd.GeoDataFrame, gpkg_path: Path, layer: str, crs: str
@@ -130,6 +154,7 @@ def write_sro_outputs(
 
     # ---- 3. livrable_bal (BAL filtered by ZASRO) ────────────────────
     bal_out = bal.copy()
+    bal_out = _ensure_crs(bal_out, crs)
     bal_out["sro_code"] = sro_code
     if not bal_out.empty:
         _ensure_layer_exists(bal_out, output_gpkg, LAYER_BAL, crs)
@@ -138,6 +163,7 @@ def write_sro_outputs(
     # ---- 4. livrable_infra (existant + GC neuf) ─────────────────────
     if livrable_infra is not None and not livrable_infra.empty:
         infra_out = livrable_infra.copy()
+        infra_out = _ensure_crs(infra_out, crs)
         if "sro_code" not in infra_out.columns:
             infra_out["sro_code"] = sro_code
         _ensure_layer_exists(infra_out, output_gpkg, LAYER_INFRA, crs)
@@ -146,6 +172,7 @@ def write_sro_outputs(
     # ---- 5. livrable_pb ─────────────────────────────────────────────
     if pb_fictifs is not None and not pb_fictifs.empty:
         pb_out = pb_fictifs.copy()
+        pb_out = _ensure_crs(pb_out, crs)
         if "sro" not in pb_out.columns:
             pb_out["sro"] = sro_code
         _ensure_layer_exists(pb_out, output_gpkg, LAYER_PB, crs)
@@ -154,6 +181,7 @@ def write_sro_outputs(
     # ---- 6. livrable_parcelles (ALL, with is_public column) ─────────
     if parcelles is not None and not parcelles.empty:
         parc_out = parcelles.copy()
+        parc_out = _ensure_crs(parc_out, crs)
         if "sro_code" not in parc_out.columns:
             parc_out["sro_code"] = sro_code
         if "is_public" not in parc_out.columns and "public" in parc_out.columns:
@@ -164,6 +192,7 @@ def write_sro_outputs(
     # ---- 7. livrable_zasro (Polygon, 1 ligne par SRO) ──────────────
     if za_sro is not None and not za_sro.empty:
         zasro_out = za_sro.copy()
+        zasro_out = _ensure_crs(zasro_out, crs)
         if "sro_code" not in zasro_out.columns:
             zasro_out["sro_code"] = sro_code
         _ensure_layer_exists(zasro_out, output_gpkg, LAYER_ZASRO, crs)
