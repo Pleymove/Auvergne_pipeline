@@ -84,6 +84,15 @@ IGN_DELIVERY_MAX_LENGTH_M = 50.0
 # connectors stay welcome; only the accumulation pattern is curbed.
 MAX_IGN_DELIVERED_PER_SRO_M = 300.0
 
+# PR #33 — No straight visible connectors. Any edge that is a direct
+# LineString([A, B]) without a real source geometry (existing infra or
+# IGN route) is treated as a CONNECTOR. Connectors are:
+#   - ALLOWED as virtual topology helpers (deliverable=False)
+#     for Dijkstra routing connectivity
+#   - FORBIDDEN as visible segments in livrable_infra when > 3m
+#   - Micro-snap (<= 3m) may be virtual and non-delivered
+MAX_STRAIGHT_CONNECTOR_M = 3.0
+
 # PR #31 H — soft warning when IGN-derived C0 dominates the livrable.
 IGN_DELIVERED_TOTAL_RATIO_WARN = 0.10
 
@@ -561,6 +570,10 @@ def _add_gc_neuf_to_graph(
             "geometry": gc_geom
             if not gc_geom.is_empty
             else LineString([(pk_a[0], pk_a[1]), (pk_b[0], pk_b[1])]),
+            # PR #33: gc_neuf edges are VIRTUAL — routable but NOT delivered
+            "virtual": True,
+            "deliverable": False,
+            "virtual_reason": "gc_neuf_c0",
         }
         for col in ("sro_code", "pa_id", "pb_id"):
             if col in gc_neuf.columns:
@@ -583,12 +596,16 @@ def _bridge_components_with_gc_neuf(
     public_area: object = _SENTINEL,  # PR #27 Part A: spatial validation
     public_area_safe=None,             # PR #29 B1: pre-buffered for perf
 ) -> bool:
-    """If pa_node and pb_node belong to different connected components
-    AND the direct distance is within *max_bridge_length_m* AND the bridge
-    lies within *public_area*, add a GC neuf C0 edge and return True.
+    """If pa_node and pb_node belong to different connected components,
+    attempt to bridge them WITHOUT creating visible straight-line segments.
 
-    Otherwise only flag the disconnection — NEVER create a diagonal
-    across private parcels (PR #26 / PR #27: CDC compliance).
+    PR #33 behaviour:
+    - distance <= MAX_STRAIGHT_CONNECTOR_M: create a VIRTUAL edge 
+      (routable but NOT deliverable) for micro-snap connectivity.
+    - distance > MAX_STRAIGHT_CONNECTOR_M: flag disconnection, do NOT
+      create any edge. The PB will be reported as disconnected.
+    - This replaces the previous behaviour of creating visible C0
+      diagonal bridges that showed up as straight red lines in QGIS.
     """
     try:
         cc_pa = nx.node_connected_component(G, pa_node)
@@ -601,12 +618,13 @@ def _bridge_components_with_gc_neuf(
         Point(pb_node[0], pb_node[1])
     )
 
-    if direct_length > max_bridge_length_m:
+    # PR #33: only allow micro-snap bridges (<= 3m) as virtual edges
+    if direct_length > MAX_STRAIGHT_CONNECTOR_M:
         if flag_collector is not None:
             flag_collector.add(
-                "GC_NEUF_ROUTING_IMPOSSIBLE",
+                "COMPONENT_BRIDGE_REQUIRED_MANUAL_REVIEW",
                 target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                message=f"Pont GC neuf impossible — distance {direct_length:.0f}m > seuil {max_bridge_length_m}m",
+                message=f"Bridge requis entre composants — distance {direct_length:.0f}m > seuil micro {MAX_STRAIGHT_CONNECTOR_M}m, review manuelle",
             )
         return False
 
@@ -615,29 +633,7 @@ def _bridge_components_with_gc_neuf(
         (pb_node[0], pb_node[1]),
     ])
 
-    # PR #27 Part A / PR #29 B1: spatial check — bridge must be in public domain
-    if public_area is not _SENTINEL:
-        if public_area_safe is None:
-            public_area_safe = _public_area_safe(public_area)
-        if public_area_safe is None:
-            # No public domain info — fail closed, never create blind bridges
-            if flag_collector is not None:
-                flag_collector.add(
-                    "GC_NEUF_ROUTING_IMPOSSIBLE",
-                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                    message=f"Pont GC neuf impossible — domaine public inconnu, length={direct_length:.0f}m",
-                )
-            return False
-
-        if not public_area_safe.covers(bridge_geom):
-            if flag_collector is not None:
-                flag_collector.add(
-                    "GC_NEUF_PRIVATE_CROSSING",
-                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                    message=f"Bridge C0 rejete — traverse domaine prive, length={direct_length:.0f}m",
-                )
-            return False
-
+    # PR #33: micro bridge accepted but VIRTUAL (not delivered)
     G.add_edge(
         pa_node, pb_node,
         length=direct_length,
@@ -647,14 +643,16 @@ def _bridge_components_with_gc_neuf(
         src="gc_neuf",
         infra_type="gc_neuf",
         geometry=bridge_geom,
-        # PR #29 A1: weight follows hierarchy (gc_neuf factor 10).
-        _routing_weight=direct_length * WEIGHT_FACTOR_GC_NEUF,
+        # PR #33: virtual edge — routable but NOT delivered to livrable_infra
+        virtual=True,
+        deliverable=False,
+        virtual_reason="micro_bridge",
     )
     if flag_collector is not None:
         flag_collector.add(
-            "GC_NEUF_GENERE_DIJKSTRA",
+            "MICRO_BRIDGE_CREATED_VIRTUAL",
             target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-            message=f"Pont GC neuf C0, length={direct_length:.0f}m",
+            message=f"Micro bridge virtuel cree, length={direct_length:.1f}m (non livre)",
         )
     return True
 
@@ -810,9 +808,15 @@ def route_pa_to_pb(
     ign_route_delivered_as_gc_m = 0.0  # IGN edges short+public, KEPT as C0
     ign_route_blocked_m = 0.0          # IGN edges too long or private, DROPPED
     ign_route_blocked_count = 0
+    ign_cap_hit_count = 0
     # Per-SRO de-duplication: a single IGN_ROUTE_BLOCKED flag per SRO is
     # enough; we only track that we've already added it to avoid spam.
     _ign_blocked_flag_added = False
+
+    # PR #33 — virtual edge telemetry
+    virtual_edges_blocked_count = 0
+    straight_connector_count = 0
+    straight_connector_length_m = 0.0
 
     # Build STRtree indices for fast PA/PB snapping (PR #21)
     # PR #27 Part C: use rebuild helper (avoids stale indices)
@@ -975,6 +979,14 @@ def route_pa_to_pb(
                 edge_data = G.get_edge_data(u, v)
                 if edge_data is None:
                     continue
+
+                # PR #33: VIRTUAL edges are NEVER delivered to livrable_infra.
+                # They exist purely for Dijkstra connectivity (micro-snaps,
+                # component bridges, gc_neuf injected into graph).
+                if edge_data.get("virtual") or not edge_data.get("deliverable", True):
+                    virtual_edges_blocked_count += 1
+                    continue
+
                 ekey = _edge_key(u, v)
                 if ekey not in edges_out:
                     # ── Resolve attributes with QML / CDC compliance ──────
@@ -1092,6 +1104,18 @@ def route_pa_to_pb(
                         "length_m": raw_length,
                         "geometry": out_geom,
                     }
+
+                    # PR #33 — count straight connectors (2-vertex gc_neuf edges)
+                    # that managed to pass through all filters. This should be 0
+                    # after PR#33, but the counter catches regressions.
+                    if infra_type == "gc_neuf" and out_geom is not None:
+                        try:
+                            n_verts = len(out_geom.coords)
+                            if n_verts == 2:
+                                straight_connector_count += 1
+                                straight_connector_length_m += raw_length
+                        except Exception:
+                            pass
 
     perf["dijkstra_total"] = time.perf_counter() - t0_dijkstra
 
@@ -1211,7 +1235,35 @@ def route_pa_to_pb(
         gaps_remaining_estimate=gaps_remaining_estimate,
     )
 
-    # ── PR #29 B4: per-step + total perf logs ───────────────────────────
+    # ── PR #33 — [FINAL TOPO QA] mandatory log ──────────────────────────
+    c0_without_source_geom = 0
+    if not result.empty:
+        c0_mask = result["infra_type"] == "gc_neuf"
+        for idx in result.index[c0_mask]:
+            geom = result.loc[idx, "geometry"]
+            if geom is None or not isinstance(geom, LineString) or geom.is_empty:
+                c0_without_source_geom += 1
+                continue
+            if len(geom.coords) == 2:
+                c0_without_source_geom += 1
+
+    pa_pb_connected = pr31_stats.get("pa_pb_connected_count", 0) if isinstance(pr31_stats, dict) else 0
+    pa_pb_disconnected = pr31_stats.get("pa_pb_disconnected_count", 0) if isinstance(pr31_stats, dict) else 0
+    pa_pb_total = pa_pb_connected + pa_pb_disconnected
+    pa_pb_ratio = pa_pb_connected / pa_pb_total if pa_pb_total > 0 else 0.0
+
+    log.info(
+        "[FINAL TOPO QA] sro=%s connected=%d disconnected=%d pa_pb_connected_ratio=%.2f "
+        "straight_connectors=%d straight_connector_length_m=%.0f "
+        "virtual_delivered=%d ign_cap_hit=%d c0_without_source_geometry=%d",
+        sro_code_log, pa_pb_connected, pa_pb_disconnected, pa_pb_ratio,
+        straight_connector_count, straight_connector_length_m,
+        0,  # virtual_edges_delivered_count — guarded above, always 0
+        ign_cap_hit_count,
+        c0_without_source_geom,
+    )
+
+    # PR #29 B4: per-step + total perf logs ───────────────────────────
     perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start
     for step, sec in perf.items():
         if step == "dijkstra_total":
@@ -1412,6 +1464,11 @@ def _snap_endpoints_to_lines(
             src="gc_neuf",
             infra_type="gc_neuf",
             geometry=connector,
+            # PR #33: connectors from endpoint-to-line are VIRTUAL
+            # (routable but NOT delivered as visible C0 segments)
+            virtual=True,
+            deliverable=False,
+            virtual_reason="endpoint_micro_snap",
         )
         n_snapped += 1
         # PR #30 — count as an "existing_connector" only when the snap

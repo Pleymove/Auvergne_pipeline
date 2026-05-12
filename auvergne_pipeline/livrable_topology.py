@@ -397,7 +397,9 @@ def _ensure_terminals_connected(
         rows[best_idx] = row_a
         rows.append(row_b)
 
-        # Check if connector needed (nonzero distance to projection)
+        # PR #33 — connector from terminal to projected line.
+        # We only accept microscopic distances as valid (floating-point jitter).
+        # Beyond that, we flag but do NOT create a straight C0 segment.
         d_to_proj = terminal_geom.distance(best_proj)
         if d_to_proj < 0.01:
             # Basically on the line after split — no connector needed
@@ -408,56 +410,22 @@ def _ensure_terminals_connected(
                 stats["pb_connected"] += 1
             return
 
-        # Public domain check
-        connector = LineString([
-            (terminal_geom.x, terminal_geom.y),
-            (best_proj.x, best_proj.y),
-        ])
-        if (delivery_public_area_safe is not None
-                and not delivery_public_area_safe.covers(connector)):
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key, target_url=target_url,
-                    message=f"{label.upper()} non connecte (connecteur traverse prive)")
-            return
-
-        # PR32-B: reject zero-length C0
-        if connector.length < 0.01:
+        if d_to_proj <= 0.2:
+            stats["terminals_connected_via_existing"] += 1
             if label == "pa":
                 stats["pa_connected"] += 1
             else:
                 stats["pb_connected"] += 1
             return
 
-        # PR32-B: reject C0 exceeding maximum length
-        if connector.length > C0_MAX_LENGTH_M:
-            log.warning(
-                "Connecteur C0 refuse: %.1f m > %.1f m max",
-                connector.length, C0_MAX_LENGTH_M,
-            )
-            stats["c0_rejected_too_long"] += 1
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key, target_url=target_url,
-                    message=f"{label.upper()} non connecte (C0 > {C0_MAX_LENGTH_M}m)")
-            return
-
-        # Add connector
-        conn_row = dict(target_row)
-        conn_row["geometry"] = connector
-        conn_row["length_m"] = connector.length
-        conn_row["statut"] = ""
-        conn_row["mode_pose"] = "C0"
-        conn_row["src"] = "gc_neuf"
-        conn_row["infra_type"] = "gc_neuf"
-        rows.append(conn_row)
-        stats["terminal_connectors_added"] += 1
-        if label == "pa":
-            stats["pa_connected"] += 1
-        else:
-            stats["pb_connected"] += 1
+        # PR #33: beyond 0.2m, do NOT create a straight C0 connector.
+        # Flag the terminal as not connected — no synthetic geometry.
+        stats["terminal_snap_failed"] += 1
+        if flag_collector is not None:
+            flag_collector.add(
+                flag_key, target_url=target_url,
+                message=f"{label.upper()} non connecte — connecteur C0 droit non cree (PR #33), distance={d_to_proj:.1f}m")
+        return
 
     if pa_sro is not None and not pa_sro.empty:
         for _, pa in pa_sro.iterrows():

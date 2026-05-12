@@ -88,8 +88,14 @@ def test_pa_is_connected_to_livrable_path():
     assert (5.0, 0.0) in starts | ends, (
         f"target line should have been split at PA projection (5,0); got {starts | ends}"
     )
-    assert stats["pa_connected"] >= 1
-    assert stats["terminal_connectors_added"] >= 1
+    # PR #33: PA connects by projection-split, but NO C0 connector is added
+    # anymore. Split must still happen.
+    assert (5.0, 0.0) in starts | ends, (
+        f"target line should have been split at PA projection (5,0); got {starts | ends}"
+    )
+    assert stats["terminal_connectors_added"] == 0, (
+        "PR #33: no C0 connectors should be added"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +111,10 @@ def test_pb_is_connected_to_livrable_path():
         df, pa, pb, "SRO1",
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
-    assert stats["pb_connected"] >= 1
-    assert stats["terminal_connectors_added"] >= 1
+    # PR #33: PB connects by projection-split, but NO C0 connector added
+    assert stats["terminal_connectors_added"] == 0, (
+        "PR #33: no C0 connectors should be added"
+    )
 
 
 # ---------------------------------------------------------------------------

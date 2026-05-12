@@ -99,24 +99,37 @@ def test_weld_close_nodes_merges_disjoint_islands():
 
 
 def test_bridge_gc_neuf_when_no_path():
-    """PR #22 Spec B: disconnected PA/PB get a C0 bridge edge (short gap < 50m)."""
+    """PR #22 Spec B: short-gap PA/PB (< 3m) get a VIRTUAL C0 bridge.
+    PR #33: bridges > 3m are rejected — no visible straight connectors."""
     import networkx as nx
 
+    # Test 1: micro gap (2m) should create a virtual bridge
     G = nx.Graph()
-    # Edge from (0,0) to (10,0) — PA can snap here
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    # Isolated node — PB at 30m (within 50m threshold, PR #26 amend)
-    G.add_node((30.0, 0.0))
+    G.add_node((1.5, 0.0))  # only 1.5m from existing node
 
-    # Bridge should be created (nodes in different CCs, gap < 50m)
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0)
+        G, (0.0, 0.0), (1.5, 0.0)
     )
     assert bridged
-    assert G.has_edge((0.0, 0.0), (30.0, 0.0))
-    edge = G[(0.0, 0.0)][(30.0, 0.0)]
+    assert G.has_edge((0.0, 0.0), (1.5, 0.0))
+    edge = G[(0.0, 0.0)][(1.5, 0.0)]
     assert edge["mode_pose"] == "C0"
-    assert edge["src"] == "gc_neuf"  # PR #26: gc_neuf_runtime -> gc_neuf
+    assert edge["src"] == "gc_neuf"
+    # PR #33: must be virtual (not delivered to livrable)
+    assert edge.get("virtual") is True
+    assert edge.get("deliverable") is False
+
+    # Test 2: large gap (30m) should be REJECTED
+    G2 = nx.Graph()
+    G2.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
+    G2.add_node((30.0, 0.0))
+
+    bridged2 = routing._bridge_components_with_gc_neuf(
+        G2, (0.0, 0.0), (30.0, 0.0)
+    )
+    assert not bridged2, "Bridge > 3m should be rejected"
+    assert not G2.has_edge((0.0, 0.0), (30.0, 0.0))
 
 
 def test_no_self_loop_after_welding():
