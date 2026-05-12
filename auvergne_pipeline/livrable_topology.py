@@ -354,34 +354,14 @@ def _ensure_terminals_connected(
                 stats["pb_connected"] += 1
             return
 
-        # Public domain check
-        connector = LineString([
-            (terminal_geom.x, terminal_geom.y),
-            (best_proj.x, best_proj.y),
-        ])
-        if (delivery_public_area_safe is not None
-                and not delivery_public_area_safe.covers(connector)):
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key, target_url=target_url,
-                    message=f"{label.upper()} non connecte (connecteur traverse prive)")
-            return
-
-        # Add connector
-        conn_row = dict(target_row)
-        conn_row["geometry"] = connector
-        conn_row["length_m"] = connector.length
-        conn_row["statut"] = ""
-        conn_row["mode_pose"] = "C0"
-        conn_row["src"] = "gc_neuf"
-        conn_row["infra_type"] = "gc_neuf"
-        rows.append(conn_row)
-        stats["terminal_connectors_added"] += 1
-        if label == "pa":
-            stats["pa_connected"] += 1
-        else:
-            stats["pb_connected"] += 1
+        # PR #33: NE PLUS créer de connecteurs C0 (droites artificielles).
+        # Si le terminal n'est pas connecté au réseau existant, on le flag.
+        stats["terminal_snap_failed"] += 1
+        if flag_collector is not None:
+            flag_collector.add(
+                flag_key, target_url=target_url,
+                message=f"{label.upper()} non connecte au livrable "
+                        f"(connecteur C0 non créé — PR #33)")
 
     if pa_sro is not None and not pa_sro.empty:
         for _, pa in pa_sro.iterrows():

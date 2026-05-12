@@ -8,6 +8,8 @@ from shapely.geometry import LineString, Point
 
 from auvergne_pipeline import config, routing
 
+import pytest
+
 
 def _straight_infra() -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(pd.DataFrame({
@@ -98,6 +100,7 @@ def test_weld_close_nodes_merges_disjoint_islands():
     assert G_w.number_of_nodes() < G.number_of_nodes()  # nodes merged
 
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_gc_neuf_when_no_path():
     """PR #22 Spec B: disconnected PA/PB get a C0 bridge edge (short gap < 50m)."""
     import networkx as nx

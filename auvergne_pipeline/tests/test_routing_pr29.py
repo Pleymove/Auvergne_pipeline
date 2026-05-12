@@ -117,6 +117,7 @@ def test_ign_route_penalized_vs_existing(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_existing_endpoint_to_existing_line_preferred_over_gc(monkeypatch):
     """An existing endpoint dangling 1 m from an existing line gets snapped
     onto the line. The Dijkstra path then prefers the existing edges over
@@ -163,6 +164,7 @@ def test_existing_endpoint_to_existing_line_preferred_over_gc(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_to_line_private_connector_does_not_split_edge():
     """A connector that crosses a private parcel must be rejected and the
     target edge must remain untouched (not split).
@@ -200,6 +202,7 @@ def test_endpoint_to_line_private_connector_does_not_split_edge():
     assert G.has_edge((0.0, 0.0), (10.0, 0.0)), "target edge must be intact"
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_to_line_public_connector_splits_edge():
     """A connector that lies in the public domain DOES split the target
     edge and adds the gc_neuf connector — the standard happy path.
@@ -232,6 +235,7 @@ def test_endpoint_to_line_public_connector_splits_edge():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_keeps_explicit_routing_weight():
     """The C0 bridge edge must carry ``_routing_weight = length × factor``."""
     G = nx.Graph()
@@ -266,6 +270,7 @@ def test_routing_no_sklearn_dependency():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: IGN disabled")
 def test_routing_qa_counts_ign_before_conversion(monkeypatch, caplog):
     """Regression for the false-zero bug: ``ign_route_length_used_m`` must
     be > 0 when Dijkstra actually traverses an IGN edge, even though the

@@ -82,7 +82,7 @@ IGN_DELIVERY_MAX_LENGTH_M = 50.0
 # delivery (still routable, just not visible) and counted in
 # ign_route_blocked_m. The cap is generous on purpose — short legitimate
 # connectors stay welcome; only the accumulation pattern is curbed.
-MAX_IGN_DELIVERED_PER_SRO_M = 300.0
+MAX_IGN_DELIVERED_PER_SRO_M = 0.0  # PR #33: IGN/C0 must NEVER be auto-consumed
 
 # PR #31 H — soft warning when IGN-derived C0 dominates the livrable.
 IGN_DELIVERED_TOTAL_RATIO_WARN = 0.10
@@ -475,192 +475,17 @@ def _add_gc_neuf_to_graph(
     public_area_safe=None,            # PR #29 B1: pre-buffered for perf
     flag_collector=None,
 ) -> int:
-    """Add GC neuf C0 edges into graph, snapping endpoints to nearest nodes.
-
-    PR #21: endpoints are snapped to existing graph nodes first so that
-    Dijkstra can traverse through GC neuf segments. If no node within
-    snap_tol, the raw _point_key is added as a new isolated node.
-
-    PR #28 BLOQUANT 2: edges crossing outside *public_area* are rejected
-    with flag GC_NEUF_PRIVATE_CROSSING. Returns count of rejected edges.
-
-    PR #29 B1: when ``public_area_safe`` is provided, it MUST equal
-    ``public_area.buffer(0.01)`` and is used directly to avoid recomputing
-    the buffer per edge (was N×buffer in inner loop).
-    """
-    if gc_neuf is None or gc_neuf.empty:
-        return 0
-
-    # Pre-compute buffered public area if not provided (B1).
-    if public_area is not _SENTINEL and public_area_safe is None:
-        public_area_safe = _public_area_safe(public_area)
-
-    n_rejected = 0
-
-    # Quick node lookup
-    node_coords = np.array([(x, y) for x, y in G.nodes()])
-    has_nodes = len(node_coords) > 0
-
-    def _snap_endpoint(coord) -> tuple[float, float]:
-        pk = _point_key(coord)
-        if pk in G:
-            return pk
-        if has_nodes:
-            dists = np.linalg.norm(node_coords - np.array([[coord[0], coord[1]]]), axis=1)
-            i_min = int(dists.argmin())
-            if dists[i_min] <= snap_tol:
-                return _point_key(node_coords[i_min])
-        return pk
-
-    for _, row in gc_neuf.iterrows():
-        line = row.geometry
-        if line is None or line.is_empty:
-            continue
-        coords = [_coord2d(c) for c in line.coords]
-        if len(coords) < 2:
-            continue
-
-        pk_a = _snap_endpoint(coords[0])
-        pk_b = _snap_endpoint(coords[-1])
-
-        # ── PR #28 BLOQUANT 2 / PR #29 B1: spatial check on GC neuf geometry ──
-        gc_geom = LineString(coords)
-        if public_area is not _SENTINEL:
-            if public_area_safe is None:
-                if flag_collector is not None:
-                    flag_collector.add(
-                        "GC_NEUF_ROUTING_IMPOSSIBLE",
-                        target_url=row.get("pa_id", "?"),
-                        message="GC neuf rejeté — domaine public inconnu",
-                    )
-                n_rejected += 1
-                continue
-            if not public_area_safe.covers(gc_geom):
-                if flag_collector is not None:
-                    flag_collector.add(
-                        "GC_NEUF_PRIVATE_CROSSING",
-                        target_url=row.get("pa_id", "?"),
-                        message=f"GC neuf rejeté — traverse domaine privé, length={gc_geom.length:.0f}m",
-                    )
-                n_rejected += 1
-                continue
-
-        # Ensure both endpoints exist as nodes in G
-        if pk_a not in G:
-            G.add_node(pk_a)
-        if pk_b not in G:
-            G.add_node(pk_b)
-
-        attrs = {
-            "length": Point(pk_a[0], pk_a[1]).distance(Point(pk_b[0], pk_b[1])),
-            "type": "gc_neuf",
-            "statut": "",
-            "mode_pose": "C0",
-            "src": "gc_neuf",
-            "infra_type": "gc_neuf",
-            "geometry": gc_geom
-            if not gc_geom.is_empty
-            else LineString([(pk_a[0], pk_a[1]), (pk_b[0], pk_b[1])]),
-        }
-        for col in ("sro_code", "pa_id", "pb_id"):
-            if col in gc_neuf.columns:
-                attrs[col] = row.get(col)
-        G.add_edge(pk_a, pk_b, **attrs)
-
-    return n_rejected
+    """PR #33: NO-OP. GC neuf C0 edges are no longer injected into the routing
+    graph to prevent automatic consumption of artificial connectors."""
+    return 0
 
 
 # ---------------------------------------------------------------------------
 
 
 
-def _bridge_components_with_gc_neuf(
-    G: nx.Graph,
-    pa_node: tuple[float, float],
-    pb_node: tuple[float, float],
-    flag_collector=None,
-    max_bridge_length_m: float = 50.0,
-    public_area: object = _SENTINEL,  # PR #27 Part A: spatial validation
-    public_area_safe=None,             # PR #29 B1: pre-buffered for perf
-) -> bool:
-    """If pa_node and pb_node belong to different connected components
-    AND the direct distance is within *max_bridge_length_m* AND the bridge
-    lies within *public_area*, add a GC neuf C0 edge and return True.
-
-    Otherwise only flag the disconnection — NEVER create a diagonal
-    across private parcels (PR #26 / PR #27: CDC compliance).
-    """
-    try:
-        cc_pa = nx.node_connected_component(G, pa_node)
-        if pb_node in cc_pa:
-            return False
-    except (nx.NetworkXError, KeyError):
-        return False
-
-    direct_length = Point(pa_node[0], pa_node[1]).distance(
-        Point(pb_node[0], pb_node[1])
-    )
-
-    if direct_length > max_bridge_length_m:
-        if flag_collector is not None:
-            flag_collector.add(
-                "GC_NEUF_ROUTING_IMPOSSIBLE",
-                target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                message=f"Pont GC neuf impossible — distance {direct_length:.0f}m > seuil {max_bridge_length_m}m",
-            )
-        return False
-
-    bridge_geom = LineString([
-        (pa_node[0], pa_node[1]),
-        (pb_node[0], pb_node[1]),
-    ])
-
-    # PR #27 Part A / PR #29 B1: spatial check — bridge must be in public domain
-    if public_area is not _SENTINEL:
-        if public_area_safe is None:
-            public_area_safe = _public_area_safe(public_area)
-        if public_area_safe is None:
-            # No public domain info — fail closed, never create blind bridges
-            if flag_collector is not None:
-                flag_collector.add(
-                    "GC_NEUF_ROUTING_IMPOSSIBLE",
-                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                    message=f"Pont GC neuf impossible — domaine public inconnu, length={direct_length:.0f}m",
-                )
-            return False
-
-        if not public_area_safe.covers(bridge_geom):
-            if flag_collector is not None:
-                flag_collector.add(
-                    "GC_NEUF_PRIVATE_CROSSING",
-                    target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-                    message=f"Bridge C0 rejete — traverse domaine prive, length={direct_length:.0f}m",
-                )
-            return False
-
-    G.add_edge(
-        pa_node, pb_node,
-        length=direct_length,
-        type="gc_neuf",
-        statut="",
-        mode_pose="C0",
-        src="gc_neuf",
-        infra_type="gc_neuf",
-        geometry=bridge_geom,
-        # PR #29 A1: weight follows hierarchy (gc_neuf factor 10).
-        _routing_weight=direct_length * WEIGHT_FACTOR_GC_NEUF,
-    )
-    if flag_collector is not None:
-        flag_collector.add(
-            "GC_NEUF_GENERE_DIJKSTRA",
-            target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-            message=f"Pont GC neuf C0, length={direct_length:.0f}m",
-        )
-    return True
-
-
-# ---------------------------------------------------------------------------
-
+# _bridge_components_with_gc_neuf removed by PR #33 — no more straight-line
+# bridges between disconnected components.
 
 def _rebuild_strtree_indices(
     G: nx.Graph,
@@ -766,15 +591,9 @@ def route_pa_to_pb(
     _topo_stats = _snap_endpoints_topology(G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M)
     perf["snap_endpoints_topology"] = time.perf_counter() - t0
 
-    # PR #28 BLOQUANT 4: snap degree-1 endpoints onto nearby lines
-    t0 = time.perf_counter()
-    _line_snap_stats = _snap_endpoints_to_lines(
-        G, snap_radius_m=SNAP_ENDPOINT_RADIUS_M,
-        public_area=public_area,
-        public_area_safe=public_area_safe,  # PR #29 B1
-        flag_collector=flag_collector,
-    )
-    perf["snap_endpoints_to_lines"] = time.perf_counter() - t0
+    # PR #33: _snap_endpoints_to_lines removed — no more straight-line
+    # connecteurs (type="gc_neuf") created by endpoint-to-line snapping.
+    _line_snap_stats = {"endpoints_to_lines": 0, "endpoints_rejected_private": 0, "existing_connectors_added": 0}
 
     # PR #29 A1: hierarchical routing weights — prefer existing infra over
     # gc_neuf, and gc_neuf over IGN routes. The factors are documented
@@ -940,34 +759,15 @@ def route_pa_to_pb(
             if pb_node in _paths:
                 path = _paths[pb_node]
             else:
-                # Spec B (PR #22): bridge components with GC neuf C0
-                bridged = _bridge_components_with_gc_neuf(
-                    G, pa_node, pb_node,
-                    flag_collector=flag_collector,
-                    public_area=public_area,             # PR #27
-                    public_area_safe=public_area_safe,   # PR #29 B1
-                )
-                if bridged:
-                    # Recompute tree after bridge insertion
-                    _paths = _dijkstra_tree()
-                    if pb_node in _paths:
-                        path = _paths[pb_node]
-                    else:
-                        if flag_collector is not None:
-                            flag_collector.add(
-                                "PA_PB_DECONNECTES",
-                                target_url=pa_id,
-                                message=f"Pas de chemin vers {pb_id} meme apres pont GC neuf",
-                            )
-                        continue
-                else:
-                    if flag_collector is not None:
-                        flag_collector.add(
-                            "PA_PB_DECONNECTES",
-                            target_url=pa_id,
-                            message=f"Pas de chemin vers {pb_id}",
-                        )
-                    continue
+                # PR #33: removed _bridge_components_with_gc_neuf. No longer create
+                # straight-line GC neuf bridges between disconnected components.
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "PA_PB_DECONNECTES",
+                        target_url=pa_id,
+                        message=f"Pas de chemin vers {pb_id}",
+                    )
+                continue
 
             # Collect edges along the path (PR #26: use stored geometry, fix attribs)
             for i in range(len(path) - 1):
@@ -1621,6 +1421,15 @@ def _log_routing_qa(
         log.warning(
             "[ROUTING WARNING] sro=%s ign_route_used_before_conversion=%.0fm",
             sro_code, ign_length,
+        )
+    # PR #33 — any IGN delivered as C0 is a red flag: the cap is 0 so
+    # this should never happen. If it does, something downstream bypassed
+    # the gate.
+    if ign_route_delivered_as_gc_m > 0:
+        log.warning(
+            "[ROUTING WARNING] sro=%s ign_route_delivered_as_gc_m=%.0f — "
+            "C0/IGN delivered despite PR #33 cap (should be zero!)",
+            sro_code, ign_route_delivered_as_gc_m,
         )
 
 

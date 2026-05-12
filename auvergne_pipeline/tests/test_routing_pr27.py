@@ -16,6 +16,7 @@ from auvergne_pipeline import config, routing
 # 1. Bridge C0 rejected if crossing private
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_rejected_private_crossing():
     """PR #27 Part A: bridge <= 50m but outside public_area is rejected."""
     G = nx.Graph()
@@ -35,6 +36,7 @@ def test_bridge_rejected_private_crossing():
 # 2. Bridge C0 accepted if in public_area
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_accepted_in_public_area():
     """PR #27 Part A: bridge <= 50m fully inside public_area is accepted."""
     G = nx.Graph()
@@ -54,6 +56,7 @@ def test_bridge_accepted_in_public_area():
 # 3. Bridge > 50m rejected
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_rejected_too_long():
     """PR #27: bridge > 50m rejected regardless of public_area."""
     G = nx.Graph()
@@ -73,6 +76,7 @@ def test_bridge_rejected_too_long():
 # 4. Bridge with public_area=None → fail-closed
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_rejected_no_public_area():
     """PR #27 amend: public_area=None must fail-closed (no blind bridges)."""
     G = nx.Graph()
@@ -90,6 +94,7 @@ def test_bridge_rejected_no_public_area():
 # 5. Bridge on boundary → accepted (covers + buffer tolerance)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_accepted_on_boundary():
     """PR #27 amend: bridge exactly on public_area boundary is accepted."""
     G = nx.Graph()
@@ -285,6 +290,7 @@ def test_3d_snap_keeps_valid_2d_output():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: gc_neuf injection disabled")
 def test_add_gc_neuf_rejected_private_crossing():
     """PR #28 BLOQUANT 2: gc_neuf from _add_gc_neuf_to_graph rejected if private."""
     G = nx.Graph()
@@ -302,6 +308,7 @@ def test_add_gc_neuf_rejected_private_crossing():
     assert G.number_of_edges() == 0  # nothing added
 
 
+@pytest.mark.skip(reason="PR #33: gc_neuf injection disabled")
 def test_add_gc_neuf_accepted_in_public():
     """PR #28: gc_neuf fully within public_area is accepted."""
     G = nx.Graph()
@@ -323,6 +330,7 @@ def test_add_gc_neuf_accepted_in_public():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_snaps_to_line():
     """PR #28 BLOQUANT 4: degree-1 endpoint near a line splits it and connects."""
     G = nx.Graph()
@@ -341,6 +349,7 @@ def test_endpoint_snaps_to_line():
     assert nx.number_connected_components(G) == 1
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_to_line_private_rejected():
     """PR #28 amend B1: endpoint→line connector outside public_area rejected."""
     G = nx.Graph()
@@ -358,6 +367,7 @@ def test_endpoint_to_line_private_rejected():
     assert G.degree((10.0, 1.0)) == 1
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_to_line_public_accepted():
     """PR #28 amend B1: endpoint→line connector within public_area accepted."""
     G = nx.Graph()
@@ -375,6 +385,7 @@ def test_endpoint_to_line_public_accepted():
     assert G.degree((10.0, 1.0)) >= 2
 
 
+@pytest.mark.skip(reason="PR #33: bridge removed")
 def test_bridge_has_routing_weight():
     """PR #28 amend B2: bridge created by _bridge_components_with_gc_neuf has _routing_weight."""
     G = nx.Graph()
@@ -390,6 +401,7 @@ def test_bridge_has_routing_weight():
     assert edge_data.get("_routing_weight") == pytest.approx(30.0 * 10.0)  # length * 10
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_line_snap_chooses_closest_line():
     """PR #28 amend B3: endpoint→line picks closest line by perpendicular distance."""
     G = nx.Graph()
@@ -425,6 +437,7 @@ def test_line_snap_chooses_closest_line():
         assert found, "No node found near (10, 0) — snap may have gone to wrong line"
 
 
+@pytest.mark.skip(reason="PR #33: snap_endpoints_to_lines removed")
 def test_endpoint_far_from_line_not_snapped():
     """PR #28 BLOQUANT 4: endpoint >3m from any line remains untouched."""
     G = nx.Graph()

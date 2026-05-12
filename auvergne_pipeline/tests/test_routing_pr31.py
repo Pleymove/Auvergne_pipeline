@@ -68,6 +68,7 @@ def _pb(x=0.0, y=0.0, pb_id="PB1", pa_id="PA1") -> gpd.GeoDataFrame:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: C0 connectors disabled - PA no longer auto-connected")
 def test_pa_is_connected_to_livrable_path():
     """A PA placed 1 m off a livrable line must end up topologically
     connected (the line is split and a public connector is added).
@@ -97,6 +98,7 @@ def test_pa_is_connected_to_livrable_path():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: C0 connectors disabled - PB no longer auto-connected")
 def test_pb_is_connected_to_livrable_path():
     df = _df([_row(geometry=LineString([(0, 0), (10, 0)]))])
     pa = _pa(0.0, 0.0, pid="PA1")
@@ -274,6 +276,7 @@ def test_mutualized_tree_reuses_trunk_for_multiple_pb():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="PR #33: IGN cap is 0")
 def test_ign_cumulative_delivery_limit(monkeypatch):
     """Many small IGN edges each below the per-edge cap must NOT
     aggregate to a kilometre of delivered C0: once the SRO budget
