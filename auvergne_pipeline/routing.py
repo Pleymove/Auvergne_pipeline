@@ -75,6 +75,18 @@ WEIGHT_FACTOR_IGN_ROUTE = 30.0
 # per SRO so Pierre can locate the gap on the QGIS flags layer.
 IGN_DELIVERY_MAX_LENGTH_M = 50.0
 
+# PR #31 H — cumulative IGN delivery limit per SRO. With the per-edge cap
+# at 50 m, an SRO could still accumulate dozens of small IGN connectors
+# that total kilometres of C0 in livrable_infra. We therefore introduce
+# a per-SRO total cap: above this, further IGN edges are BLOCKED from
+# delivery (still routable, just not visible) and counted in
+# ign_route_blocked_m. The cap is generous on purpose — short legitimate
+# connectors stay welcome; only the accumulation pattern is curbed.
+MAX_IGN_DELIVERED_PER_SRO_M = 300.0
+
+# PR #31 H — soft warning when IGN-derived C0 dominates the livrable.
+IGN_DELIVERED_TOTAL_RATIO_WARN = 0.10
+
 
 def _routing_weight_for(data: dict) -> float:
     """Compute the Dijkstra weight for an edge based on its source type.
@@ -1021,7 +1033,16 @@ def route_pa_to_pb(
                             # the conversion so Pierre sees the surface.
                             is_in_public = True
 
-                        if is_short and is_in_public:
+                        # PR #31 H — cumulative cap: even a short, public
+                        # IGN edge is blocked once the SRO-wide budget
+                        # has been spent. This curbs the "many small
+                        # connectors add up to kilometres" pattern.
+                        within_budget = (
+                            ign_route_delivered_as_gc_m + raw_length
+                            <= MAX_IGN_DELIVERED_PER_SRO_M
+                        )
+
+                        if is_short and is_in_public and within_budget:
                             mode_pose = "C0"
                             infra_type = "gc_neuf"
                             src = "gc_neuf"
@@ -1039,8 +1060,9 @@ def route_pa_to_pb(
                                     "IGN_ROUTE_BLOCKED",
                                     target_url=sro_code_log,
                                     message=(
-                                        "Tronçon IGN routé non livré (trop long "
-                                        "ou hors domaine public strict)"
+                                        "Tronçon IGN routé non livré (trop long, "
+                                        "hors domaine public strict ou budget "
+                                        "cumulatif dépassé)"
                                     ),
                                 )
                                 _ign_blocked_flag_added = True
@@ -1133,6 +1155,26 @@ def route_pa_to_pb(
     result = _dedup_geometries(result)
     n_after_dedup = len(result)
     perf["dedup"] = time.perf_counter() - t0
+
+    # ── PR #31 — Topology validation pipeline. Runs AFTER the existing
+    # PR28/PR29/PR30 filters so it operates on geometries that are
+    # already strict-public-only and exact-dedupped. The pipeline:
+    #   1. snaps endpoints to exact identical coords
+    #   2. splits livrable lines at PA/PB projections and adds public
+    #      connectors so terminals visually touch the network
+    #   3. removes near-duplicates by metier hierarchy
+    #   4. drops aerial-energy (E1 / bt) segments crossing private land
+    #   5. audits PA→PB reachability + micro-gaps
+    #   6. counts support-switch zigzags (no rerouting)
+    #   7. computes mutualisation stats
+    t0 = time.perf_counter()
+    from . import livrable_topology as _lt
+    result, pr31_stats = _lt.finalize_livrable_topology(
+        result, pa_sro, pb_sro, sro_code_log,
+        delivery_public_area_safe=delivery_public_area_safe,
+        flag_collector=flag_collector,
+    )
+    perf["pr31_topology"] = time.perf_counter() - t0
 
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
