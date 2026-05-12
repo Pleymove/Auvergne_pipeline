@@ -1,0 +1,11 @@
+geopandas>=0.14
+osmnx>=1.6
+networkx>=3.2
+shapely>=2.0
+pyproj>=3.6
+fiona>=1.9
+rtree>=1.2  # index spatial
+requests>=2.31
+tqdm>=4.66
+qgis-processing  # si QGIS installé localement
+# Optionnel : psycopg2-binary si PostGIS
