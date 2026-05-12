@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.env
+.env.*
+
+# QGIS local data must not leak into git
+*.gpkg
+*.qgz
+*.qgs~
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Pipeline run logs
+logs/
+output/
+cache/*
