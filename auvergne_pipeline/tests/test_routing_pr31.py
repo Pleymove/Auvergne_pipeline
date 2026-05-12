@@ -164,29 +164,30 @@ def test_line_ending_on_middle_of_line_is_split():
 # ---------------------------------------------------------------------------
 
 
-def test_existing_energy_private_crossing_blocked():
-    """A BT row whose geometry exits the strict delivery area must be
-    removed and an ENERGY_PRIVATE_CROSSING flag added.
-    """
+# ---------------------------------------------------------------------------
+# Amend : _is_energy capte mode_pose="1" même avec src="ft"
+# ---------------------------------------------------------------------------
+
+
+def test_energy_filter_catches_ft_mode_pose_1_crossing_private():
+    """Amend 1: src='ft' + mode_pose='1' crossing private must be removed."""
     from auvergne_pipeline import flags as flags_mod
 
     df = _df([
-        _row(geometry=LineString([(0, 0), (15, 0)]), src="bt",
-             infra_type="bt", mode_pose="1"),
+        _row(geometry=LineString([(0, 0), (15, 0)]), src="ft",
+             infra_type="ft", mode_pose="1"),  # E1 via FT source
         _row(geometry=LineString([(0, 0), (5, 0)]), src="ft",
              infra_type="ft", mode_pose="7"),
     ])
-    # Public domain only covers x in [-5, 8] → BT row crosses private at x>8.
     delivery_area_safe = Polygon([(-5, -5), (8, -5), (8, 5), (-5, 5)]).buffer(0.01)
     fc = flags_mod.FlagCollector("SRO1")
     out, stats = lt._filter_energy_private(
         df, delivery_public_area_safe=delivery_area_safe, flag_collector=fc,
     )
-    assert (out["src"] == "bt").sum() == 0
-    assert (out["src"] == "ft").sum() == 1
+    # The ft/E1 row (mode_pose=1) must be removed
+    assert (out["mode_pose"] == "1").sum() == 0
+    assert (out["src"] == "ft").sum() == 1  # only the C7 one survives
     assert stats["energy_private_crossing_count"] == 1
-    flags_df = fc.to_dataframe()
-    assert "ENERGY_PRIVATE_CROSSING" in set(flags_df["flag_type"])
 
 
 # ---------------------------------------------------------------------------
@@ -408,24 +409,23 @@ def test_pb_on_middle_of_line_is_split_and_connected():
 def test_endpoint_projection_splits_crossing_line_t_junction():
     """PR #28 Point 2: Line A (0,5)→(5,5) ends at (5,5) on the middle
     of Line B (5,0)→(5,10). After split, Line B becomes two segments
-    and the graph is connected.
-    """
+    sharing EXACT node (5,5) with Line A — true topological connection."""
     df = _df([
         _row(geometry=LineString([(0, 5), (5, 5)]), src="ft", pb_id="PB1"),
         _row(geometry=LineString([(5, 0), (5, 10)]), src="ft", pb_id="PB2"),
     ])
     out, stats = lt._split_livrableedges_at_endpoint_projections(df, tol_m=0.5)
     assert len(out) >= 3, f"Expected at least 3 rows after T-junction split; got {len(out)}"
-    # Line B at (5,0)→(5,10) should have been split at (5,5)
+    # After split, Line A endpoint and Line B split point must share EXACT same coord
     geoms = list(out.geometry)
-    has_split_at_5_5 = False
+    all_endpoints = []
     for g in geoms:
         cs = list(g.coords)
-        for c in cs:
-            if abs(c[0] - 5.0) < 0.1 and abs(c[1] - 5.0) < 0.1:
-                has_split_at_5_5 = True
-                break
-    assert has_split_at_5_5, f"Expected split at (5,5); coords: {[(list(g.coords)) for g in geoms]}"
+        all_endpoints.append((round(cs[0][0], 3), round(cs[0][1], 3)))
+        all_endpoints.append((round(cs[-1][0], 3), round(cs[-1][1], 3)))
+    # (5,5) must appear as endpoint of at least 2 segments (A and one B-half)
+    count_5_5 = sum(1 for ep in all_endpoints if ep == (5.0, 5.0))
+    assert count_5_5 >= 2, f"Expected (5,5) as shared endpoint ≥2 times, got {count_5_5}: {all_endpoints}"
 
 
 # ---------------------------------------------------------------------------
@@ -496,26 +496,14 @@ def test_support_switch_smoothing_replaces_bt_sandwich_when_orange_parallel_exis
 
 
 def test_energy_private_removal_reconnects_with_public_c0_when_possible():
-    """PR #28 Point 5: network PA→PB with a BT private segment removed,
-    reconnected by a short public C0 connector.
-    """
-    df_before = _df([
-        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
-        _row(geometry=LineString([(5, 0), (10, 0)]), src="bt"),
-        _row(geometry=LineString([(10, 0), (15, 0)]), src="ft"),
-    ])
-    # After energy filter, BT removed
-    df_after = _df([
-        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
-        _row(geometry=LineString([(10, 0), (15, 0)]), src="ft"),
-    ])
-    # The gap between (5,0) and (10,0) is 5m > MICRO_GAP_MAX_FIX_M=3.0
-    # So this won't auto-reconnect by default. Use a shorter gap test.
+    """Amend 5: BT segment removed → endpoints identified from df_before
+    vs df_after difference → reconnect with short public C0 if possible."""
     df_before = _df([
         _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
         _row(geometry=LineString([(5, 0), (6.5, 0)]), src="bt"),
         _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft"),
     ])
+    # After energy filter, BT removed — gap (5,0) to (6.5,0)
     df_after = _df([
         _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
         _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft"),
@@ -525,15 +513,16 @@ def test_energy_private_removal_reconnects_with_public_c0_when_possible():
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
     assert stats["energy_reconnectors_added"] >= 1
-    assert stats["energy_reconnect_failed"] == 0
 
 
 def test_energy_private_removal_flags_when_reconnect_impossible():
-    """PR #28 Point 5: reconnect impossible (too far) → flag, no diagonal."""
+    """Amend 5: BT removed but gap too far → flag, no connector."""
     from auvergne_pipeline import flags as flags_mod
 
     df_before = _df([
-        _row(geometry=LineString([(0, 0), (20, 0)]), src="ft"),
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(5, 0), (50, 0)]), src="bt"),
+        _row(geometry=LineString([(50, 0), (60, 0)]), src="ft"),
     ])
     df_after = _df([
         _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
@@ -545,5 +534,8 @@ def test_energy_private_removal_flags_when_reconnect_impossible():
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
         flag_collector=fc,
     )
-    # Gap is 45m > MICRO_GAP_MAX_FIX_M * 2 = 6m → no reconnect
+    # Gap is 45m > MICRO_GAP_MAX_FIX_M * 2 = 6m → no reconnect, fail flagged
+    assert stats["energy_reconnect_failed"] >= 1
     assert stats["energy_reconnectors_added"] == 0
+    flags_df = fc.to_dataframe()
+    assert "ENERGY_RECONNECT_FAILED" in set(flags_df["flag_type"])

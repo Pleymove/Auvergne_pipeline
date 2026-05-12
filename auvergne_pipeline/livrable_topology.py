@@ -256,15 +256,11 @@ def _ensure_terminals_connected(
     """Make sure every PA and every PB touches a livrable line.
 
     For each terminal:
-    1. If a livrable edge already passes within ``touch_tol_m`` of the
-       terminal, do nothing (already connected after Step 1 snapping).
+    1. If a livrable edge *endpoint* is within ``touch_tol_m`` → connected.
     2. Else, find the closest livrable edge within ``snap_radius_m``,
-       split it at the projection point, then insert a short connector
-       (``mode_pose=C0``, ``src=gc_neuf``) from the terminal to the
-       projection point — provided the connector geometry is fully
-       covered by ``delivery_public_area_safe``.
-    3. Else flag (``PA_NOT_CONNECTED_TO_LIVRABLE`` / ``PB_NOT_CONNECTED_TO_LIVRABLE``)
-       and leave the geometry alone.
+       split it at the projection, add a short C0 connector (if public
+       and length > epsilon).
+    3. Else flag.
 
     Existing PA / BAT / BAL geometries are NEVER moved (CDC). Only the
     livrable infra is reshaped.
@@ -280,110 +276,107 @@ def _ensure_terminals_connected(
 
     rows = df.to_dict("records")
 
-    def _connect(terminal_geom, label: str, flag_key: str, target_url: str) -> None:
-        # 1) Already touching an endpoint?
-        already_on_endpoint = False
+    def _is_endpoint_touch(terminal_geom):
         for r in rows:
             g = r.get("geometry")
             if g is None or g.is_empty:
                 continue
-            # Check exact endpoint touch (not just mid-line proximity)
             gs = list(g.coords)
-            for ep in [gs[0], gs[-1]]:
-                if Point(ep).distance(terminal_geom) <= touch_tol_m:
-                    already_on_endpoint = True
-                    break
-            if already_on_endpoint:
-                break
-        if already_on_endpoint:
+            if min(Point(gs[0]).distance(terminal_geom),
+                    Point(gs[-1]).distance(terminal_geom)) <= touch_tol_m:
+                return True
+        return False
+
+    def _connect(terminal_geom, label, flag_key, target_url):
+        # Already on endpoint?
+        if _is_endpoint_touch(terminal_geom):
             if label == "pa":
                 stats["pa_connected"] += 1
             else:
                 stats["pb_connected"] += 1
             return
 
-        # 2) Find best edge to split inside snap_radius_m.
-        best_idx, best_proj, best_dist, best_proj_dist = None, None, float("inf"), 0.0
+        # Find best edge to split
+        best_idx = None
+        best_proj = None
+        best_dist = float("inf")
+        best_proj_dist = 0.0
         for idx, r in enumerate(rows):
             g = r.get("geometry")
             if g is None or g.is_empty or not isinstance(g, LineString):
                 continue
             d = g.distance(terminal_geom)
-            if d > snap_radius_m or d > best_dist:
+            if d > snap_radius_m or d >= best_dist:
                 continue
             proj_dist = g.project(terminal_geom)
-            if proj_dist <= 0 or proj_dist >= g.length:
-                # Terminal projects on an endpoint — handled by tolerance above.
-                continue
-            proj_pt = g.interpolate(proj_dist)
-            best_idx, best_proj, best_dist, best_proj_dist = idx, proj_pt, d, proj_dist
+            if proj_dist <= 1e-6 or proj_dist >= g.length - 1e-6:
+                continue  # near endpoint
+            best_idx = idx
+            best_proj = g.interpolate(proj_dist)
+            best_dist = d
+            best_proj_dist = proj_dist
 
         if best_idx is None:
             stats["terminal_snap_failed"] += 1
             if flag_collector is not None:
                 flag_collector.add(
-                    flag_key,
-                    target_url=target_url,
-                    message=(
-                        f"{label.upper()} non connecté au livrable "
-                        f"(aucune ligne livrée à moins de {snap_radius_m}m)"
-                    ),
-                )
+                    flag_key, target_url=target_url,
+                    message=f"{label.upper()} non connecte au livrable "
+                            f"(aucune ligne a moins de {snap_radius_m}m)")
             return
 
-        # 3) Verify the connector lies in public domain.
-        connector = LineString([(terminal_geom.x, terminal_geom.y),
-                                (best_proj.x, best_proj.y)])
-        if (
-            delivery_public_area_safe is not None
-            and not delivery_public_area_safe.covers(connector)
-        ):
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key,
-                    target_url=target_url,
-                    message=(
-                        f"{label.upper()} non connecté au livrable "
-                        f"(connecteur traverse domaine privé)"
-                    ),
-                )
-            return
-
-        # Split the target edge into two sub-segments.
+        # Split target edge
         target_row = rows[best_idx]
         target_geom = target_row["geometry"]
         split = _split_line_at_distance(target_geom, best_proj_dist)
         if split is None:
             stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key,
-                    target_url=target_url,
-                    message=f"{label.upper()} split impossible — geometry degenerate",
-                )
             return
         seg_a, seg_b = split
 
-        # Replace target_row with seg_a, then append seg_b + connector.
         row_a = dict(target_row)
         row_a["geometry"] = seg_a
         row_a["length_m"] = seg_a.length
         row_b = dict(target_row)
         row_b["geometry"] = seg_b
         row_b["length_m"] = seg_b.length
-        connector_row = dict(target_row)
-        connector_row["geometry"] = connector
-        connector_row["length_m"] = connector.length
-        connector_row["statut"] = ""
-        connector_row["mode_pose"] = "C0"
-        connector_row["src"] = "gc_neuf"
-        connector_row["infra_type"] = "gc_neuf"
-        # pb_id / pa_id: keep target_row's pa/pb so flag traceability is preserved.
 
         rows[best_idx] = row_a
         rows.append(row_b)
-        rows.append(connector_row)
+
+        # Check if connector needed (nonzero distance to projection)
+        d_to_proj = terminal_geom.distance(best_proj)
+        if d_to_proj < 0.01:
+            # Basically on the line after split — no connector needed
+            if label == "pa":
+                stats["pa_connected"] += 1
+            else:
+                stats["pb_connected"] += 1
+            return
+
+        # Public domain check
+        connector = LineString([
+            (terminal_geom.x, terminal_geom.y),
+            (best_proj.x, best_proj.y),
+        ])
+        if (delivery_public_area_safe is not None
+                and not delivery_public_area_safe.covers(connector)):
+            stats["terminal_snap_failed"] += 1
+            if flag_collector is not None:
+                flag_collector.add(
+                    flag_key, target_url=target_url,
+                    message=f"{label.upper()} non connecte (connecteur traverse prive)")
+            return
+
+        # Add connector
+        conn_row = dict(target_row)
+        conn_row["geometry"] = connector
+        conn_row["length_m"] = connector.length
+        conn_row["statut"] = ""
+        conn_row["mode_pose"] = "C0"
+        conn_row["src"] = "gc_neuf"
+        conn_row["infra_type"] = "gc_neuf"
+        rows.append(conn_row)
         stats["terminal_connectors_added"] += 1
         if label == "pa":
             stats["pa_connected"] += 1
@@ -395,20 +388,16 @@ def _ensure_terminals_connected(
             geom = pa.geometry
             if geom is None or geom.is_empty:
                 continue
-            _connect(
-                geom, "pa", "PA_NOT_CONNECTED_TO_LIVRABLE",
-                pa.get("id_metier", f"pa#{pa.name}"),
-            )
+            _connect(geom, "pa", "PA_NOT_CONNECTED_TO_LIVRABLE",
+                     pa.get("id_metier", f"pa#{pa.name}"))
 
     if pb_sro is not None and not pb_sro.empty:
         for _, pb in pb_sro.iterrows():
             geom = pb.geometry
             if geom is None or geom.is_empty:
                 continue
-            _connect(
-                geom, "pb", "PB_NOT_CONNECTED_TO_LIVRABLE",
-                pb.get("pb_id", f"pb#{pb.name}"),
-            )
+            _connect(geom, "pb", "PB_NOT_CONNECTED_TO_LIVRABLE",
+                     pb.get("pb_id", f"pb#{pb.name}"))
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
     return out, stats
@@ -434,7 +423,6 @@ def _split_livrableedges_at_endpoint_projections(
     if df is None or df.empty:
         return df, 0
 
-    import enum
     rows = df.to_dict("records")
     # Collect all endpoints: (coord, source_index, is_first)
     endpoints: list[tuple[tuple[float, float], int, bool]] = []
@@ -489,13 +477,21 @@ def _split_livrableedges_at_endpoint_projections(
                 if seg_a.length < 0.01 or seg_b.length < 0.01:
                     continue
 
-                # Update the endpoint to exact projection coordinate
+                # Update the source line's endpoint to the EXACT projection coordinate
+                # by projecting the last vertex of seg_a and first of seg_b onto the
+                # exact projected point, so both lines share the same node.
+                seg_a_coords = list(seg_a.coords)
+                seg_b_coords = list(seg_b.coords)
+                proj_tuple = (round(proj_pt.x, 6), round(proj_pt.y, 6))
+                seg_a_coords[-1] = proj_tuple
+                seg_b_coords[0] = proj_tuple
+
                 row_a = dict(r)
-                row_a["geometry"] = seg_a
-                row_a["length_m"] = seg_a.length
+                row_a["geometry"] = LineString(seg_a_coords)
+                row_a["length_m"] = LineString(seg_a_coords).length
                 row_b = dict(r)
-                row_b["geometry"] = seg_b
-                row_b["length_m"] = seg_b.length
+                row_b["geometry"] = LineString(seg_b_coords)
+                row_b["length_m"] = LineString(seg_b_coords).length
                 new_rows.append(row_a)
                 new_rows.append(row_b)
                 is_split = True
@@ -664,10 +660,9 @@ def _filter_energy_private(
         return df, stats
 
     def _is_energy(row) -> bool:
-        # BT family OR explicit E1 modepose with BT-like origin.
-        src = str(row.get("src") or "").lower()
+        # E1 (aérien énergie) = mode_pose == "1", quel que soit src.
         mp = str(row.get("mode_pose") or "")
-        return src == "bt" or (src == "" and mp == "1")
+        return mp == "1"
 
     drop_idx: list[int] = []
     for idx in range(len(df)):
@@ -1101,8 +1096,11 @@ def _reconnect_after_energy_removal(
     delivery_public_area_safe=None,
     flag_collector=None,
 ) -> tuple[gpd.GeoDataFrame, dict]:
-    """If removing BT/private edges disconnected parts of the network,
-    try to reconnect endpoints with a short public C0 connector.
+    """Reconnect after removing BT/E1 private segments.
+
+    Identifies edges present in df_before but missing in df_after
+    (removed energy segments). For any resulting gap between surviving
+    segments, tries to reconnect with a short public C0 connector.
     """
     stats = {
         "energy_reconnectors_added": 0,
@@ -1111,57 +1109,77 @@ def _reconnect_after_energy_removal(
     if df_after is None or df_after.empty:
         return df_after, stats
 
+    rows = df_after.to_dict("records")
+
+    # Build graph from after
     G = _build_livrable_topology_graph(df_after)
     if G.number_of_nodes() < 2:
         return df_after, stats
 
     nodes = list(G.nodes())
-    from scipy.spatial import cKDTree
-    coords = np.array(nodes, dtype=float)
-    tree = cKDTree(coords)
-    pairs = tree.query_pairs(r=MICRO_GAP_MAX_FIX_M * 2, output_type="ndarray")
     cc = {n: i for i, comp in enumerate(nx.connected_components(G)) for n in comp}
 
-    rows = df_after.to_dict("records")
-    fixed = 0
-    failed = 0
+    # Check if the graph is already connected
+    if len(set(cc.values())) <= 1:
+        return df_after, stats
 
-    for a, b in pairs:
-        na, nb = nodes[int(a)], nodes[int(b)]
-        if cc.get(na) == cc.get(nb):
-            continue
-        d = Point(na).distance(Point(nb))
-        connector = LineString([na, nb])
+    # For each node, find endpoints in different components within range
+    from scipy.spatial import cKDTree
+    node_coords = np.array(nodes, dtype=float)
+    tree = cKDTree(node_coords)
 
-        if (
-            delivery_public_area_safe is not None
-            and delivery_public_area_safe.covers(connector)
-        ):
-            row_template = dict(rows[0]) if rows else {}
-            connector_row = {
-                "sro": row_template.get("sro", "?"),
-                "pa_id": row_template.get("pa_id", ""),
-                "pb_id": row_template.get("pb_id", ""),
-                "statut": "",
-                "mode_pose": "C0",
-                "src": "gc_neuf",
-                "infra_type": "gc_neuf",
-                "length_m": d,
-                "geometry": connector,
-            }
-            rows.append(connector_row)
-            fixed += 1
-        else:
-            failed += 1
+    # Only reconnect if there were BT removed (check df_before vs df_after geometry count)
+    n_before = len(df_before)
+    n_after = len(df_after)
+    if n_before <= n_after:
+        # No segments removed, nothing to reconnect
+        return df_after, stats
+
+    reconnected = False
+    for i, n1 in enumerate(nodes):
+        if reconnected:
+            break
+        cc1 = cc.get(n1)
+        candidates = tree.query_ball_point(node_coords[i], MICRO_GAP_MAX_FIX_M * 2)
+        for j in candidates:
+            n2 = nodes[int(j)]
+            cc2 = cc.get(n2)
+            if cc1 == cc2:
+                continue
+            d = Point(n1[0], n1[1]).distance(Point(n2[0], n2[1]))
+            if d > MICRO_GAP_MAX_FIX_M * 2:
+                continue
+            connector = LineString([n1, n2])
+            if (delivery_public_area_safe is not None
+                    and delivery_public_area_safe.covers(connector)):
+                row_template = dict(rows[0]) if rows else {}
+                connector_row = {
+                    "sro": row_template.get("sro", "?"),
+                    "pa_id": row_template.get("pa_id", ""),
+                    "pb_id": row_template.get("pb_id", ""),
+                    "statut": "",
+                    "mode_pose": "C0",
+                    "src": "gc_neuf",
+                    "infra_type": "gc_neuf",
+                    "length_m": d,
+                    "geometry": connector,
+                }
+                rows.append(connector_row)
+                stats["energy_reconnectors_added"] += 1
+                reconnected = True
+                break
+
+    # If we tried but couldn't reconnect, flag
+    if stats["energy_reconnectors_added"] == 0:
+        remaining_ccs = len(set(cc.values()))
+        if remaining_ccs > 1:
+            stats["energy_reconnect_failed"] += remaining_ccs - 1
             if flag_collector is not None:
                 flag_collector.add(
                     "ENERGY_RECONNECT_FAILED",
-                    target_url=f"({na[0]:.0f},{na[1]:.0f})",
-                    message=f"Reconnect impossible (privé/trop loin) après suppression énergie",
+                    target_url=str(df_after.iloc[0].get("sro", "?")),
+                    message=f"{remaining_ccs - 1} composantes non reconnectées après suppression énergie",
                 )
-
-    stats["energy_reconnectors_added"] = fixed
-    stats["energy_reconnect_failed"] = failed
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df_after.crs)
     return out, stats
@@ -1257,8 +1275,11 @@ def finalize_livrable_topology(
     )
     stats.update(cont_stats)
 
-    # 10) Support switch audit.
+    # 10) Support switch audit — preserve existing support_switches_fixed
+    saved_sw_fixed = stats.get("support_switches_fixed", 0)
     sw_stats = _audit_support_switches(final_df)
+    # audit support-switches resets to 0, but we have real fixes from smoothing
+    sw_stats["support_switches_fixed"] = max(sw_stats.get("support_switches_fixed", 0), saved_sw_fixed)
     stats.update(sw_stats)
 
     # 11) Mutualisation audit.
