@@ -281,17 +281,26 @@ def _ensure_terminals_connected(
     rows = df.to_dict("records")
 
     def _connect(terminal_geom, label: str, flag_key: str, target_url: str) -> None:
-        # 1) Already touching?
+        # 1) Already touching an endpoint?
+        already_on_endpoint = False
         for r in rows:
             g = r.get("geometry")
             if g is None or g.is_empty:
                 continue
-            if g.distance(terminal_geom) <= touch_tol_m:
-                if label == "pa":
-                    stats["pa_connected"] += 1
-                else:
-                    stats["pb_connected"] += 1
-                return
+            # Check exact endpoint touch (not just mid-line proximity)
+            gs = list(g.coords)
+            for ep in [gs[0], gs[-1]]:
+                if Point(ep).distance(terminal_geom) <= touch_tol_m:
+                    already_on_endpoint = True
+                    break
+            if already_on_endpoint:
+                break
+        if already_on_endpoint:
+            if label == "pa":
+                stats["pa_connected"] += 1
+            else:
+                stats["pb_connected"] += 1
+            return
 
         # 2) Find best edge to split inside snap_radius_m.
         best_idx, best_proj, best_dist, best_proj_dist = None, None, float("inf"), 0.0
@@ -403,6 +412,115 @@ def _ensure_terminals_connected(
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
     return out, stats
+
+
+# ---------------------------------------------------------------------------
+# Step 2b — Generic T-junction split (PR #28 Point 2)
+# ---------------------------------------------------------------------------
+
+
+def _split_livrableedges_at_endpoint_projections(
+    df: gpd.GeoDataFrame,
+    *,
+    tol_m: float = 0.5,
+) -> tuple[gpd.GeoDataFrame, int]:
+    """For each endpoint of each delivered LineString, check whether it
+    lands on the middle of another line within ``tol_m``. If so, split
+    the target line at the projection point and insert the two halves.
+
+    This is the classic T-junction fix: endpoints must share exact
+    coordinates, not just sit close to another edge.
+    """
+    if df is None or df.empty:
+        return df, 0
+
+    import enum
+    rows = df.to_dict("records")
+    # Collect all endpoints: (coord, source_index, is_first)
+    endpoints: list[tuple[tuple[float, float], int, bool]] = []
+    for idx, r in enumerate(rows):
+        g = r.get("geometry")
+        if g is None or g.is_empty or not isinstance(g, LineString):
+            continue
+        cs = list(g.coords)
+        if len(cs) >= 2:
+            endpoints.append(((round(cs[0][0], 3), round(cs[0][1], 3)), idx, True))
+            endpoints.append(((round(cs[-1][0], 3), round(cs[-1][1], 3)), idx, False))
+
+    splits_added = 0
+    changed = True
+    max_passes = 5
+    while changed and max_passes > 0:
+        changed = False
+        max_passes -= 1
+        # Rebuild rows list after splits
+        new_rows: list[dict] = []
+        ep_to_split: list[tuple[tuple, dict, tuple, float]] = []
+
+        for idx, r in enumerate(rows):
+            g = r.get("geometry")
+            if g is None or g.is_empty or not isinstance(g, LineString):
+                new_rows.append(r)
+                continue
+            cs = list(g.coords)
+            first = (round(cs[0][0], 3), round(cs[0][1], 3))
+            last = (round(cs[-1][0], 3), round(cs[-1][1], 3))
+            is_split = False
+
+            for ep_coord, src_idx, is_first in endpoints:
+                if src_idx == idx:
+                    continue  # same line
+                g = LineString(cs)
+                if g.length < tol_m * 2:
+                    continue  # degenerate, skip
+                proj_dist = g.project(Point(ep_coord[0], ep_coord[1]))
+                if proj_dist <= 0 or proj_dist >= g.length:
+                    continue  # endpoint near other line's endpoint, not middle
+                ep_pt = Point(ep_coord[0], ep_coord[1])
+                proj_pt = g.interpolate(proj_dist)
+                if ep_pt.distance(proj_pt) > tol_m:
+                    continue
+                split = _split_line_at_distance(g, proj_dist)
+                if split is None:
+                    continue
+                seg_a, seg_b = split
+
+                # Check no degenerate tiny segments
+                if seg_a.length < 0.01 or seg_b.length < 0.01:
+                    continue
+
+                # Update the endpoint to exact projection coordinate
+                row_a = dict(r)
+                row_a["geometry"] = seg_a
+                row_a["length_m"] = seg_a.length
+                row_b = dict(r)
+                row_b["geometry"] = seg_b
+                row_b["length_m"] = seg_b.length
+                new_rows.append(row_a)
+                new_rows.append(row_b)
+                is_split = True
+                splits_added += 1
+                changed = True
+                break
+
+            if not is_split:
+                new_rows.append(r)
+
+        rows = new_rows
+        # Rebuild endpoints from new rows
+        new_endpoints: list[tuple] = []
+        for idx, r in enumerate(rows):
+            g = r.get("geometry")
+            if g is None or g.is_empty or not isinstance(g, LineString):
+                continue
+            cs = list(g.coords)
+            if len(cs) >= 2:
+                new_endpoints.append(((round(cs[0][0], 3), round(cs[0][1], 3)), idx, True))
+                new_endpoints.append(((round(cs[-1][0], 3), round(cs[-1][1], 3)), idx, False))
+        endpoints = new_endpoints
+
+    out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
+    return out, splits_added
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +911,263 @@ def _audit_mutualisation(df: gpd.GeoDataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Step 3a — Repair micro-gaps (PR #28 Point 3)
+# ---------------------------------------------------------------------------
+
+
+def _repair_micro_gaps(
+    df: gpd.GeoDataFrame,
+    *,
+    delivery_public_area_safe=None,
+    flag_collector=None,
+) -> tuple[gpd.GeoDataFrame, dict]:
+    """Find endpoints from different connected components within
+    ``MICRO_GAP_MAX_FIX_M`` and try to insert a public C0 connector.
+
+    If the connector crosses private land, flag as MICRO_GAP_UNRESOLVED.
+    """
+    stats = {
+        "micro_gaps_detected": 0,
+        "micro_gaps_fixed": 0,
+        "micro_gaps_unresolved": 0,
+        "max_gap_m": 0.0,
+    }
+    if df is None or df.empty:
+        return df, stats
+
+    G = _build_livrable_topology_graph(df)
+    if G.number_of_nodes() < 2:
+        return df, stats
+
+    nodes = list(G.nodes())
+    from scipy.spatial import cKDTree
+    coords = np.array(nodes, dtype=float)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=MICRO_GAP_MAX_FIX_M, output_type="ndarray")
+    cc = {n: i for i, comp in enumerate(nx.connected_components(G)) for n in comp}
+
+    rows = df.to_dict("records")
+    fixed_pairs: set = set()
+    unresolved_pairs: set = set()
+
+    for a, b in pairs:
+        na, nb = nodes[int(a)], nodes[int(b)]
+        if cc.get(na) == cc.get(nb):
+            continue
+        d = Point(na).distance(Point(nb))
+        stats["max_gap_m"] = max(stats["max_gap_m"], d)
+        stats["micro_gaps_detected"] += 1
+
+        connector = LineString([na, nb])
+        if (
+            delivery_public_area_safe is not None
+            and delivery_public_area_safe.covers(connector)
+        ):
+            # Add public connector
+            row_template = dict(rows[0]) if rows else {}
+            connector_row = {
+                "sro": row_template.get("sro", "?"),
+                "pa_id": row_template.get("pa_id", ""),
+                "pb_id": row_template.get("pb_id", ""),
+                "statut": "",
+                "mode_pose": "C0",
+                "src": "gc_neuf",
+                "infra_type": "gc_neuf",
+                "length_m": d,
+                "geometry": connector,
+            }
+            rows.append(connector_row)
+            stats["micro_gaps_fixed"] += 1
+            fixed_pairs.add((na, nb))
+        else:
+            stats["micro_gaps_unresolved"] += 1
+            unresolved_pairs.add((na, nb))
+            if flag_collector is not None:
+                flag_collector.add(
+                    "MICRO_GAP_UNRESOLVED",
+                    target_url=f"({na[0]:.0f},{na[1]:.0f})",
+                    message=f"Micro-gap entre noeuds livrés, length={d:.2f}m",
+                )
+
+    out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
+    return out, stats
+
+
+# ---------------------------------------------------------------------------
+# Step 5a — Smooth support switches (PR #28 Point 4)
+# ---------------------------------------------------------------------------
+
+
+def _smooth_support_switches(
+    df: gpd.GeoDataFrame,
+    *,
+    delivery_public_area_safe=None,
+) -> tuple[gpd.GeoDataFrame, dict]:
+    """Detect and fix BT-sandwich zigzags: when a BT segment is
+    surrounded by Orange/FT segments and a near-parallel Orange
+    alternative exists, drop the BT segment.
+    """
+    stats = {
+        "support_switches_fixed": 0,
+    }
+    if df is None or len(df) < 3:
+        return df, stats
+
+    # Build a lookup keyed by rounded endpoints (undirected).
+    def _key(g):
+        cs = list(g.coords)
+        a = (round(cs[0][0], 3), round(cs[0][1], 3))
+        b = (round(cs[-1][0], 3), round(cs[-1][1], 3))
+        return tuple(sorted((a, b)))
+
+    # Index edges by their key
+    by_key: dict[tuple, list[int]] = defaultdict(list)
+    for idx, row in df.iterrows():
+        g = row.get("geometry")
+        if g is None or g.is_empty:
+            continue
+        k = _key(g)
+        by_key[k].append(idx)
+
+    # Find BT sandwich: look for patterns where BT segment endpoints
+    # are also endpoints of Orange/FT segments.
+    drop_idx: set = set()
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        src = str(row.get("src") or "").lower()
+        if src != "bt":
+            continue
+        g = row.get("geometry")
+        if g is None or g.is_empty or not isinstance(g, LineString):
+            continue
+
+        k = _key(g)
+        # Check if there's an Orange/FT segment with same key
+        has_orange_parallel = False
+        for alt_idx in by_key.get(k, []):
+            if alt_idx == idx:
+                continue
+            alt_row = df.iloc[alt_idx]
+            alt_src = str(alt_row.get("src") or "").lower()
+            if alt_src in ("ft", "chem", "athd"):
+                has_orange_parallel = True
+                break
+
+        # Also check near-parallel (Hausdorff distance check)
+        if not has_orange_parallel:
+            for alt_idx in range(len(df)):
+                if alt_idx == idx:
+                    continue
+                alt_row = df.iloc[alt_idx]
+                alt_src = str(alt_row.get("src") or "").lower()
+                if alt_src not in ("ft", "chem", "athd"):
+                    continue
+                alt_g = alt_row.get("geometry")
+                if alt_g is None or alt_g.is_empty:
+                    continue
+                # Near-parallel: endpoints close AND hausdorff within tol
+                if g.hausdorff_distance(alt_g) <= NEAR_DUPLICATE_TOL_M * 3:
+                    # Endpoints also close
+                    alt_k = _key(alt_g)
+                    a_end_a = k[0]
+                    a_end_b = k[1] if len(k) > 1 else k[0]
+                    close_enough = (
+                        Point(a_end_a[0], a_end_a[1]).distance(
+                            Point(alt_k[0][0], alt_k[0][1])
+                        ) <= NEAR_DUPLICATE_TOL_M * 3
+                    )
+                    if close_enough:
+                        has_orange_parallel = True
+                        break
+
+        if has_orange_parallel:
+            drop_idx.add(idx)
+            stats["support_switches_fixed"] += 1
+
+    keep = [i for i in range(len(df)) if i not in drop_idx]
+    out = df.iloc[keep].reset_index(drop=True)
+    return out, stats
+
+
+# ---------------------------------------------------------------------------
+# Step 6a — Reconnect after energy removal (PR #28 Point 5)
+# ---------------------------------------------------------------------------
+
+
+def _reconnect_after_energy_removal(
+    df_before: gpd.GeoDataFrame,
+    df_after: gpd.GeoDataFrame,
+    *,
+    delivery_public_area_safe=None,
+    flag_collector=None,
+) -> tuple[gpd.GeoDataFrame, dict]:
+    """If removing BT/private edges disconnected parts of the network,
+    try to reconnect endpoints with a short public C0 connector.
+    """
+    stats = {
+        "energy_reconnectors_added": 0,
+        "energy_reconnect_failed": 0,
+    }
+    if df_after is None or df_after.empty:
+        return df_after, stats
+
+    G = _build_livrable_topology_graph(df_after)
+    if G.number_of_nodes() < 2:
+        return df_after, stats
+
+    nodes = list(G.nodes())
+    from scipy.spatial import cKDTree
+    coords = np.array(nodes, dtype=float)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=MICRO_GAP_MAX_FIX_M * 2, output_type="ndarray")
+    cc = {n: i for i, comp in enumerate(nx.connected_components(G)) for n in comp}
+
+    rows = df_after.to_dict("records")
+    fixed = 0
+    failed = 0
+
+    for a, b in pairs:
+        na, nb = nodes[int(a)], nodes[int(b)]
+        if cc.get(na) == cc.get(nb):
+            continue
+        d = Point(na).distance(Point(nb))
+        connector = LineString([na, nb])
+
+        if (
+            delivery_public_area_safe is not None
+            and delivery_public_area_safe.covers(connector)
+        ):
+            row_template = dict(rows[0]) if rows else {}
+            connector_row = {
+                "sro": row_template.get("sro", "?"),
+                "pa_id": row_template.get("pa_id", ""),
+                "pb_id": row_template.get("pb_id", ""),
+                "statut": "",
+                "mode_pose": "C0",
+                "src": "gc_neuf",
+                "infra_type": "gc_neuf",
+                "length_m": d,
+                "geometry": connector,
+            }
+            rows.append(connector_row)
+            fixed += 1
+        else:
+            failed += 1
+            if flag_collector is not None:
+                flag_collector.add(
+                    "ENERGY_RECONNECT_FAILED",
+                    target_url=f"({na[0]:.0f},{na[1]:.0f})",
+                    message=f"Reconnect impossible (privé/trop loin) après suppression énergie",
+                )
+
+    stats["energy_reconnectors_added"] = fixed
+    stats["energy_reconnect_failed"] = failed
+
+    out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df_after.crs)
+    return out, stats
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -829,35 +1204,70 @@ def finalize_livrable_topology(
     )
     stats.update(snap_stats)
 
-    # 3) Remove near-duplicates via metier hierarchy.
-    df3, dedup_stats = _remove_near_duplicates(df2)
+    # 2b) Generic T-junction split (PR #28 Point 2).
+    df2b, n_t_splits = _split_livrableedges_at_endpoint_projections(df2)
+    stats["t_junction_splits"] = n_t_splits
+
+    # 3) Repair micro-gaps (PR #28 Point 3).
+    df3, gap_stats = _repair_micro_gaps(
+        df2b, delivery_public_area_safe=delivery_public_area_safe,
+        flag_collector=flag_collector,
+    )
+    stats.update(gap_stats)
+
+    # 4) Remove near-duplicates.
+    df4, dedup_stats = _remove_near_duplicates(df3)
     stats.update(dedup_stats)
 
-    # 4) Filter aerial energy / BT crossing private land.
-    df4, energy_stats = _filter_energy_private(
-        df3, delivery_public_area_safe=delivery_public_area_safe,
+    # 5) Smooth support switches (PR #28 Point 4).
+    df5, sw_fix_stats = _smooth_support_switches(df4)
+    stats.update(sw_fix_stats)
+
+    # 6) Filter aerial energy / BT crossing private land.
+    df6, energy_stats = _filter_energy_private(
+        df5, delivery_public_area_safe=delivery_public_area_safe,
         flag_collector=flag_collector,
     )
     stats.update(energy_stats)
 
-    # 5) Continuity audit (PA→PB reachability + micro-gaps).
+    # 7) Reconnect after energy removal (PR #28 Point 5).
+    df7, reconnect_stats = _reconnect_after_energy_removal(
+        df5, df6, delivery_public_area_safe=delivery_public_area_safe,
+        flag_collector=flag_collector,
+    )
+    stats.update(reconnect_stats)
+
+    # 8) Snap endpoints again (connectors may introduce new near-identical coords).
+    df8, n_re_snap = _snap_endpoints_to_exact(df7)
+    if n_re_snap:
+        stats["endpoints_re_snapped_post_fix"] = n_re_snap
+        # Re-do T-junction split after re-snap if new endpoints were created
+        df8b, n_re_t = _split_livrableedges_at_endpoint_projections(df8)
+        if n_re_t:
+            stats["t_junction_splits_post_snap"] = n_re_t
+            df8 = df8b
+    else:
+        df8b = df8
+
+    # 9) Continuity audit (PA→PB reachability + micro-gaps).
+    final_df = df8 if n_re_snap else (df8b if isinstance(df8b, gpd.GeoDataFrame) else df7)
     cont_stats = _audit_continuity(
-        df4, pa_sro, pb_sro,
+        final_df, pa_sro, pb_sro,
         flag_collector=flag_collector,
     )
     stats.update(cont_stats)
 
-    # 6) Support switch audit (count, no rerouting here).
-    sw_stats = _audit_support_switches(df4)
+    # 10) Support switch audit.
+    sw_stats = _audit_support_switches(final_df)
     stats.update(sw_stats)
 
-    # 7) Mutualisation audit.
-    mut_stats = _audit_mutualisation(df4)
+    # 11) Mutualisation audit.
+    mut_stats = _audit_mutualisation(final_df)
     stats.update(mut_stats)
 
-    # 8) Emit the QA log block (grep-friendly).
+    # 12) Emit the QA log block.
     _log_pr31_block(sro_code, stats)
-    return df4, stats
+    return final_df, stats
 
 
 # ---------------------------------------------------------------------------
@@ -869,22 +1279,25 @@ def _log_pr31_block(sro_code: str, s: dict) -> None:
     """Emit the 6 PR31 grep-friendly QA lines."""
     log.info(
         "[CONTINUITY QA] sro=%s pa_pb_connected=%d pa_pb_disconnected=%d "
-        "micro_gaps_detected=%d micro_gaps_unresolved=%d max_gap_m=%.2f",
+        "micro_gaps_detected=%d micro_gaps_fixed=%d micro_gaps_unresolved=%d max_gap_m=%.2f",
         sro_code,
         s.get("pa_pb_connected_count", 0),
         s.get("pa_pb_disconnected_count", 0),
         s.get("micro_gaps_detected", 0),
+        s.get("micro_gaps_fixed", 0),
         s.get("micro_gaps_unresolved", 0),
         float(s.get("max_gap_m", 0.0) or 0.0),
     )
     log.info(
         "[SNAP QA] sro=%s pa_connected=%d pb_connected=%d "
-        "terminal_connectors_added=%d terminal_snap_failed=%d",
+        "terminal_connectors_added=%d terminal_snap_failed=%d "
+        "t_junction_splits=%d",
         sro_code,
         s.get("pa_connected", 0),
         s.get("pb_connected", 0),
         s.get("terminal_connectors_added", 0),
         s.get("terminal_snap_failed", 0),
+        s.get("t_junction_splits", 0),
     )
     log.info(
         "[DEDUP QA] sro=%s exact_duplicates_removed=%d near_duplicates_removed=%d "
@@ -905,11 +1318,14 @@ def _log_pr31_block(sro_code: str, s: dict) -> None:
     )
     log.info(
         "[ENERGY QA] sro=%s energy_private_crossing_count=%d "
-        "energy_private_crossing_length_m=%.0f removed_or_penalized=%d",
+        "energy_private_crossing_length_m=%.0f removed_or_penalized=%d "
+        "energy_reconnectors_added=%d energy_reconnect_failed=%d",
         sro_code,
         s.get("energy_private_crossing_count", 0),
         float(s.get("energy_private_crossing_length_m", 0.0) or 0.0),
         s.get("energy_edges_removed_or_penalized", 0),
+        s.get("energy_reconnectors_added", 0),
+        s.get("energy_reconnect_failed", 0),
     )
     log.info(
         "[MUTUAL QA] sro=%s shared_edges_count=%d trunk_reuse_ratio=%.2f "

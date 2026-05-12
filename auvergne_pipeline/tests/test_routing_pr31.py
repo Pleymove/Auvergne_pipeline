@@ -348,3 +348,202 @@ def test_output_geometries_share_exact_coordinates_after_snap():
     assert nx.is_connected(G) or G.number_of_nodes() <= 3, (
         f"snapped network must be connected, got nodes={list(G.nodes())}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR #28 (Point 1) — PA on middle of line is split and connected
+# ---------------------------------------------------------------------------
+
+
+def test_pa_on_middle_of_line_is_split_and_connected():
+    """PR #28 Point 1: PA exactly on the middle of a livrable line must
+    trigger a split at the PA coordinate. After finalization, the graph
+    must contain a node at PA (5, 0).
+    """
+    df = _df([_row(geometry=LineString([(0, 0), (10, 0)]))])
+    pa = _pa(5.0, 0.0, pid="PA1")
+    pb = _pb(10.0, 0.0, pb_id="PB1", pa_id="PA1")
+    out, stats = lt.finalize_livrable_topology(
+        df, pa, pb, "SRO1",
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    geoms = [g for g in out.geometry if isinstance(g, LineString)]
+    node_set = set()
+    for g in geoms:
+        cs = list(g.coords)
+        node_set.add((round(cs[0][0], 3), round(cs[0][1], 3)))
+        node_set.add((round(cs[-1][0], 3), round(cs[-1][1], 3)))
+    assert (5.0, 0.0) in node_set, (
+        f"Expected node at PA (5,0) after split; got {node_set}"
+    )
+    assert stats["pa_connected"] >= 1
+
+
+def test_pb_on_middle_of_line_is_split_and_connected():
+    """PR #28 Point 1: same as above but for PB in the middle of a line."""
+    df = _df([_row(geometry=LineString([(0, 0), (10, 0)]))])
+    pa = _pa(0.0, 0.0, pid="PA1")
+    pb = _pb(5.0, 0.0, pb_id="PB1", pa_id="PA1")
+    out, stats = lt.finalize_livrable_topology(
+        df, pa, pb, "SRO1",
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    geoms = [g for g in out.geometry if isinstance(g, LineString)]
+    node_set = set()
+    for g in geoms:
+        cs = list(g.coords)
+        node_set.add((round(cs[0][0], 3), round(cs[0][1], 3)))
+        node_set.add((round(cs[-1][0], 3), round(cs[-1][1], 3)))
+    assert (5.0, 0.0) in node_set, (
+        f"Expected node at PB (5,0) after split; got {node_set}"
+    )
+    assert stats["pb_connected"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# PR #28 (Point 2) — T-junction generic split
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_projection_splits_crossing_line_t_junction():
+    """PR #28 Point 2: Line A (0,5)→(5,5) ends at (5,5) on the middle
+    of Line B (5,0)→(5,10). After split, Line B becomes two segments
+    and the graph is connected.
+    """
+    df = _df([
+        _row(geometry=LineString([(0, 5), (5, 5)]), src="ft", pb_id="PB1"),
+        _row(geometry=LineString([(5, 0), (5, 10)]), src="ft", pb_id="PB2"),
+    ])
+    out, stats = lt._split_livrableedges_at_endpoint_projections(df, tol_m=0.5)
+    assert len(out) >= 3, f"Expected at least 3 rows after T-junction split; got {len(out)}"
+    # Line B at (5,0)→(5,10) should have been split at (5,5)
+    geoms = list(out.geometry)
+    has_split_at_5_5 = False
+    for g in geoms:
+        cs = list(g.coords)
+        for c in cs:
+            if abs(c[0] - 5.0) < 0.1 and abs(c[1] - 5.0) < 0.1:
+                has_split_at_5_5 = True
+                break
+    assert has_split_at_5_5, f"Expected split at (5,5); coords: {[(list(g.coords)) for g in geoms]}"
+
+
+# ---------------------------------------------------------------------------
+# PR #28 (Point 3) — Repair public micro-gap
+# ---------------------------------------------------------------------------
+
+
+def test_public_micro_gap_1_5m_is_repaired_not_only_flagged():
+    """PR #28 Point 3: gap of 1.5 m between two segments in public area
+    must be fixed by adding a connector, not just flagged.
+    """
+    df = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)])),
+        _row(geometry=LineString([(6.5, 0), (10, 0)])),
+    ])
+    out, stats = lt._repair_micro_gaps(
+        df, delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    assert stats["micro_gaps_fixed"] >= 1
+    assert stats["micro_gaps_unresolved"] == 0
+    # A connector should have been added
+    assert len(out) >= 3
+
+
+def test_private_micro_gap_is_flagged_not_repaired():
+    """PR #28 Point 3: gap of 1.5 m in private area → flagged, no connector."""
+    from auvergne_pipeline import flags as flags_mod
+
+    public = Polygon([(0, -5), (4, -5), (4, 5), (0, 5)]).buffer(0.01)
+    df = _df([
+        _row(geometry=LineString([(0, 0), (4, 0)])),
+        _row(geometry=LineString([(5.5, 0), (10, 0)])),
+    ])
+    fc = flags_mod.FlagCollector("SRO1")
+    out, stats = lt._repair_micro_gaps(
+        df, delivery_public_area_safe=public, flag_collector=fc,
+    )
+    assert stats["micro_gaps_fixed"] == 0
+    assert stats["micro_gaps_unresolved"] >= 1
+    assert len(out) == 2  # no connector added
+
+
+# ---------------------------------------------------------------------------
+# PR #28 (Point 4) — Support switch smoothing
+# ---------------------------------------------------------------------------
+
+
+def test_support_switch_smoothing_replaces_bt_sandwich_when_orange_parallel_exists():
+    """PR #28 Point 4: Orange-A (0,0)→(5,0), BT (5,0)→(10,0),
+    Orange-B (10,0)→(15,0), Orange parallel (5,0.1)→(10,0.1).
+    After smoothing, the BT sandwich should be dropped.
+    """
+    df = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft", mode_pose="7"),
+        _row(geometry=LineString([(5, 0), (10, 0)]), src="bt", mode_pose="1"),
+        _row(geometry=LineString([(10, 0), (15, 0)]), src="ft", mode_pose="7"),
+        _row(geometry=LineString([(5, 0.1), (10, 0.1)]), src="ft", mode_pose="7"),
+    ])
+    out, stats = lt._smooth_support_switches(df)
+    # BT segment should be removed, Orange parallel kept
+    assert (out["src"] == "bt").sum() == 0
+    assert stats["support_switches_fixed"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# PR #28 (Point 5) — Reconnect after energy private removal
+# ---------------------------------------------------------------------------
+
+
+def test_energy_private_removal_reconnects_with_public_c0_when_possible():
+    """PR #28 Point 5: network PA→PB with a BT private segment removed,
+    reconnected by a short public C0 connector.
+    """
+    df_before = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(5, 0), (10, 0)]), src="bt"),
+        _row(geometry=LineString([(10, 0), (15, 0)]), src="ft"),
+    ])
+    # After energy filter, BT removed
+    df_after = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(10, 0), (15, 0)]), src="ft"),
+    ])
+    # The gap between (5,0) and (10,0) is 5m > MICRO_GAP_MAX_FIX_M=3.0
+    # So this won't auto-reconnect by default. Use a shorter gap test.
+    df_before = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(5, 0), (6.5, 0)]), src="bt"),
+        _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft"),
+    ])
+    df_after = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft"),
+    ])
+    out, stats = lt._reconnect_after_energy_removal(
+        df_before, df_after,
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    assert stats["energy_reconnectors_added"] >= 1
+    assert stats["energy_reconnect_failed"] == 0
+
+
+def test_energy_private_removal_flags_when_reconnect_impossible():
+    """PR #28 Point 5: reconnect impossible (too far) → flag, no diagonal."""
+    from auvergne_pipeline import flags as flags_mod
+
+    df_before = _df([
+        _row(geometry=LineString([(0, 0), (20, 0)]), src="ft"),
+    ])
+    df_after = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft"),
+        _row(geometry=LineString([(50, 0), (60, 0)]), src="ft"),
+    ])
+    fc = flags_mod.FlagCollector("SRO1")
+    out, stats = lt._reconnect_after_energy_removal(
+        df_before, df_after,
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+        flag_collector=fc,
+    )
+    # Gap is 45m > MICRO_GAP_MAX_FIX_M * 2 = 6m → no reconnect
+    assert stats["energy_reconnectors_added"] == 0
