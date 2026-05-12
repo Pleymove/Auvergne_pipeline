@@ -241,16 +241,23 @@ def test_is_split_flag_after_successful_split():
 def test_reconnect_via_existing_has_priority():
     """After a BT/E1 segment is removed, reconnect should prefer
     existing infrastructure over injecting a new C0."""
-    # Before: an FT line bridges the gap + a BT segment
+    # Before: FT + BT + FT (BT will be removed)
     df_before = _df([
         _livrable_row(geometry=LineString([(0, 0), (5, 0)]),
                        src="ft", mode_pose="7", infra_type="ft"),
         _livrable_row(geometry=LineString([(5, 0), (10, 0)]),
                        src="bt", mode_pose="1", infra_type="bt"),  # removed BT
+        _livrable_row(geometry=LineString([(10, 0), (15, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
     ])
-    # After: BT removed, only FT remains
+    # After: BT removed, FT lines remain + existing edge bridging the gap
     df_after = _df([
         _livrable_row(geometry=LineString([(0, 0), (5, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+        _livrable_row(geometry=LineString([(10, 0), (15, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+        # Existing FT edge that bridges the gap (passes through midpoint)
+        _livrable_row(geometry=LineString([(4, 0), (11, 0)]),
                        src="ft", mode_pose="7", infra_type="ft"),
     ])
     out, recon_stats = lt._reconnect_after_energy_removal(
@@ -259,6 +266,8 @@ def test_reconnect_via_existing_has_priority():
     )
     # If existing infra already bridges, no new C0 needed
     assert recon_stats.get("energy_reconnectors_added", 0) == 0
+    # PR32-B4: reconnected via existing
+    assert recon_stats.get("energy_reconnected_by_existing", 0) == 1
 
 
 def test_energy_reconnect_FAILED_when_no_solution():
@@ -366,3 +375,82 @@ def test_c0_single_candidate_no_existing_kept():
     assert out.iloc[0]["mode_pose"] == "C0"
     assert c0_stats["c0_kept_last_resort"] == 1
     assert c0_stats["c0_removed_existing_parallel"] == 0
+
+
+# =========================================================================
+# B3 — T-junction source-after-target ordering
+# =========================================================================
+
+
+def test_t_junction_split_source_after_target():
+    """PR32-B3: When the target line B comes BEFORE the source line A
+    in row order, the source endpoint must still be rewritten.
+
+    Row 0 = target B (vertical) (5,0)->(5,10)
+    Row 1 = source A (horizontal) (0,5)->(5,5)
+    A's endpoint (5,5) projects onto B's middle. After split, A's
+    endpoint must be exactly at B's split coord (5,5).
+    """
+    df = _df([
+        # Row 0: target (vertical) — FIRST
+        _livrable_row(geometry=LineString([(5, 0), (5, 10)]),
+                       src="ft", mode_pose="7", infra_type="ft", pb_id="PB1"),
+        # Row 1: source (horizontal) — SECOND
+        _livrable_row(geometry=LineString([(0, 5), (5, 5)]),
+                       src="ft", mode_pose="7", infra_type="ft", pb_id="PB2"),
+    ])
+    out, n_splits = lt._split_livrableedges_at_endpoint_projections(df, tol_m=0.5)
+    assert n_splits >= 1, "Expected at least one T-junction split"
+    assert len(out) >= 3, f"Expected >= 3 rows after T-junction split; got {len(out)}"
+
+    all_endpoints = []
+    for _, r in out.iterrows():
+        g = r["geometry"]
+        if isinstance(g, LineString):
+            cs = list(g.coords)
+            all_endpoints.append((round(cs[0][0], 6), round(cs[0][1], 6)))
+            all_endpoints.append((round(cs[-1][0], 6), round(cs[-1][1], 6)))
+
+    target_point = (5.0, 5.0)
+    count_55 = sum(1 for ep in all_endpoints if ep == target_point)
+    assert count_55 >= 3, (
+        f"(5,5) should appear as endpoint >= 3 times; got {count_55}"
+    )
+
+
+# =========================================================================
+# B4 — Reconnect energy: existing bridges gap, no C0 added
+# =========================================================================
+
+
+def test_reconnect_existing_equivalent_zero_connectors_added():
+    """PR32-B4: When existing infrastructure already reconnects after
+    energy removal, energy_reconnectors_added must be 0 and
+    energy_reconnected_by_existing must be >= 1."""
+    df_before = _df([
+        _livrable_row(geometry=LineString([(0, 0), (5, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+        _livrable_row(geometry=LineString([(5, 0), (10, 0)]),
+                       src="bt", mode_pose="1", infra_type="bt"),
+        _livrable_row(geometry=LineString([(10, 0), (15, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+    ])
+    df_after = _df([
+        _livrable_row(geometry=LineString([(0, 0), (5, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+        _livrable_row(geometry=LineString([(10, 0), (15, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+        # Existing FT edge that bridges the gap
+        _livrable_row(geometry=LineString([(4, 0), (11, 0)]),
+                       src="ft", mode_pose="7", infra_type="ft"),
+    ])
+    out, recon_stats = lt._reconnect_after_energy_removal(
+        df_before, df_after,
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    assert recon_stats.get("energy_reconnectors_added", 0) == 0, (
+        "No C0 should be added when existing bridges the gap"
+    )
+    assert recon_stats.get("energy_reconnected_by_existing", 0) >= 1, (
+        "existing should have reconnected"
+    )

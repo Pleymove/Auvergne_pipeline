@@ -531,7 +531,10 @@ def test_energy_private_removal_reconnects_with_public_c0_when_possible():
         df_before, df_after,
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
-    assert stats["energy_reconnectors_added"] >= 1
+    # PR32-D: existing FT line touches the reconnect connector at (6.5, 0),
+    # so reconnect is handled via existing infra rather than injecting C0.
+    assert stats["energy_reconnectors_added"] == 0
+    assert stats["energy_reconnected_by_existing"] >= 1
 
 
 def test_energy_private_removal_flags_when_reconnect_impossible():
