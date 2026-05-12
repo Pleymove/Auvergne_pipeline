@@ -441,79 +441,98 @@ def _split_livrableedges_at_endpoint_projections(
     while changed and max_passes > 0:
         changed = False
         max_passes -= 1
-        # Rebuild rows list after splits
         new_rows: list[dict] = []
-        ep_to_split: list[tuple[tuple, dict, tuple, float]] = []
+        old_to_new: list[int] = []  # old rows index -> new rows index (or None for split)
 
         for idx, r in enumerate(rows):
             g = r.get("geometry")
             if g is None or g.is_empty or not isinstance(g, LineString):
+                old_to_new.append(len(new_rows))
                 new_rows.append(r)
                 continue
             cs = list(g.coords)
-            first = (round(cs[0][0], 3), round(cs[0][1], 3))
-            last = (round(cs[-1][0], 3), round(cs[-1][1], 3))
+            first_ep = (round(cs[0][0], 3), round(cs[0][1], 3))
+            last_ep = (round(cs[-1][0], 3), round(cs[-1][1], 3))
             is_split = False
 
             for ep_coord, src_idx, is_first in endpoints:
                 if src_idx == idx:
-                    continue  # same line
-                g = LineString(cs)
-                if g.length < tol_m * 2:
-                    continue  # degenerate, skip
-                proj_dist = g.project(Point(ep_coord[0], ep_coord[1]))
-                if proj_dist <= 0 or proj_dist >= g.length:
-                    continue  # endpoint near other line's endpoint, not middle
+                    continue
+                g_line = LineString(cs)
+                if g_line.length < tol_m * 2:
+                    continue
+                proj_dist = g_line.project(Point(ep_coord[0], ep_coord[1]))
+                if proj_dist <= 0 or proj_dist >= g_line.length:
+                    continue
                 ep_pt = Point(ep_coord[0], ep_coord[1])
-                proj_pt = g.interpolate(proj_dist)
+                proj_pt = g_line.interpolate(proj_dist)
                 if ep_pt.distance(proj_pt) > tol_m:
                     continue
-                split = _split_line_at_distance(g, proj_dist)
+                split = _split_line_at_distance(g_line, proj_dist)
                 if split is None:
                     continue
                 seg_a, seg_b = split
-
-                # Check no degenerate tiny segments
                 if seg_a.length < 0.01 or seg_b.length < 0.01:
                     continue
 
-                # Update the source line's endpoint to the EXACT projection coordinate
-                # by projecting the last vertex of seg_a and first of seg_b onto the
-                # exact projected point, so both lines share the same node.
+                # Exact projection coord for split target
                 seg_a_coords = list(seg_a.coords)
                 seg_b_coords = list(seg_b.coords)
                 proj_tuple = (round(proj_pt.x, 6), round(proj_pt.y, 6))
                 seg_a_coords[-1] = proj_tuple
                 seg_b_coords[0] = proj_tuple
 
+                # Rewrite SOURCE line endpoint to exact projection
+                if src_idx is not None and src_idx < len(new_rows):
+                    src_r = new_rows[src_idx]
+                    src_g = src_r.get("geometry")
+                    if src_g and isinstance(src_g, LineString):
+                        src_cs = list(src_g.coords)
+                        if is_first:
+                            src_cs[0] = proj_tuple
+                        else:
+                            src_cs[-1] = proj_tuple
+                        new_rows[src_idx] = {**src_r, "geometry": LineString(src_cs),
+                                             "length_m": LineString(src_cs).length}
+
+                # Also update endpoints list for source line
+                for ei, (ec, si, if_) in enumerate(endpoints):
+                    if si == src_idx:
+                        if if_:
+                            endpoints[ei] = (proj_tuple, src_idx, if_)
+                        else:
+                            endpoints[ei] = (proj_tuple, src_idx, if_)
+
+                # Add split segments
+                old_to_new.append(len(new_rows))
                 row_a = dict(r)
                 row_a["geometry"] = LineString(seg_a_coords)
                 row_a["length_m"] = LineString(seg_a_coords).length
+                new_rows.append(row_a)
+                old_to_new.append(len(new_rows))
                 row_b = dict(r)
                 row_b["geometry"] = LineString(seg_b_coords)
                 row_b["length_m"] = LineString(seg_b_coords).length
-                new_rows.append(row_a)
                 new_rows.append(row_b)
-                is_split = True
                 splits_added += 1
                 changed = True
                 break
 
             if not is_split:
+                old_to_new.append(len(new_rows))
                 new_rows.append(r)
 
-        rows = new_rows
-        # Rebuild endpoints from new rows
+        # Update endpoint indices to point to new_rows
         new_endpoints: list[tuple] = []
-        for idx, r in enumerate(rows):
-            g = r.get("geometry")
-            if g is None or g.is_empty or not isinstance(g, LineString):
-                continue
-            cs = list(g.coords)
-            if len(cs) >= 2:
-                new_endpoints.append(((round(cs[0][0], 3), round(cs[0][1], 3)), idx, True))
-                new_endpoints.append(((round(cs[-1][0], 3), round(cs[-1][1], 3)), idx, False))
+        for ep_coord, src_idx, is_first in endpoints:
+            # src_idx now maps through old_to_new
+            mapped_idx = None
+            if src_idx is not None and src_idx < len(old_to_new):
+                mapped_idx = old_to_new[src_idx]
+            if mapped_idx is not None:
+                new_endpoints.append((ep_coord, mapped_idx, is_first))
         endpoints = new_endpoints
+        rows = new_rows
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
     return out, splits_added
@@ -661,8 +680,10 @@ def _filter_energy_private(
 
     def _is_energy(row) -> bool:
         # E1 (aérien énergie) = mode_pose == "1", quel que soit src.
+        # ET src == "bt" doit aussi être capté même si mode_pose absent.
+        src = str(row.get("src") or "").lower()
         mp = str(row.get("mode_pose") or "")
-        return mp == "1"
+        return mp == "1" or src == "bt"
 
     drop_idx: list[int] = []
     for idx in range(len(df)):
@@ -1098,9 +1119,9 @@ def _reconnect_after_energy_removal(
 ) -> tuple[gpd.GeoDataFrame, dict]:
     """Reconnect after removing BT/E1 private segments.
 
-    Identifies edges present in df_before but missing in df_after
-    (removed energy segments). For any resulting gap between surviving
-    segments, tries to reconnect with a short public C0 connector.
+    Identifies BT/E1 segments present in df_before but absent in df_after.
+    Only then tries to reconnect nearby surviving endpoints that were
+    separated by the energy removal.
     """
     stats = {
         "energy_reconnectors_added": 0,
@@ -1109,67 +1130,98 @@ def _reconnect_after_energy_removal(
     if df_after is None or df_after.empty:
         return df_after, stats
 
-    rows = df_after.to_dict("records")
+    # Identify removed BT/E1 segments
+    before_keys: dict[str, tuple] = {}
+    for _, r in df_before.iterrows():
+        g = r.get("geometry")
+        if g and isinstance(g, LineString) and not g.is_empty:
+            cs = list(g.coords)
+            fk = tuple(sorted((
+                (round(cs[0][0], 3), round(cs[0][1], 3)),
+                (round(cs[-1][0], 3), round(cs[-1][1], 3))
+            )))
+            before_keys[fk] = r
 
-    # Build graph from after
+    after_keys: set[str] = set()
+    for _, r in df_after.iterrows():
+        g = r.get("geometry")
+        if g and isinstance(g, LineString) and not g.is_empty:
+            cs = list(g.coords)
+            fk = tuple(sorted((
+                (round(cs[0][0], 3), round(cs[0][1], 3)),
+                (round(cs[-1][0], 3), round(cs[-1][1], 3))
+            )))
+            after_keys.add(fk)
+
+    # Removed BT/E1 segments and their endpoints
+    removed_bt_eps: list[tuple[float, float]] = []
+    for fk, row in before_keys.items():
+        if fk in after_keys:
+            continue
+        src = str(row.get("src") or "").lower()
+        mp = str(row.get("mode_pose") or "")
+        if src != "bt" and mp != "1":
+            continue
+        # This is a removed BT/E1 segment — collect its endpoints
+        cs = list(row["geometry"].coords)
+        removed_bt_eps.append((round(cs[0][0], 6), round(cs[0][1], 6)))
+        removed_bt_eps.append((round(cs[-1][0], 6), round(cs[-1][1], 6)))
+
+    if not removed_bt_eps:
+        return df_after, stats
+
+    rows = df_after.to_dict("records")
     G = _build_livrable_topology_graph(df_after)
     if G.number_of_nodes() < 2:
         return df_after, stats
 
     nodes = list(G.nodes())
     cc = {n: i for i, comp in enumerate(nx.connected_components(G)) for n in comp}
-
-    # Check if the graph is already connected
-    if len(set(cc.values())) <= 1:
-        return df_after, stats
-
-    # For each node, find endpoints in different components within range
     from scipy.spatial import cKDTree
     node_coords = np.array(nodes, dtype=float)
     tree = cKDTree(node_coords)
 
-    # Only reconnect if there were BT removed (check df_before vs df_after geometry count)
-    n_before = len(df_before)
-    n_after = len(df_after)
-    if n_before <= n_after:
-        # No segments removed, nothing to reconnect
-        return df_after, stats
-
     reconnected = False
-    for i, n1 in enumerate(nodes):
+    for rem_ep in removed_bt_eps:
         if reconnected:
             break
-        cc1 = cc.get(n1)
-        candidates = tree.query_ball_point(node_coords[i], MICRO_GAP_MAX_FIX_M * 2)
-        for j in candidates:
-            n2 = nodes[int(j)]
-            cc2 = cc.get(n2)
-            if cc1 == cc2:
+        rem_pt = Point(rem_ep[0], rem_ep[1])
+        candidates = tree.query_ball_point([rem_ep[0], rem_ep[1]], MICRO_GAP_MAX_FIX_M * 2)
+        best_d = float("inf")
+        best_node = None
+        for idx in candidates:
+            n = nodes[int(idx)]
+            n_cc = cc.get(n)
+            ep_cc = cc.get(rem_ep) if rem_ep in cc else None
+            if n_cc == ep_cc:
                 continue
-            d = Point(n1[0], n1[1]).distance(Point(n2[0], n2[1]))
-            if d > MICRO_GAP_MAX_FIX_M * 2:
-                continue
-            connector = LineString([n1, n2])
-            if (delivery_public_area_safe is not None
-                    and delivery_public_area_safe.covers(connector)):
-                row_template = dict(rows[0]) if rows else {}
-                connector_row = {
-                    "sro": row_template.get("sro", "?"),
-                    "pa_id": row_template.get("pa_id", ""),
-                    "pb_id": row_template.get("pb_id", ""),
-                    "statut": "",
-                    "mode_pose": "C0",
-                    "src": "gc_neuf",
-                    "infra_type": "gc_neuf",
-                    "length_m": d,
-                    "geometry": connector,
-                }
-                rows.append(connector_row)
-                stats["energy_reconnectors_added"] += 1
-                reconnected = True
-                break
+            d = rem_pt.distance(Point(n[0], n[1]))
+            if d < best_d:
+                best_d, best_node = d, n
 
-    # If we tried but couldn't reconnect, flag
+        if best_node is None:
+            continue
+        connector = LineString([rem_ep, best_node])
+        if (delivery_public_area_safe is not None
+                and delivery_public_area_safe.covers(connector)):
+            row_template = dict(rows[0]) if rows else {}
+            connector_row = {
+                "sro": row_template.get("sro", "?"),
+                "pa_id": row_template.get("pa_id", ""),
+                "pb_id": row_template.get("pb_id", ""),
+                "statut": "",
+                "mode_pose": "C0",
+                "src": "gc_neuf",
+                "infra_type": "gc_neuf",
+                "length_m": best_d,
+                "geometry": connector,
+            }
+            rows.append(connector_row)
+            stats["energy_reconnectors_added"] += 1
+            reconnected = True
+            break
+
+    # If no reconnect possible, flag
     if stats["energy_reconnectors_added"] == 0:
         remaining_ccs = len(set(cc.values()))
         if remaining_ccs > 1:

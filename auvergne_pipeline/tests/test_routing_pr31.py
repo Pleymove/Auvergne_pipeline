@@ -170,12 +170,12 @@ def test_line_ending_on_middle_of_line_is_split():
 
 
 def test_energy_filter_catches_ft_mode_pose_1_crossing_private():
-    """Amend 1: src='ft' + mode_pose='1' crossing private must be removed."""
+    """Amend 1a: src='ft' + mode_pose='1' crossing private must be removed."""
     from auvergne_pipeline import flags as flags_mod
 
     df = _df([
         _row(geometry=LineString([(0, 0), (15, 0)]), src="ft",
-             infra_type="ft", mode_pose="1"),  # E1 via FT source
+             infra_type="ft", mode_pose="1"),
         _row(geometry=LineString([(0, 0), (5, 0)]), src="ft",
              infra_type="ft", mode_pose="7"),
     ])
@@ -184,9 +184,28 @@ def test_energy_filter_catches_ft_mode_pose_1_crossing_private():
     out, stats = lt._filter_energy_private(
         df, delivery_public_area_safe=delivery_area_safe, flag_collector=fc,
     )
-    # The ft/E1 row (mode_pose=1) must be removed
     assert (out["mode_pose"] == "1").sum() == 0
-    assert (out["src"] == "ft").sum() == 1  # only the C7 one survives
+    assert (out["src"] == "ft").sum() == 1
+    assert stats["energy_private_crossing_count"] == 1
+
+
+def test_energy_filter_catches_bt_empty_mode_pose():
+    """Amend 1b: src='bt' + mode_pose='' crossing private must be removed."""
+    from auvergne_pipeline import flags as flags_mod
+
+    df = _df([
+        _row(geometry=LineString([(0, 0), (15, 0)]), src="bt",
+             infra_type="bt", mode_pose=""),
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft",
+             infra_type="ft", mode_pose="7"),
+    ])
+    delivery_area_safe = Polygon([(-5, -5), (8, -5), (8, 5), (-5, 5)]).buffer(0.01)
+    fc = flags_mod.FlagCollector("SRO1")
+    out, stats = lt._filter_energy_private(
+        df, delivery_public_area_safe=delivery_area_safe, flag_collector=fc,
+    )
+    assert (out["src"] == "bt").sum() == 0
+    assert stats["energy_private_crossing_count"] == 1
     assert stats["energy_private_crossing_count"] == 1
 
 
@@ -539,3 +558,22 @@ def test_energy_private_removal_flags_when_reconnect_impossible():
     assert stats["energy_reconnectors_added"] == 0
     flags_df = fc.to_dataframe()
     assert "ENERGY_RECONNECT_FAILED" in set(flags_df["flag_type"])
+
+
+def test_non_energy_removal_does_not_reconnect():
+    """Amend 5: FT segment removed (not BT/E1) → no reconnector added."""
+    df_before = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft", mode_pose="7"),
+        _row(geometry=LineString([(5, 0), (6.5, 0)]), src="ft", mode_pose="7"),
+        _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft", mode_pose="7"),
+    ])
+    df_after = _df([
+        _row(geometry=LineString([(0, 0), (5, 0)]), src="ft", mode_pose="7"),
+        _row(geometry=LineString([(6.5, 0), (10, 0)]), src="ft", mode_pose="7"),
+    ])
+    out, stats = lt._reconnect_after_energy_removal(
+        df_before, df_after,
+        delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    assert stats["energy_reconnectors_added"] == 0
+    assert stats["energy_reconnect_failed"] == 0
