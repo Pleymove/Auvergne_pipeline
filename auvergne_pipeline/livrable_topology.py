@@ -397,7 +397,9 @@ def _ensure_terminals_connected(
         rows[best_idx] = row_a
         rows.append(row_b)
 
-        # Check if connector needed (nonzero distance to projection)
+        # PR #33 — connector from terminal to projected line.
+        # We only accept microscopic distances as valid (floating-point jitter).
+        # Beyond that, we flag but do NOT create a straight C0 segment.
         d_to_proj = terminal_geom.distance(best_proj)
         if d_to_proj < 0.01:
             # Basically on the line after split — no connector needed
@@ -408,56 +410,22 @@ def _ensure_terminals_connected(
                 stats["pb_connected"] += 1
             return
 
-        # Public domain check
-        connector = LineString([
-            (terminal_geom.x, terminal_geom.y),
-            (best_proj.x, best_proj.y),
-        ])
-        if (delivery_public_area_safe is not None
-                and not delivery_public_area_safe.covers(connector)):
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key, target_url=target_url,
-                    message=f"{label.upper()} non connecte (connecteur traverse prive)")
-            return
-
-        # PR32-B: reject zero-length C0
-        if connector.length < 0.01:
+        if d_to_proj <= 0.2:
+            stats["terminals_connected_via_existing"] += 1
             if label == "pa":
                 stats["pa_connected"] += 1
             else:
                 stats["pb_connected"] += 1
             return
 
-        # PR32-B: reject C0 exceeding maximum length
-        if connector.length > C0_MAX_LENGTH_M:
-            log.warning(
-                "Connecteur C0 refuse: %.1f m > %.1f m max",
-                connector.length, C0_MAX_LENGTH_M,
-            )
-            stats["c0_rejected_too_long"] += 1
-            stats["terminal_snap_failed"] += 1
-            if flag_collector is not None:
-                flag_collector.add(
-                    flag_key, target_url=target_url,
-                    message=f"{label.upper()} non connecte (C0 > {C0_MAX_LENGTH_M}m)")
-            return
-
-        # Add connector
-        conn_row = dict(target_row)
-        conn_row["geometry"] = connector
-        conn_row["length_m"] = connector.length
-        conn_row["statut"] = ""
-        conn_row["mode_pose"] = "C0"
-        conn_row["src"] = "gc_neuf"
-        conn_row["infra_type"] = "gc_neuf"
-        rows.append(conn_row)
-        stats["terminal_connectors_added"] += 1
-        if label == "pa":
-            stats["pa_connected"] += 1
-        else:
-            stats["pb_connected"] += 1
+        # PR #33: beyond 0.2m, do NOT create a straight C0 connector.
+        # Flag the terminal as not connected — no synthetic geometry.
+        stats["terminal_snap_failed"] += 1
+        if flag_collector is not None:
+            flag_collector.add(
+                flag_key, target_url=target_url,
+                message=f"{label.upper()} non connecte — connecteur C0 droit non cree (PR #33), distance={d_to_proj:.1f}m")
+        return
 
     if pa_sro is not None and not pa_sro.empty:
         for _, pa in pa_sro.iterrows():
@@ -1034,13 +1002,24 @@ def _repair_micro_gaps(
     flag_collector=None,
 ) -> tuple[gpd.GeoDataFrame, dict]:
     """Find endpoints from different connected components within
-    ``MICRO_GAP_MAX_FIX_M`` and try to insert a public C0 connector.
+    ``MICRO_GAP_MAX_FIX_M`` and repair them WITHOUT adding visible C0.
 
-    If the connector crosses private land, flag as MICRO_GAP_UNRESOLVED.
+    PR #34 amend (Bloqueur 3): the previous behaviour emitted a
+    ``mode_pose=C0`` / ``src=gc_neuf`` row whenever the gap was public.
+    Pierre considers this a topology rustine masquerading as real GC
+    neuf, and it ends up as a short straight line in ``livrable_infra``.
+
+    New behaviour:
+    - gap <= ``ENDPOINT_SNAP_TOL_M`` (~0.5 m): snap endpoints exactly so
+      the segments share a coordinate. No new row.
+    - gap > ``ENDPOINT_SNAP_TOL_M`` and <= ``MICRO_GAP_MAX_FIX_M``: flag
+      ``MICRO_GAP_UNRESOLVED`` and increment ``micro_gaps_unresolved``.
+      No visible C0 row is appended, ever. Visible C0 is reserved for
+      genuine GC neuf decided by the routing layer, not topology patches.
     """
     stats = {
         "micro_gaps_detected": 0,
-        "micro_gaps_fixed": 0,
+        "micro_gaps_fixed": 0,        # exact snaps (no visible row)
         "micro_gaps_unresolved": 0,
         "max_gap_m": 0.0,
     }
@@ -1058,9 +1037,7 @@ def _repair_micro_gaps(
     pairs = tree.query_pairs(r=MICRO_GAP_MAX_FIX_M, output_type="ndarray")
     cc = {n: i for i, comp in enumerate(nx.connected_components(G)) for n in comp}
 
-    rows = df.to_dict("records")
-    fixed_pairs: set = set()
-    unresolved_pairs: set = set()
+    snap_map: dict[tuple[float, float], tuple[float, float]] = {}
 
     for a, b in pairs:
         na, nb = nodes[int(a)], nodes[int(b)]
@@ -1070,36 +1047,59 @@ def _repair_micro_gaps(
         stats["max_gap_m"] = max(stats["max_gap_m"], d)
         stats["micro_gaps_detected"] += 1
 
-        connector = LineString([na, nb])
-        if (
-            delivery_public_area_safe is not None
-            and delivery_public_area_safe.covers(connector)
-        ):
-            # Add public connector
-            row_template = dict(rows[0]) if rows else {}
-            connector_row = {
-                "sro": row_template.get("sro", "?"),
-                "pa_id": row_template.get("pa_id", ""),
-                "pb_id": row_template.get("pb_id", ""),
-                "statut": "",
-                "mode_pose": "C0",
-                "src": "gc_neuf",
-                "infra_type": "gc_neuf",
-                "length_m": d,
-                "geometry": connector,
-            }
-            rows.append(connector_row)
+        if d <= ENDPOINT_SNAP_TOL_M:
+            # Exact snap: rewrite ``nb`` endpoints onto ``na`` (or whichever
+            # was already chosen as a snap target) so the two segments
+            # share a coordinate. No row is appended — this is purely a
+            # geometric tweak.
+            target = snap_map.get(na, na)
+            snap_map[nb] = target
             stats["micro_gaps_fixed"] += 1
-            fixed_pairs.add((na, nb))
         else:
             stats["micro_gaps_unresolved"] += 1
-            unresolved_pairs.add((na, nb))
             if flag_collector is not None:
                 flag_collector.add(
                     "MICRO_GAP_UNRESOLVED",
                     target_url=f"({na[0]:.0f},{na[1]:.0f})",
-                    message=f"Micro-gap entre noeuds livrés, length={d:.2f}m",
+                    message=(
+                        f"Micro-gap entre noeuds livrés, length={d:.2f}m — "
+                        "non réparé (pas de C0 visible pour patch topo)"
+                    ),
                 )
+
+    if not snap_map:
+        return df, stats
+
+    # Apply snaps to the existing geometries — no new rows are created.
+    def _snap_pt(pt: tuple[float, float]) -> tuple[float, float]:
+        cur = pt
+        seen: set = set()
+        while cur in snap_map and cur not in seen:
+            seen.add(cur)
+            nxt = snap_map[cur]
+            if nxt == cur:
+                break
+            cur = nxt
+        return cur
+
+    rows = df.to_dict("records")
+    for row in rows:
+        g = row.get("geometry")
+        if g is None or g.is_empty or not isinstance(g, LineString):
+            continue
+        cs = list(g.coords)
+        if len(cs) < 2:
+            continue
+        first = (float(cs[0][0]), float(cs[0][1]))
+        last = (float(cs[-1][0]), float(cs[-1][1]))
+        nf = _snap_pt(first)
+        nl = _snap_pt(last)
+        if nf == first and nl == last:
+            continue
+        new_cs = list(cs)
+        new_cs[0] = nf
+        new_cs[-1] = nl
+        row["geometry"] = LineString(new_cs)
 
     out = gpd.GeoDataFrame(rows, geometry="geometry", crs=df.crs)
     return out, stats

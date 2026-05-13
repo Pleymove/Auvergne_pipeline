@@ -32,21 +32,22 @@ def test_bridge_rejects_long_diagonal():
 
 
 def test_bridge_allows_short_gap():
-    """PR #26 amend: a short gap (< 50 m) is still bridged."""
+    """PR #33: a micro gap (<= 3 m) is bridged as a VIRTUAL edge."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    G.add_node((30.0, 0.0))  # only 30 m away, < 50 m
+    G.add_node((2.0, 0.0))  # only 2 m away, <= 3 m PR33 threshold
     assert nx.number_connected_components(G) == 2
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
+        G, (0.0, 0.0), (2.0, 0.0),
     )
     assert bridged
-    assert G.has_edge((0.0, 0.0), (30.0, 0.0))
-    edge = G[(0.0, 0.0)][(30.0, 0.0)]
+    # PR #33: must be virtual — not delivered to livrable
+    edge = G[(0.0, 0.0)][(2.0, 0.0)]
+    assert edge.get("virtual") is True
+    assert edge.get("deliverable") is False
     assert edge["src"] == "gc_neuf"
     assert edge["infra_type"] == "gc_neuf"
-    assert edge["statut"] == ""  # PR #26 amend: never None
     assert "geometry" in edge
     assert isinstance(edge["geometry"], LineString)
 

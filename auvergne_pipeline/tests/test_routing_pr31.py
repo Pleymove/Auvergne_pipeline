@@ -88,8 +88,14 @@ def test_pa_is_connected_to_livrable_path():
     assert (5.0, 0.0) in starts | ends, (
         f"target line should have been split at PA projection (5,0); got {starts | ends}"
     )
-    assert stats["pa_connected"] >= 1
-    assert stats["terminal_connectors_added"] >= 1
+    # PR #33: PA connects by projection-split, but NO C0 connector is added
+    # anymore. Split must still happen.
+    assert (5.0, 0.0) in starts | ends, (
+        f"target line should have been split at PA projection (5,0); got {starts | ends}"
+    )
+    assert stats["terminal_connectors_added"] == 0, (
+        "PR #33: no C0 connectors should be added"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +111,10 @@ def test_pb_is_connected_to_livrable_path():
         df, pa, pb, "SRO1",
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
-    assert stats["pb_connected"] >= 1
-    assert stats["terminal_connectors_added"] >= 1
+    # PR #33: PB connects by projection-split, but NO C0 connector added
+    assert stats["terminal_connectors_added"] == 0, (
+        "PR #33: no C0 connectors should be added"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +461,12 @@ def test_endpoint_projection_splits_crossing_line_t_junction():
 
 
 def test_public_micro_gap_1_5m_is_repaired_not_only_flagged():
-    """PR #28 Point 3: gap of 1.5 m between two segments in public area
-    must be fixed by adding a connector, not just flagged.
+    """PR #28 Point 3 / PR #34 amend (Bloqueur 3): a 1.5 m public gap is
+    detected and surfaced as ``MICRO_GAP_UNRESOLVED`` instead of being
+    patched with a visible C0 connector. The previous behaviour
+    (appending a ``mode_pose=C0, src=gc_neuf`` row) is now forbidden so
+    livrable_infra does not show short straight lines glued onto real
+    infra.
     """
     df = _df([
         _row(geometry=LineString([(0, 0), (5, 0)])),
@@ -463,10 +475,46 @@ def test_public_micro_gap_1_5m_is_repaired_not_only_flagged():
     out, stats = lt._repair_micro_gaps(
         df, delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
+    # Gap detected
+    assert stats["micro_gaps_detected"] >= 1
+    # 1.5 m is above ENDPOINT_SNAP_TOL_M (0.5 m), so it is NOT auto-snapped
+    # and must be reported as unresolved — never silently patched with C0.
+    assert stats["micro_gaps_unresolved"] >= 1
+    # No new visible C0 connector row appended.
+    assert len(out) == 2
+    c0_patch = out[(out["mode_pose"] == "C0") & (out["src"] == "gc_neuf")]
+    assert c0_patch.empty, (
+        "PR #34: _repair_micro_gaps must never emit a visible C0 row"
+    )
+
+
+def test_public_micro_gap_under_0_5m_is_snapped_no_c0_row():
+    """PR #34 amend: a sub-0.5 m public gap is snapped exactly. The two
+    segments end up sharing a coordinate and no extra row is added.
+    """
+    df = _df([
+        _row(geometry=LineString([(0.0, 0.0), (5.0, 0.0)])),
+        _row(geometry=LineString([(5.3, 0.0), (10.0, 0.0)])),
+    ])
+    out, stats = lt._repair_micro_gaps(
+        df, delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
+    )
+    assert stats["micro_gaps_detected"] >= 1
     assert stats["micro_gaps_fixed"] >= 1
     assert stats["micro_gaps_unresolved"] == 0
-    # A connector should have been added
-    assert len(out) >= 3
+    assert len(out) == 2  # no connector row appended
+    c0_patch = out[(out["mode_pose"] == "C0") & (out["src"] == "gc_neuf")]
+    assert c0_patch.empty, "snap must not produce a C0 row"
+    # Confirm the snap actually happened: both segments now share an endpoint.
+    endpoints: set[tuple[float, float]] = set()
+    for g in out.geometry:
+        cs = list(g.coords)
+        endpoints.add((round(cs[0][0], 3), round(cs[0][1], 3)))
+        endpoints.add((round(cs[-1][0], 3), round(cs[-1][1], 3)))
+    # Either (5.0, 0.0) or (5.3, 0.0) — but not both anymore.
+    assert not ((5.0, 0.0) in endpoints and (5.3, 0.0) in endpoints), (
+        f"endpoints should have been snapped together, got {endpoints}"
+    )
 
 
 def test_private_micro_gap_is_flagged_not_repaired():

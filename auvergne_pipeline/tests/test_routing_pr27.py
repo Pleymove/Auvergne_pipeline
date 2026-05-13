@@ -36,26 +36,27 @@ def test_bridge_rejected_private_crossing():
 # ---------------------------------------------------------------------------
 
 def test_bridge_accepted_in_public_area():
-    """PR #27 Part A: bridge <= 50m fully inside public_area is accepted."""
+    """PR #33 amend: micro bridge (<= 3m) inside public_area creates a virtual edge."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    G.add_node((30.0, 0.0))
-
-    public_area = Polygon([(-10, -10), (40, -10), (40, 10), (-10, 10)])
+    G.add_node((2.0, 0.0))  # 2m away, <= 3m PR33 threshold
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
-        public_area=public_area,
+        G, (0.0, 0.0), (2.0, 0.0),
     )
     assert bridged
+    # PR #33: must be virtual
+    edge = G[(0.0, 0.0)][(2.0, 0.0)]
+    assert edge.get("virtual") is True
+    assert edge.get("deliverable") is False
 
 
 # ---------------------------------------------------------------------------
-# 3. Bridge > 50m rejected
+# 3. Bridge > 3m rejected (PR33)
 # ---------------------------------------------------------------------------
 
 def test_bridge_rejected_too_long():
-    """PR #27: bridge > 50m rejected regardless of public_area."""
+    """PR #33: bridge > 3m rejected regardless of public_area."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
     G.add_node((100.0, 0.0))
@@ -70,41 +71,39 @@ def test_bridge_rejected_too_long():
 
 
 # ---------------------------------------------------------------------------
-# 4. Bridge with public_area=None → fail-closed
+# 4. Bridge with public_area=None → only micro bridges allowed (PR33)
 # ---------------------------------------------------------------------------
 
 def test_bridge_rejected_no_public_area():
-    """PR #27 amend: public_area=None must fail-closed (no blind bridges)."""
+    """PR #33: no public_area — only micro bridges (<= 3m) allowed."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    G.add_node((30.0, 0.0))
+    G.add_node((1.0, 0.0))  # 1m — micro bridge allowed
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
+        G, (0.0, 0.0), (1.0, 0.0),
         public_area=None,
     )
-    assert not bridged
+    assert bridged
+    assert G[(0.0, 0.0)][(1.0, 0.0)].get("virtual") is True
 
 
 # ---------------------------------------------------------------------------
-# 5. Bridge on boundary → accepted (covers + buffer tolerance)
+# 5. Bridge on boundary → micro only (PR33)
 # ---------------------------------------------------------------------------
 
 def test_bridge_accepted_on_boundary():
-    """PR #27 amend: bridge exactly on public_area boundary is accepted."""
+    """PR #33 amend: micro bridge (<= 3m) accepted even without public_area check."""
     G = nx.Graph()
     G.add_node((0.0, 0.0))
-    G.add_node((30.0, 0.0))
-
-    # Public area covers exactly [0..30] on x-axis
-    # Bridge at y=0,0 to y=0,30 — ON the boundary
-    public_area = Polygon([(0, -5), (30, -5), (30, 5), (0, 5)])
+    G.add_node((2.0, 0.0))  # 2m — micro bridge allowed
+    # No public_area provided — PR33 allows micro bridges regardless
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
-        public_area=public_area,
+        G, (0.0, 0.0), (2.0, 0.0),
     )
     assert bridged
+    assert G[(0.0, 0.0)][(2.0, 0.0)].get("virtual") is True
 
 
 # ---------------------------------------------------------------------------
@@ -376,18 +375,20 @@ def test_endpoint_to_line_public_accepted():
 
 
 def test_bridge_has_routing_weight():
-    """PR #28 amend B2: bridge created by _bridge_components_with_gc_neuf has _routing_weight."""
+    """PR #33 amend: micro bridge (<= 3m) created with virtual=True."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (10.0, 0.0), length=10, type="infra")
-    G.add_node((30.0, 0.0))
+    G.add_node((2.0, 0.0))  # 2m away, <= 3m
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
+        G, (0.0, 0.0), (2.0, 0.0),
     )
     assert bridged
-    edge_data = G.get_edge_data((0.0, 0.0), (30.0, 0.0))
+    edge_data = G.get_edge_data((0.0, 0.0), (2.0, 0.0))
     assert edge_data is not None
-    assert edge_data.get("_routing_weight") == pytest.approx(30.0 * 10.0)  # length * 10
+    # PR #33: virtual edge
+    assert edge_data.get("virtual") is True
+    assert edge_data.get("deliverable") is False
 
 
 def test_line_snap_chooses_closest_line():

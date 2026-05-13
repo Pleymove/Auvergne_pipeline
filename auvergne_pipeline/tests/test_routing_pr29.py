@@ -233,21 +233,21 @@ def test_endpoint_to_line_public_connector_splits_edge():
 
 
 def test_bridge_keeps_explicit_routing_weight():
-    """The C0 bridge edge must carry ``_routing_weight = length × factor``."""
+    """PR #33 amend: micro bridge (<= 3m) created as VIRTUAL edge."""
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (5.0, 0.0), length=5, type="infra", src="bt")
-    G.add_node((30.0, 0.0))
-
-    public_area = Polygon([(-5, -5), (35, -5), (35, 5), (-5, 5)])
+    G.add_node((2.0, 0.0))  # 2m, micro bridge allowed
 
     bridged = routing._bridge_components_with_gc_neuf(
-        G, (0.0, 0.0), (30.0, 0.0),
-        public_area=public_area,
+        G, (0.0, 0.0), (2.0, 0.0),
     )
     assert bridged
-    assert G.has_edge((0.0, 0.0), (30.0, 0.0))
-    edge = G[(0.0, 0.0)][(30.0, 0.0)]
-    assert edge["_routing_weight"] == pytest.approx(30.0 * routing.WEIGHT_FACTOR_GC_NEUF)
+    assert G.has_edge((0.0, 0.0), (2.0, 0.0))
+    edge = G[(0.0, 0.0)][(2.0, 0.0)]
+    # PR #33: must be virtual and non-deliverable
+    assert edge.get("virtual") is True
+    assert edge.get("deliverable") is False
+    assert edge["length"] == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------
