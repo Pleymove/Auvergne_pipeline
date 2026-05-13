@@ -633,21 +633,25 @@ def _bridge_components_with_gc_neuf(
         (pb_node[0], pb_node[1]),
     ])
 
-    # PR #33: micro bridge accepted but VIRTUAL (not delivered)
-    G.add_edge(
-        pa_node, pb_node,
-        length=direct_length,
-        type="gc_neuf",
-        statut="",
-        mode_pose="C0",
-        src="gc_neuf",
-        infra_type="gc_neuf",
-        geometry=bridge_geom,
-        # PR #33: virtual edge — routable but NOT delivered to livrable_infra
-        virtual=True,
-        deliverable=False,
-        virtual_reason="micro_bridge",
-    )
+    # PR #33: micro bridge accepted but VIRTUAL (not delivered).
+    # PR #34 amend (Bloqueur 1): this edge is added AFTER the prepare_weights
+    # loop, so we must set ``_routing_weight`` here ourselves. Otherwise
+    # NetworkX falls back to its default behaviour (None / implicit weight)
+    # which can bias Dijkstra paths through this virtual bridge.
+    bridge_attrs = {
+        "length": direct_length,
+        "type": "gc_neuf",
+        "statut": "",
+        "mode_pose": "C0",
+        "src": "gc_neuf",
+        "infra_type": "gc_neuf",
+        "geometry": bridge_geom,
+        "virtual": True,
+        "deliverable": False,
+        "virtual_reason": "micro_bridge",
+    }
+    bridge_attrs["_routing_weight"] = _routing_weight_for(bridge_attrs)
+    G.add_edge(pa_node, pb_node, **bridge_attrs)
     if flag_collector is not None:
         flag_collector.add(
             "MICRO_BRIDGE_CREATED_VIRTUAL",
@@ -1064,6 +1068,14 @@ def route_pa_to_pb(
                             # Block from delivery: count + flag, skip add.
                             ign_route_blocked_m += raw_length
                             ign_route_blocked_count += 1
+                            # PR #34 amend (Bloqueur 2): track cumulative-cap
+                            # hits specifically. A short, public IGN edge
+                            # blocked purely because the SRO budget is
+                            # already spent must surface in [FINAL TOPO QA]
+                            # so the log reflects reality instead of a
+                            # hard-coded zero.
+                            if is_short and is_in_public and not within_budget:
+                                ign_cap_hit_count += 1
                             if (
                                 not _ign_blocked_flag_added
                                 and flag_collector is not None
@@ -1252,13 +1264,29 @@ def route_pa_to_pb(
     pa_pb_total = pa_pb_connected + pa_pb_disconnected
     pa_pb_ratio = pa_pb_connected / pa_pb_total if pa_pb_total > 0 else 0.0
 
+    # PR #34 amend (point QA): compute a real ``virtual_delivered`` value
+    # from the final GeoDataFrame instead of hard-coding 0. If neither
+    # ``virtual`` nor ``deliverable`` columns are present (the routing path
+    # never emits them by design), the counter stays 0 — but it is now an
+    # observed 0 rather than a hard-coded reassurance.
+    virtual_edges_delivered_count = 0
+    if not result.empty:
+        if "virtual" in result.columns:
+            virtual_edges_delivered_count += int(
+                result["virtual"].fillna(False).astype(bool).sum()
+            )
+        if "deliverable" in result.columns:
+            virtual_edges_delivered_count += int(
+                (result["deliverable"].fillna(True).astype(bool) == False).sum()
+            )
+
     log.info(
         "[FINAL TOPO QA] sro=%s connected=%d disconnected=%d pa_pb_connected_ratio=%.2f "
         "straight_connectors=%d straight_connector_length_m=%.0f "
         "virtual_delivered=%d ign_cap_hit=%d c0_without_source_geometry=%d",
         sro_code_log, pa_pb_connected, pa_pb_disconnected, pa_pb_ratio,
         straight_connector_count, straight_connector_length_m,
-        0,  # virtual_edges_delivered_count — guarded above, always 0
+        virtual_edges_delivered_count,
         ign_cap_hit_count,
         c0_without_source_geom,
     )

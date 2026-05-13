@@ -121,6 +121,117 @@ def test_micro_snap_under_3m_not_delivered_as_visible_c0():
 
 
 # ---------------------------------------------------------------------------
+# PR #34 amend — Bloqueur 1: micro-bridge must carry _routing_weight
+# ---------------------------------------------------------------------------
+
+def test_micro_bridge_has_routing_weight():
+    """PR #34 amend Bloqueur 1: ``_bridge_components_with_gc_neuf`` is
+    called AFTER ``prepare_weights``. The micro-bridge it inserts must
+    therefore set ``_routing_weight`` itself, otherwise Dijkstra would
+    fall back to NetworkX' implicit weight handling.
+    """
+    G = nx.Graph()
+    G.add_edge((0.0, 0.0), (2.0, 0.0),
+               length=2.0, geometry=LineString([(0, 0), (2, 0)]),
+               type="infra", src="ft", infra_type="ft")
+    G.add_edge((2.0, 1.0), (4.0, 1.0),
+               length=2.0, geometry=LineString([(2, 1), (4, 1)]),
+               type="infra", src="ft", infra_type="ft")
+
+    pa_node = (2.0, 0.0)
+    pb_node = (2.0, 1.0)  # 1 m away (<= MAX_STRAIGHT_CONNECTOR_M)
+
+    bridged = routing._bridge_components_with_gc_neuf(G, pa_node, pb_node)
+    assert bridged
+    edge_data = G.get_edge_data(pa_node, pb_node)
+    assert edge_data is not None
+    assert edge_data.get("virtual") is True
+    assert edge_data.get("deliverable") is False
+    assert edge_data.get("virtual_reason") == "micro_bridge"
+    # The core PR #34 assertion: a coherent routing weight must be set.
+    assert "_routing_weight" in edge_data, (
+        "PR #34: micro-bridge must carry _routing_weight (set after "
+        "prepare_weights ran in route_pa_to_pb)"
+    )
+    rw = edge_data["_routing_weight"]
+    assert isinstance(rw, (int, float))
+    assert rw > 0, "routing weight must be strictly positive"
+    # Must match what _routing_weight_for would compute for a gc_neuf edge
+    expected = routing._routing_weight_for(edge_data)
+    assert abs(rw - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# PR #34 amend — Bloqueur 2: ign_cap_hit_count is really incremented
+# ---------------------------------------------------------------------------
+
+def test_ign_cap_hit_count_increments_when_budget_exceeded(caplog):
+    """PR #34 amend Bloqueur 2: ``ign_cap_hit_count`` (logged in
+    ``[FINAL TOPO QA]``) must reflect actual cap hits, not stay at 0.
+
+    Build an SRO whose only feasible path is a chain of short, public,
+    IGN routes whose cumulative length exceeds
+    ``MAX_IGN_DELIVERED_PER_SRO_M``. The cap should kick in and the log
+    should expose ``ign_cap_hit`` > 0.
+    """
+    import logging
+    from shapely.geometry import Polygon
+
+    # No existing infra — Dijkstra is forced onto IGN edges.
+    infra = gpd.GeoDataFrame(
+        [], columns=["statut", "mode_pose", "src", "geometry", "sro_code"],
+        geometry="geometry", crs="EPSG:2154",
+    )
+
+    # A long IGN polyline made of short segments. Each segment is short
+    # enough to pass the per-edge length filter
+    # (``IGN_DELIVERY_MAX_LENGTH_M``) but their cumulative length is well
+    # above ``MAX_IGN_DELIVERED_PER_SRO_M`` (300 m).
+    seg_len = 20.0
+    n_segs = 30  # 600 m total — twice the cap
+    ign_geom = LineString([(i * seg_len, 0.0) for i in range(n_segs + 1)])
+    ign = gpd.GeoDataFrame(
+        [{"geometry": ign_geom}], geometry="geometry", crs="EPSG:2154",
+    )
+
+    public_area = Polygon([
+        (-10.0, -10.0), (n_segs * seg_len + 10.0, -10.0),
+        (n_segs * seg_len + 10.0, 10.0), (-10.0, 10.0),
+    ])
+
+    pa = _pa(0.0, 0.0, pid="PA1")
+    pb = gpd.GeoDataFrame([{
+        "pb_id": "PB1", "pa_id": "PA1", "id_metier": "PA1", "sro": "SRO1",
+        "geometry": Point(n_segs * seg_len, 0.0),
+    }], geometry="geometry", crs="EPSG:2154")
+
+    flags = _Flags()
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        routing.route_pa_to_pb(
+            pa, pb, infra, ign,
+            flag_collector=flags,
+            gc_neuf=gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            public_area=public_area,
+            delivery_public_area=public_area,
+        )
+
+    final_topo_lines = [
+        rec.getMessage() for rec in caplog.records
+        if "[FINAL TOPO QA]" in rec.getMessage()
+    ]
+    assert final_topo_lines, "expected a [FINAL TOPO QA] log line"
+    qa_line = final_topo_lines[-1]
+    # Extract ign_cap_hit=<n>
+    import re
+    m = re.search(r"ign_cap_hit=(\d+)", qa_line)
+    assert m is not None, f"ign_cap_hit not found in: {qa_line}"
+    assert int(m.group(1)) > 0, (
+        f"PR #34: ign_cap_hit should be > 0 once the SRO budget is "
+        f"exceeded — got line: {qa_line}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 3. test_endpoint_to_line_split_no_straight_connector
 # ---------------------------------------------------------------------------
 
