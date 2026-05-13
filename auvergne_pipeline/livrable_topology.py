@@ -80,6 +80,14 @@ TERMINAL_TOUCH_TOL_M = 0.2
 # projection. Anything further than this is flagged but not snapped.
 TERMINAL_SNAP_RADIUS_M = 5.0
 
+# PR #36 — Maximum length of a terminal C0 connector emitted by
+# ``_ensure_terminals_connected``. A connector longer than this is
+# considered too visually disruptive (a “straight line through a parcel”)
+# and is flagged for manual review instead of being emitted. Pierre
+# accepts short terminal connectors as the lesser evil vs. completely
+# disconnected PA/PB; he does not accept big visible chords.
+TERMINAL_CONNECTOR_MAX_LENGTH_M = 3.0
+
 # Two parallel segments closer than this are considered "doublons".
 NEAR_DUPLICATE_TOL_M = 0.5
 
@@ -398,11 +406,16 @@ def _ensure_terminals_connected(
         rows.append(row_b)
 
         # PR #33 — connector from terminal to projected line.
-        # We only accept microscopic distances as valid (floating-point jitter).
-        # Beyond that, we flag but do NOT create a straight C0 segment.
+        # PR #36 — restore the short terminal connector. PR #33 forbade
+        # ANY connector beyond floating-point jitter (0.2 m), which left
+        # ~75% of PA / PB floating in the topology graph on Pierre's
+        # field test and dragged ``pa_pb_connected_ratio`` to 0. The
+        # operator accepts a short, public, deliverable C0 stub as the
+        # lesser evil vs. a disconnected terminal — see brief PR #36:
+        # "PA/PB doivent être connectés … split/snap de manière
+        # cohérente". Long connectors are still rejected.
         d_to_proj = terminal_geom.distance(best_proj)
         if d_to_proj < 0.01:
-            # Basically on the line after split — no connector needed
             stats["terminals_connected_via_existing"] += 1
             if label == "pa":
                 stats["pa_connected"] += 1
@@ -418,13 +431,60 @@ def _ensure_terminals_connected(
                 stats["pb_connected"] += 1
             return
 
-        # PR #33: beyond 0.2m, do NOT create a straight C0 connector.
-        # Flag the terminal as not connected — no synthetic geometry.
-        stats["terminal_snap_failed"] += 1
-        if flag_collector is not None:
-            flag_collector.add(
-                flag_key, target_url=target_url,
-                message=f"{label.upper()} non connecte — connecteur C0 droit non cree (PR #33), distance={d_to_proj:.1f}m")
+        # PR #36 — add a short, public C0 connector from terminal to
+        # the projection point on the split target line. This is the
+        # ONLY case where ``_ensure_terminals_connected`` emits a new
+        # row; otherwise the terminal stays unconnected and is flagged.
+        if d_to_proj > TERMINAL_CONNECTOR_MAX_LENGTH_M:
+            stats["terminal_snap_failed"] += 1
+            if flag_collector is not None:
+                flag_collector.add(
+                    flag_key, target_url=target_url,
+                    message=(
+                        f"{label.upper()} trop éloigné du livrable "
+                        f"(distance={d_to_proj:.1f}m > "
+                        f"{TERMINAL_CONNECTOR_MAX_LENGTH_M}m) — pas de "
+                        "connecteur visible, review manuel requis."
+                    ),
+                )
+            return
+
+        connector_geom = LineString([
+            (terminal_geom.x, terminal_geom.y),
+            (best_proj.x, best_proj.y),
+        ])
+        if (
+            delivery_public_area_safe is not None
+            and not delivery_public_area_safe.covers(connector_geom)
+        ):
+            stats["terminal_snap_failed"] += 1
+            if flag_collector is not None:
+                flag_collector.add(
+                    flag_key, target_url=target_url,
+                    message=(
+                        f"{label.upper()} non connecté — connecteur C0 "
+                        f"traverserait domaine privé (length={d_to_proj:.1f}m)."
+                    ),
+                )
+            return
+
+        # Emit the deliverable terminal connector. Inherit the SRO/PA/PB
+        # context from the target row so writer-side filters keep the
+        # connector grouped with its PA→PB pair.
+        connector_row = dict(target_row)
+        connector_row["statut"] = ""
+        connector_row["mode_pose"] = "C0"
+        connector_row["src"] = "gc_neuf"
+        connector_row["infra_type"] = "gc_neuf"
+        connector_row["length_m"] = float(connector_geom.length)
+        connector_row["geometry"] = connector_geom
+        rows.append(connector_row)
+
+        stats["terminal_connectors_added"] += 1
+        if label == "pa":
+            stats["pa_connected"] += 1
+        else:
+            stats["pb_connected"] += 1
         return
 
     if pa_sro is not None and not pa_sro.empty:

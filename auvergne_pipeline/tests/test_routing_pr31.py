@@ -70,7 +70,13 @@ def _pb(x=0.0, y=0.0, pb_id="PB1", pa_id="PA1") -> gpd.GeoDataFrame:
 
 def test_pa_is_connected_to_livrable_path():
     """A PA placed 1 m off a livrable line must end up topologically
-    connected (the line is split and a public connector is added).
+    connected.
+
+    PR #36 — terminal connector restored. PR #33 had forbidden ANY
+    visible terminal connector, which left ~75% of PA/PB floating in
+    the field test (pa_pb_connected_ratio=0.00 sur 4/5 SROs). The
+    operator accepts a short, public, deliverable C0 stub as the lesser
+    evil vs. a disconnected terminal — see brief PR #36.
     """
     df = _df([
         _row(geometry=LineString([(0, 0), (10, 0)])),
@@ -88,14 +94,14 @@ def test_pa_is_connected_to_livrable_path():
     assert (5.0, 0.0) in starts | ends, (
         f"target line should have been split at PA projection (5,0); got {starts | ends}"
     )
-    # PR #33: PA connects by projection-split, but NO C0 connector is added
-    # anymore. Split must still happen.
-    assert (5.0, 0.0) in starts | ends, (
-        f"target line should have been split at PA projection (5,0); got {starts | ends}"
+    # PR #36 — at least one short public terminal connector emitted so
+    # the topology graph actually contains the PA. The connector stays
+    # under TERMINAL_CONNECTOR_MAX_LENGTH_M (3 m).
+    assert stats["pa_connected"] >= 1
+    assert stats["terminal_connectors_added"] >= 1, (
+        "PR #36: a short C0 terminal connector must be added to attach the PA"
     )
-    assert stats["terminal_connectors_added"] == 0, (
-        "PR #33: no C0 connectors should be added"
-    )
+    assert stats["terminal_snap_failed"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +117,10 @@ def test_pb_is_connected_to_livrable_path():
         df, pa, pb, "SRO1",
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
-    # PR #33: PB connects by projection-split, but NO C0 connector added
-    assert stats["terminal_connectors_added"] == 0, (
-        "PR #33: no C0 connectors should be added"
-    )
+    # PR #36 — short C0 terminal connector restored; PB is attached.
+    assert stats["pb_connected"] >= 1
+    assert stats["terminal_connectors_added"] >= 1
+    assert stats["terminal_snap_failed"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -282,21 +288,16 @@ def test_mutualized_tree_reuses_trunk_for_multiple_pb():
 # ---------------------------------------------------------------------------
 
 
-def test_ign_cumulative_delivery_limit(monkeypatch):
-    """Many small IGN edges each below the per-edge cap must NOT
-    aggregate past the SRO budget (300 m).
-
-    PR #34 amend v3 — policy update: when a single PA→PB path's IGN
-    consumption would push past ``MAX_IGN_DELIVERED_PER_SRO_M``, the
-    whole path is rejected (so the livrable does not display a 300 m
-    delivered stub followed by a 100 m hole). The previous behaviour
-    (deliver up to 300 m and silently drop the rest) is forbidden
-    because it produces discontinuous livrables.
+def test_ign_cumulative_delivery_limit_soft_warning(monkeypatch):
+    """PR #36 — the cumulative SRO IGN cap is a SOFT warning, not a
+    blocker. PR #34 v3 had made it a hard reject, which on the field
+    test (it.22) produced infra=0 livrables on full SROs and dragged
+    ``pa_pb_connected_ratio`` to 0. Pierre's brief PR #36 explicitly
+    asks for restored continuity even when IGN cumulé > budget, with
+    the cap surviving only as ``ign_cap_hit`` telemetry in
+    [FINAL TOPO QA] and as a flag.
     """
     G = nx.Graph()
-    # 10 IGN edges of 40 m each → 400 m total. Per-edge cap 50 m allows
-    # each one individually, but the cumulative cap (300 m) would be
-    # exceeded by edge 8, so the whole path must be rejected.
     for i in range(10):
         x0 = i * 40.0
         x1 = (i + 1) * 40.0
@@ -317,17 +318,13 @@ def test_ign_cumulative_delivery_limit(monkeypatch):
         public_area=_BIG_PUBLIC,
         delivery_public_area=_BIG_PUBLIC,
     )
-    # Either nothing was delivered (path rejected by path-level cap
-    # check) — this is the new, expected outcome — or the cumulative
-    # cap was respected. Both branches honor the user-visible rule
-    # "no delivered IGN length above 300 m for this SRO".
-    if out is None or out.empty:
-        delivered_m = 0.0
-    else:
-        delivered_m = float(out["length_m"].sum())
-    assert delivered_m <= routing.MAX_IGN_DELIVERED_PER_SRO_M, (
-        f"cumulative IGN delivery should not exceed "
-        f"{routing.MAX_IGN_DELIVERED_PER_SRO_M} m; got {delivered_m}"
+    # PR #36 — full path delivered even above the cap, livrable_infra
+    # stays continuous.
+    assert out is not None and not out.empty
+    delivered_m = float(out["length_m"].sum())
+    assert delivered_m == pytest.approx(400.0, abs=1.0), (
+        f"PR #36: path delivered continuously over the soft cap, "
+        f"expected ~400m, got {delivered_m}"
     )
 
 
