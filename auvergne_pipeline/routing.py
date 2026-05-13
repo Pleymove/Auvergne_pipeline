@@ -960,6 +960,24 @@ def route_pa_to_pb(
     virtual_edges_blocked_count = 0
     straight_connector_count = 0
     straight_connector_length_m = 0.0
+    # PR38 diagnostics
+    diag = {
+        "pass1_existing_reached": 0,
+        "pass1_existing_committed": 0,
+        "pass1_existing_rejected": 0,
+        "pass2_gc_reached": 0,
+        "pass2_gc_committed": 0,
+        "pass2_gc_rejected": 0,
+        "pb_unreachable_after_pass1": 0,
+        "pb_unreachable_after_pass2": 0,
+        "path_rejected_missing_anchor": 0,
+        "path_lost_between_routing_and_final_graph": 0,
+        "path_broken_after_postprocess": 0,
+        "committed_path_reachable_final_graph": 0,
+        "committed_path_unreachable_final_graph": 0,
+        "path_metadata_present_but_graph_disconnected": 0,
+    }
+    committed_paths: dict[str, dict] = {}
 
     # Build STRtree indices for fast PA/PB snapping (PR #21)
     # PR #27 Part C: use rebuild helper (avoids stale indices)
@@ -1025,6 +1043,33 @@ def route_pa_to_pb(
 
         return None
 
+    def _add_terminal_anchor(term_geom: Point, term_kind: str, term_id: str):
+        snapped = _snap(term_geom)
+        if snapped is None:
+            return None
+        tnode = _point_key(term_geom)
+        if tnode not in G:
+            G.add_node(tnode)
+        if tnode != snapped and not G.has_edge(tnode, snapped):
+            g = LineString([(tnode[0], tnode[1]), (snapped[0], snapped[1])])
+            G.add_edge(
+                tnode, snapped,
+                length=float(g.length),
+                geometry=g,
+                type="gc_neuf",
+                infra_type="terminal_connector",
+                mode_pose="C0",
+                src="gc_neuf",
+                deliverable=True,
+                virtual=False,
+                _can_deliver=True,
+                _terminal_anchor=True,
+                _terminal_type=term_kind,
+                _terminal_id=term_id,
+                _c0_source="terminal",
+            )
+        return tnode
+
     # ── For each PA, route all PA → PB (PR #23 Feature D: single-source Dijkstra per PA) ──
     t0_dijkstra = time.perf_counter()
     pa_count = 0
@@ -1035,7 +1080,7 @@ def route_pa_to_pb(
         sro = pa.get("sro", "?")
         pa_geom = pa.geometry
 
-        pa_node = _snap(pa_geom)
+        pa_node = _add_terminal_anchor(pa_geom, "PA", str(pa_id))
         if pa_node is None:
             if flag_collector is not None:
                 flag_collector.add(
@@ -1052,8 +1097,9 @@ def route_pa_to_pb(
         # ── Snap all PBs first (may mutate G via edge projection) ─────
         pb_snapped: list[tuple] = []  # (pb_row, pb_node, pb_id, pb_geom)
         for _, pb in pb4pa.iterrows():
-            pb_node = _snap(pb.geometry)
+            pb_node = _add_terminal_anchor(pb.geometry, "PB", str(pb.get("pb_id", f"pb#{pb.name}")))
             if pb_node is None:
+                diag["path_rejected_missing_anchor"] += 1
                 # PB unreachable — flag immediately
                 if flag_collector is not None:
                     flag_collector.add(
@@ -1116,8 +1162,14 @@ def route_pa_to_pb(
             # ── Pass 1: existing-only ─────────────────────────────────
             if pb_node in _paths_p1:
                 p1 = _paths_p1[pb_node]
+                diag["pass1_existing_reached"] += 1
                 if _path_is_existing_only(p1):
                     path = p1
+                    diag["pass1_existing_committed"] += 1
+                else:
+                    diag["pass1_existing_rejected"] += 1
+            else:
+                diag["pb_unreachable_after_pass1"] += 1
 
             # ── Pass 2: fallback to IGN/C0 deliverable graph ──────────
             if path is None:
@@ -1125,6 +1177,8 @@ def route_pa_to_pb(
                     _paths_full = _dijkstra_tree_full()
                 if pb_node in _paths_full:
                     path = _paths_full[pb_node]
+                    diag["pass2_gc_reached"] += 1
+                    diag["pass2_gc_committed"] += 1
                 else:
                     # PB still unreachable: try a last-resort micro-bridge
                     bridged = _bridge_components_with_gc_neuf(
@@ -1137,8 +1191,11 @@ def route_pa_to_pb(
                         _paths_full = _dijkstra_tree_full()
                         if pb_node in _paths_full:
                             path = _paths_full[pb_node]
+                            diag["pass2_gc_reached"] += 1
+                            diag["pass2_gc_committed"] += 1
 
             if path is None:
+                diag["pb_unreachable_after_pass2"] += 1
                 if flag_collector is not None:
                     flag_collector.add(
                         "PA_PB_DECONNECTES",
@@ -1222,6 +1279,10 @@ def route_pa_to_pb(
                 )
 
             if not path_deliverable:
+                if path is not None and pb_node in _paths_p1:
+                    diag["pass1_existing_rejected"] += 1
+                else:
+                    diag["pass2_gc_rejected"] += 1
                 if flag_collector is not None:
                     flag_collector.add(
                         "PA_PB_PATH_NON_DELIVERABLE",
@@ -1324,6 +1385,7 @@ def route_pa_to_pb(
                     "length_m": raw_length,
                     "geometry": out_geom,
                     "_c0_source": c0_source,
+                    "_used_by_paths": f"{pa_id}->{pb_id}",
                 }
 
                 # PR #34 amend (v3) — straight_connectors counts ONLY
@@ -1344,6 +1406,12 @@ def route_pa_to_pb(
                             straight_connector_length_m += raw_length
                     except Exception:
                         pass
+            committed_paths[f"{pa_id}->{pb_id}"] = {
+                "pa_id": pa_id,
+                "pb_id": pb_id,
+                "pa_anchor": pa_node,
+                "pb_anchor": pb_node,
+            }
 
     perf["dijkstra_total"] = time.perf_counter() - t0_dijkstra
 
@@ -1442,6 +1510,60 @@ def route_pa_to_pb(
         flag_collector=flag_collector,
     )
     perf["pr31_topology"] = time.perf_counter() - t0
+    # PR38: verify committed paths still exist in final graph rows
+    if committed_paths:
+        if "_used_by_paths" in result.columns:
+            remaining = set(str(v) for v in result["_used_by_paths"].dropna().unique())
+            for pid in committed_paths:
+                if pid not in remaining:
+                    diag["path_lost_between_routing_and_final_graph"] += 1
+                    diag["path_broken_after_postprocess"] += 1
+        else:
+            diag["path_lost_between_routing_and_final_graph"] += len(committed_paths)
+            diag["path_broken_after_postprocess"] += len(committed_paths)
+
+    def _build_final_graph(df: gpd.GeoDataFrame) -> nx.Graph:
+        g = nx.Graph()
+        if df is None or df.empty:
+            return g
+        for _, row in df.iterrows():
+            geom = row.get("geometry")
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            for line in _explode_to_linestrings(geom):
+                coords = list(line.coords)
+                if len(coords) < 2:
+                    continue
+                for i in range(len(coords) - 1):
+                    a = _point_key(_coord2d(coords[i]))
+                    b = _point_key(_coord2d(coords[i + 1]))
+                    if a == b:
+                        continue
+                    g.add_edge(a, b)
+        return g
+
+    # PR38 hard validation: actual final-graph reachability for committed paths
+    G_final = _build_final_graph(result)
+    unreachable_committed = 0
+    for pid, rec in committed_paths.items():
+        pa_a = rec.get("pa_anchor")
+        pb_a = rec.get("pb_anchor")
+        metadata_present = (
+            "_used_by_paths" in result.columns
+            and pid in set(str(v) for v in result["_used_by_paths"].dropna().unique())
+        )
+        reachable = (
+            pa_a in G_final and pb_a in G_final
+            and nx.has_path(G_final, pa_a, pb_a)
+        )
+        if reachable:
+            diag["committed_path_reachable_final_graph"] += 1
+        else:
+            diag["committed_path_unreachable_final_graph"] += 1
+            unreachable_committed += 1
+            if metadata_present:
+                diag["path_metadata_present_but_graph_disconnected"] += 1
+            diag["path_broken_after_postprocess"] += 1
 
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
@@ -1504,6 +1626,9 @@ def route_pa_to_pb(
 
     pa_pb_connected = pr31_stats.get("pa_pb_connected_count", 0) if isinstance(pr31_stats, dict) else 0
     pa_pb_disconnected = pr31_stats.get("pa_pb_disconnected_count", 0) if isinstance(pr31_stats, dict) else 0
+    if unreachable_committed:
+        pa_pb_connected = max(0, pa_pb_connected - unreachable_committed)
+        pa_pb_disconnected += unreachable_committed
     pa_pb_total = pa_pb_connected + pa_pb_disconnected
     pa_pb_ratio = pa_pb_connected / pa_pb_total if pa_pb_total > 0 else 0.0
 
@@ -1563,7 +1688,14 @@ def route_pa_to_pb(
         "[FINAL TOPO QA] sro=%s connected=%d disconnected=%d pa_pb_connected_ratio=%.2f "
         "straight_connectors=%d straight_connector_length_m=%.0f "
         "virtual_delivered=%d ign_cap_hit=%d c0_without_source_geometry=%d "
-        "long_direct_c0_count=%d c0_without_ign_source=%d",
+        "long_direct_c0_count=%d c0_without_ign_source=%d "
+        "pass1_existing_reached=%d pass1_existing_committed=%d pass1_existing_rejected=%d "
+        "pass2_gc_reached=%d pass2_gc_committed=%d pass2_gc_rejected=%d "
+        "pb_unreachable_after_pass1=%d pb_unreachable_after_pass2=%d "
+        "path_rejected_missing_anchor=%d path_lost_between_routing_and_final_graph=%d "
+        "path_broken_after_postprocess=%d committed_path_reachable_final_graph=%d "
+        "committed_path_unreachable_final_graph=%d "
+        "path_metadata_present_but_graph_disconnected=%d",
         sro_code_log, pa_pb_connected, pa_pb_disconnected, pa_pb_ratio,
         straight_connector_count, straight_connector_length_m,
         virtual_edges_delivered_count,
@@ -1571,6 +1703,20 @@ def route_pa_to_pb(
         c0_without_source_geom,
         long_direct_c0_count,
         c0_without_ign_source,
+        diag["pass1_existing_reached"],
+        diag["pass1_existing_committed"],
+        diag["pass1_existing_rejected"],
+        diag["pass2_gc_reached"],
+        diag["pass2_gc_committed"],
+        diag["pass2_gc_rejected"],
+        diag["pb_unreachable_after_pass1"],
+        diag["pb_unreachable_after_pass2"],
+        diag["path_rejected_missing_anchor"],
+        diag["path_lost_between_routing_and_final_graph"],
+        diag["path_broken_after_postprocess"],
+        diag["committed_path_reachable_final_graph"],
+        diag["committed_path_unreachable_final_graph"],
+        diag["path_metadata_present_but_graph_disconnected"],
     )
 
     # PR #37 — strip the internal ``_c0_source`` provenance column
