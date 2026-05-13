@@ -570,10 +570,16 @@ def _add_gc_neuf_to_graph(
             "geometry": gc_geom
             if not gc_geom.is_empty
             else LineString([(pk_a[0], pk_a[1]), (pk_b[0], pk_b[1])]),
-            # PR #33: gc_neuf edges are VIRTUAL — routable but NOT delivered
-            "virtual": True,
-            "deliverable": False,
-            "virtual_reason": "gc_neuf_c0",
+            # PR #36: gc_neuf injected from ``pb_fictif`` represents REAL
+            # planned GC neuf segments that already follow the public
+            # domain (validated above by ``public_area_safe.covers``).
+            # They are legitimate livrable infra, not virtual routing
+            # helpers — keeping them virtual (PR #33's blanket rule)
+            # caused PR #35 to reject every PA→PB path that needed any
+            # gc_neuf, leaving SROs with no delivered infra on the field
+            # test. They are now delivered like any other public C0 row.
+            "virtual": False,
+            "deliverable": True,
         }
         for col in ("sro_code", "pa_id", "pb_id"):
             if col in gc_neuf.columns:
@@ -633,11 +639,22 @@ def _bridge_components_with_gc_neuf(
         (pb_node[0], pb_node[1]),
     ])
 
-    # PR #33: micro bridge accepted but VIRTUAL (not delivered).
-    # PR #34 amend (Bloqueur 1): this edge is added AFTER the prepare_weights
-    # loop, so we must set ``_routing_weight`` here ourselves. Otherwise
-    # NetworkX falls back to its default behaviour (None / implicit weight)
-    # which can bias Dijkstra paths through this virtual bridge.
+    # PR #36 — micro bridge can be DELIVERED when it stays inside the
+    # public domain (Pierre's brief: "GC neuf seulement en dernier recours
+    # … doit suivre la voirie publique"). A ≤3 m bridge across two welded
+    # components in public area is the same as a small terminal connector:
+    # short, justified, follows public domain — it counts as legitimate
+    # GC neuf, not a virtual routing trick. If the bridge would cross
+    # private land or no public_area was provided, fall back to the PR #33
+    # virtual-only behaviour so Dijkstra still finds connectivity but the
+    # edge will be filtered out at delivery time.
+    bridge_is_public = False
+    if public_area is not _SENTINEL:
+        if public_area_safe is None:
+            public_area_safe = _public_area_safe(public_area)
+        if public_area_safe is not None and public_area_safe.covers(bridge_geom):
+            bridge_is_public = True
+
     bridge_attrs = {
         "length": direct_length,
         "type": "gc_neuf",
@@ -646,17 +663,28 @@ def _bridge_components_with_gc_neuf(
         "src": "gc_neuf",
         "infra_type": "gc_neuf",
         "geometry": bridge_geom,
-        "virtual": True,
-        "deliverable": False,
-        "virtual_reason": "micro_bridge",
     }
+    if bridge_is_public:
+        bridge_attrs["virtual"] = False
+        bridge_attrs["deliverable"] = True
+    else:
+        bridge_attrs["virtual"] = True
+        bridge_attrs["deliverable"] = False
+        bridge_attrs["virtual_reason"] = "micro_bridge"
     bridge_attrs["_routing_weight"] = _routing_weight_for(bridge_attrs)
+    # PR #36 — keep the _can_deliver hint in sync so the path-walk in
+    # ``route_pa_to_pb`` does not need to re-derive it for late-added
+    # bridges (they are inserted AFTER the prepare-weights loop).
+    bridge_attrs["_can_deliver"] = bridge_is_public
     G.add_edge(pa_node, pb_node, **bridge_attrs)
     if flag_collector is not None:
         flag_collector.add(
-            "MICRO_BRIDGE_CREATED_VIRTUAL",
+            "MICRO_BRIDGE_CREATED" if bridge_is_public else "MICRO_BRIDGE_CREATED_VIRTUAL",
             target_url=f"PA=({pa_node[0]:.0f},{pa_node[1]:.0f}) PB=({pb_node[0]:.0f},{pb_node[1]:.0f})",
-            message=f"Micro bridge virtuel cree, length={direct_length:.1f}m (non livre)",
+            message=(
+                f"Micro bridge {'C0 livré' if bridge_is_public else 'virtuel'} "
+                f"créé, length={direct_length:.1f}m"
+            ),
         )
     return True
 
@@ -778,12 +806,50 @@ def route_pa_to_pb(
     )
     perf["snap_endpoints_to_lines"] = time.perf_counter() - t0
 
-    # PR #29 A1: hierarchical routing weights — prefer existing infra over
-    # gc_neuf, and gc_neuf over IGN routes. The factors are documented
-    # at module top (WEIGHT_FACTOR_*).
+    # PR #29 A1 + PR #36 — hierarchical routing weights AND per-edge
+    # deliverability flag baked in. Dijkstra runs on the FULL graph but
+    # non-deliverable edges carry an additive penalty large enough that
+    # the algorithm will only ever route through one when no deliverable
+    # alternative exists. The path walk later checks ``_can_deliver`` to
+    # decide whether to commit or to flag the PB as disconnected — but
+    # because the weight is already steering Dijkstra to deliverable
+    # alternatives, those flags only fire when the geometry truly does
+    # not allow a clean PA→PB livraison.
+    #
+    # Deliverability rules (PR #36):
+    #   - virtual=True  or deliverable=False → non-deliverable
+    #   - IGN edge longer than IGN_DELIVERY_MAX_LENGTH_M → non-deliverable
+    #   - IGN edge whose geometry leaves ``delivery_public_area_safe`` →
+    #     non-deliverable (private IGN must not leak into livrable_infra)
+    # The cumulative IGN cap (MAX_IGN_DELIVERED_PER_SRO_M) is intentionally
+    # NOT a deliverability blocker anymore. PR #35 made it a hard blocker
+    # which turned full SROs into infra=0 livrables; PR #36 demotes it to
+    # a telemetry warning so paths stay continuous, while Pierre still
+    # sees ``ign_cap_hit`` rise in [FINAL TOPO QA] when an SRO over-uses
+    # IGN-derived C0.
     t0 = time.perf_counter()
+    HIGH_WEIGHT_PENALTY = 1e9
     for u, v, data in G.edges(data=True):
-        data["_routing_weight"] = _routing_weight_for(data)
+        base_w = _routing_weight_for(data)
+        is_deliverable = True
+        if data.get("virtual") or not data.get("deliverable", True):
+            is_deliverable = False
+        raw_type = data.get("type")
+        raw_length = float(data.get("length", 0.0))
+        if raw_type == "ign_route":
+            if raw_length > IGN_DELIVERY_MAX_LENGTH_M:
+                is_deliverable = False
+            elif delivery_public_area_safe is not None:
+                stored = data.get("geometry")
+                if (
+                    stored is not None
+                    and isinstance(stored, LineString)
+                    and not stored.is_empty
+                    and not delivery_public_area_safe.covers(stored)
+                ):
+                    is_deliverable = False
+        data["_can_deliver"] = is_deliverable
+        data["_routing_weight"] = base_w if is_deliverable else base_w + HIGH_WEIGHT_PENALTY
     perf["prepare_weights"] = time.perf_counter() - t0
 
     # Spec C (PR #22): diagnostic on connected components
@@ -977,22 +1043,27 @@ def route_pa_to_pb(
                         )
                     continue
 
-            # ── PR #34 amend (v3) — PATH-LEVEL deliverability validation.
+            # ── PR #36 — DELIVERABILITY-AWARE Dijkstra path walk.
             #
-            # Previous behaviour: walk the path edge-by-edge, and for each
-            # non-deliverable edge (virtual=True, IGN over per-edge or
-            # cumulative cap, IGN outside public domain) silently ``continue``
-            # — but commit the other edges of the same PA→PB. The output
-            # ended up structurally discontinuous: the routing log saw the
-            # PA→PB as connected (a Dijkstra path existed), yet the livrable
-            # had visible holes where blocked edges had been dropped.
+            # PR #35 ran Dijkstra on the permissive graph and then rejected
+            # any PA→PB whose chosen path contained a single non-deliverable
+            # edge. On the field test this killed full SROs: gc_neuf
+            # injected by ``pb_fictif`` was flagged virtual, micro-bridges
+            # were flagged virtual, the cumulative IGN cap blocked legit
+            # long-IGN paths — and Pierre ended up with infra=0 livrables.
             #
-            # New rule (brief Notion 2026-05): the delivered graph MUST equal
-            # the routed graph for a given PA→PB pair. If any edge along the
-            # path is not deliverable, the WHOLE PB path is rejected — no
-            # partial geometry is emitted — and the pair is flagged as
-            # disconnected. This trades raw connectivity for honest livrables
-            # without straight-line patches.
+            # PR #36 instead steers Dijkstra: non-deliverable edges already
+            # carry a huge ``_routing_weight`` penalty (see prepare_weights
+            # above), so the algorithm naturally picks a fully-deliverable
+            # alternative whenever one exists. The only case where the
+            # returned path still contains a non-deliverable edge is when
+            # there is *no* deliverable alternative at all — and that is
+            # the situation we honestly flag here.
+            #
+            # The cumulative IGN cap (MAX_IGN_DELIVERED_PER_SRO_M) is no
+            # longer a blocker: it's a soft warning surfaced in
+            # [FINAL TOPO QA] via ``ign_cap_hit`` so Pierre still sees when
+            # an SRO uses more IGN-derived C0 than the budget suggests.
             proposed_edges: list[tuple] = []
             path_ign_delivered_pending_m = 0.0
             path_deliverable = True
@@ -1002,21 +1073,21 @@ def route_pa_to_pb(
                 u, v = path[i], path[i + 1]
                 edge_data = G.get_edge_data(u, v)
                 if edge_data is None:
-                    # Should not happen for a Dijkstra path — be defensive.
                     path_deliverable = False
                     path_rejection_reason = "missing_edge_data"
                     break
 
-                # ── Virtual / explicitly-non-deliverable edges abort the path.
-                # PR #33 introduced these to keep Dijkstra connectivity (gc_neuf
-                # injected, endpoint→line micro-snap, component bridges) without
-                # delivering them. If any sit on the chosen path, the PA→PB is
-                # only routable through a virtual hop and therefore cannot be
-                # delivered as a continuous chain of real infra.
-                if edge_data.get("virtual") or not edge_data.get("deliverable", True):
+                if not edge_data.get("_can_deliver", True):
+                    # Dijkstra had to traverse a non-deliverable edge — no
+                    # deliverable alternative exists. Drop the PB cleanly.
                     virtual_edges_blocked_count += 1
                     path_deliverable = False
-                    path_rejection_reason = "virtual_edge_in_path"
+                    if edge_data.get("virtual"):
+                        path_rejection_reason = "virtual_edge_no_alternative"
+                    elif edge_data.get("type") == "ign_route":
+                        path_rejection_reason = "ign_non_deliverable_no_alternative"
+                    else:
+                        path_rejection_reason = "non_deliverable_no_alternative"
                     break
 
                 raw_src = edge_data.get("src", edge_data.get("type", ""))
@@ -1036,52 +1107,9 @@ def route_pa_to_pb(
                     out_geom = LineString([(u[0], u[1]), (v[0], v[1])])
                     geom_is_real = False
 
-                # ── IGN-as-C0 path-level gate (PR #30 + PR #34 amend v3).
-                # Per-edge checks (length, public area) AND the SRO-wide
-                # cumulative cap must ALL pass for the path to be eligible.
-                # The cap considers already-committed deliveries plus what
-                # this path would add — so paths that would push past the
-                # budget are dropped before any of their IGN edges leak in.
+                # Track cumulative IGN-derived C0 length so the soft-cap
+                # warning fires honestly at the end of the SRO.
                 if raw_type == "ign_route" and raw_infra != "gc_neuf":
-                    is_short = raw_length <= IGN_DELIVERY_MAX_LENGTH_M
-                    if delivery_public_area_safe is not None:
-                        is_in_public = delivery_public_area_safe.covers(out_geom)
-                    else:
-                        is_in_public = True
-                    within_budget = (
-                        ign_route_delivered_as_gc_m
-                        + path_ign_delivered_pending_m
-                        + raw_length
-                        <= MAX_IGN_DELIVERED_PER_SRO_M
-                    )
-
-                    if not (is_short and is_in_public and within_budget):
-                        ign_route_blocked_m += raw_length
-                        ign_route_blocked_count += 1
-                        if is_short and is_in_public and not within_budget:
-                            ign_cap_hit_count += 1
-                            path_rejection_reason = "ign_cap_exceeded"
-                        elif not is_short:
-                            path_rejection_reason = "ign_segment_too_long"
-                        else:
-                            path_rejection_reason = "ign_outside_public"
-                        if (
-                            not _ign_blocked_flag_added
-                            and flag_collector is not None
-                        ):
-                            flag_collector.add(
-                                "IGN_ROUTE_BLOCKED",
-                                target_url=sro_code_log,
-                                message=(
-                                    "Tronçon IGN routé non livré (trop long, "
-                                    "hors domaine public strict ou budget "
-                                    "cumulatif dépassé)"
-                                ),
-                            )
-                            _ign_blocked_flag_added = True
-                        path_deliverable = False
-                        break
-
                     path_ign_delivered_pending_m += raw_length
 
                 proposed_edges.append(
@@ -1095,14 +1123,32 @@ def route_pa_to_pb(
                         "PA_PB_PATH_NON_DELIVERABLE",
                         target_url=f"{pa_id}->{pb_id}",
                         message=(
-                            f"Chemin Dijkstra {pa_id}->{pb_id} non livrable "
-                            f"({path_rejection_reason}). PB compté comme "
-                            "déconnecté pour livrable_infra."
+                            f"Aucun chemin livrable entre {pa_id} et {pb_id} "
+                            f"({path_rejection_reason})."
                         ),
                     )
-                # PA→PB stays out of edges_out entirely; pr31_stats will
-                # later see no delivered path between this PA and PB.
                 continue
+
+            # PR #36 — cumulative IGN soft-cap warning (no longer blocks).
+            if (
+                ign_route_delivered_as_gc_m + path_ign_delivered_pending_m
+                > MAX_IGN_DELIVERED_PER_SRO_M
+                and path_ign_delivered_pending_m > 0
+            ):
+                ign_cap_hit_count += 1
+                if (
+                    not _ign_blocked_flag_added
+                    and flag_collector is not None
+                ):
+                    flag_collector.add(
+                        "IGN_DELIVERED_BUDGET_EXCEEDED",
+                        target_url=sro_code_log,
+                        message=(
+                            f"IGN-as-C0 cumulé > {MAX_IGN_DELIVERED_PER_SRO_M:.0f}m "
+                            "sur ce SRO (livré en continuité — alerte budget)."
+                        ),
+                    )
+                    _ign_blocked_flag_added = True
 
             # ── Commit path atomically ───────────────────────────────────
             for (u, v, edge_data, raw_src, raw_type, raw_infra,
