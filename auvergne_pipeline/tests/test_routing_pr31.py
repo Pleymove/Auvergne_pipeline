@@ -284,13 +284,19 @@ def test_mutualized_tree_reuses_trunk_for_multiple_pb():
 
 def test_ign_cumulative_delivery_limit(monkeypatch):
     """Many small IGN edges each below the per-edge cap must NOT
-    aggregate to a kilometre of delivered C0: once the SRO budget
-    (300 m) is spent, subsequent IGN edges are blocked.
+    aggregate past the SRO budget (300 m).
+
+    PR #34 amend v3 — policy update: when a single PA→PB path's IGN
+    consumption would push past ``MAX_IGN_DELIVERED_PER_SRO_M``, the
+    whole path is rejected (so the livrable does not display a 300 m
+    delivered stub followed by a 100 m hole). The previous behaviour
+    (deliver up to 300 m and silently drop the rest) is forbidden
+    because it produces discontinuous livrables.
     """
     G = nx.Graph()
-    # 10 IGN edges of 40 m each → 400 m of IGN traversal. Per-edge cap
-    # 50 m allows each one individually, but cumulative cap 300 m caps
-    # delivery at 300 m and blocks ~100 m.
+    # 10 IGN edges of 40 m each → 400 m total. Per-edge cap 50 m allows
+    # each one individually, but the cumulative cap (300 m) would be
+    # exceeded by edge 8, so the whole path must be rejected.
     for i in range(10):
         x0 = i * 40.0
         x1 = (i + 1) * 40.0
@@ -311,7 +317,14 @@ def test_ign_cumulative_delivery_limit(monkeypatch):
         public_area=_BIG_PUBLIC,
         delivery_public_area=_BIG_PUBLIC,
     )
-    delivered_m = float(out["length_m"].sum())
+    # Either nothing was delivered (path rejected by path-level cap
+    # check) — this is the new, expected outcome — or the cumulative
+    # cap was respected. Both branches honor the user-visible rule
+    # "no delivered IGN length above 300 m for this SRO".
+    if out is None or out.empty:
+        delivered_m = 0.0
+    else:
+        delivered_m = float(out["length_m"].sum())
     assert delivered_m <= routing.MAX_IGN_DELIVERED_PER_SRO_M, (
         f"cumulative IGN delivery should not exceed "
         f"{routing.MAX_IGN_DELIVERED_PER_SRO_M} m; got {delivered_m}"

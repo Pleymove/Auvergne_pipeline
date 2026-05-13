@@ -251,30 +251,32 @@ def test_existing_endpoint_to_existing_line_visual_touch():
     routing._snap_endpoints_to_lines(
         G, snap_radius_m=3.0, public_area=public_area,
     )
-    # Find the connector edge (5.0, 1.0)-(<projection>).
-    connectors = [
+    # PR #34 amend v3: the dangling endpoint is RELOCATED onto the
+    # projection instead of being linked by a virtual gc_neuf connector.
+    # No new gc_neuf edge should exist; the previously-dangling stub's
+    # geometry now terminates at the projection on the existing line,
+    # so the livrable stays visually connected without any visible C0.
+    gc_edges = [
         (u, v, d) for u, v, d in G.edges(data=True)
-        if d.get("type") == "gc_neuf" and ((5.0, 1.0) in (u, v))
+        if d.get("type") == "gc_neuf"
     ]
-    assert connectors, "expected a gc_neuf connector from the dangling endpoint"
-    u, v, data = connectors[0]
-    connector_geom = data["geometry"]
-    # The other end of the connector is the projection point onto the line.
-    other = v if u == (5.0, 1.0) else u
-    # That other end MUST be one of the line's vertices in G after the
-    # split: i.e. an edge containing this point exists with type=="infra".
-    touching_infra = any(
-        d.get("type") == "infra" and other in (eu, ev)
-        for eu, ev, d in G.edges(data=True)
+    assert not gc_edges, (
+        "PR #34 v3: no gc_neuf connector should be created — "
+        f"got {gc_edges}"
     )
-    assert touching_infra, (
-        "connector endpoint must touch an existing infra sub-edge"
-    )
-    # And the connector geometry must actually share a coordinate with
-    # the projection point (visual touch).
-    assert (
-        connector_geom.coords[0] == (5.0, 1.0)
-        or connector_geom.coords[-1] == (5.0, 1.0)
+    # The original dangling endpoint must have been removed.
+    assert (5.0, 1.0) not in G or G.degree((5.0, 1.0)) == 0
+    # The relocated stub edge must terminate at the projection point
+    # (i.e. one of its endpoints lies on the existing line).
+    relocated = [
+        (u, v, d) for u, v, d in G.edges(data=True)
+        if (5.5, 1.5) in (u, v)
+    ]
+    assert relocated, "expected the relocated stub edge to remain"
+    other_ends = [u if v == (5.5, 1.5) else v for u, v, _ in relocated]
+    # The projection of (5, 1) onto the line is (5, 0).
+    assert any(abs(e[0] - 5.0) < 0.1 and abs(e[1]) < 0.1 for e in other_ends), (
+        f"relocated edge must terminate near (5, 0), got {other_ends}"
     )
 
 
