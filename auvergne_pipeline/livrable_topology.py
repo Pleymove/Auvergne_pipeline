@@ -329,6 +329,15 @@ def _ensure_terminals_connected(
         "pb_connected": 0,
         "terminal_connectors_added": 0,
         "terminal_snap_failed": 0,
+        "pa_anchor_success": 0,
+        "pa_anchor_failed": 0,
+        "pb_anchor_success": 0,
+        "pb_anchor_failed": 0,
+        "pa_anchor_failed_too_far": 0,
+        "pa_anchor_failed_private": 0,
+        "pb_anchor_failed_too_far": 0,
+        "pb_anchor_failed_private": 0,
+        "terminal_anchor_edges_added": 0,
         "c0_rejected_too_long": 0,
         "terminals_connected_via_existing": 0,
     }
@@ -379,6 +388,8 @@ def _ensure_terminals_connected(
 
         if best_idx is None:
             stats["terminal_snap_failed"] += 1
+            stats[f"{label}_anchor_failed"] += 1
+            stats[f"{label}_anchor_failed_too_far"] += 1
             if flag_collector is not None:
                 flag_collector.add(
                     flag_key, target_url=target_url,
@@ -392,6 +403,7 @@ def _ensure_terminals_connected(
         split = _split_line_at_distance(target_geom, best_proj_dist)
         if split is None:
             stats["terminal_snap_failed"] += 1
+            stats[f"{label}_anchor_failed"] += 1
             return
         seg_a, seg_b = split
 
@@ -421,6 +433,7 @@ def _ensure_terminals_connected(
                 stats["pa_connected"] += 1
             else:
                 stats["pb_connected"] += 1
+            stats[f"{label}_anchor_success"] += 1
             return
 
         if d_to_proj <= 0.2:
@@ -429,6 +442,7 @@ def _ensure_terminals_connected(
                 stats["pa_connected"] += 1
             else:
                 stats["pb_connected"] += 1
+            stats[f"{label}_anchor_success"] += 1
             return
 
         # PR #36 — add a short, public C0 connector from terminal to
@@ -437,6 +451,8 @@ def _ensure_terminals_connected(
         # row; otherwise the terminal stays unconnected and is flagged.
         if d_to_proj > TERMINAL_CONNECTOR_MAX_LENGTH_M:
             stats["terminal_snap_failed"] += 1
+            stats[f"{label}_anchor_failed"] += 1
+            stats[f"{label}_anchor_failed_too_far"] += 1
             if flag_collector is not None:
                 flag_collector.add(
                     flag_key, target_url=target_url,
@@ -458,6 +474,8 @@ def _ensure_terminals_connected(
             and not delivery_public_area_safe.covers(connector_geom)
         ):
             stats["terminal_snap_failed"] += 1
+            stats[f"{label}_anchor_failed"] += 1
+            stats[f"{label}_anchor_failed_private"] += 1
             if flag_collector is not None:
                 flag_collector.add(
                     flag_key, target_url=target_url,
@@ -475,9 +493,15 @@ def _ensure_terminals_connected(
         connector_row["statut"] = ""
         connector_row["mode_pose"] = "C0"
         connector_row["src"] = "gc_neuf"
-        connector_row["infra_type"] = "gc_neuf"
+        connector_row["infra_type"] = "terminal_connector"
         connector_row["length_m"] = float(connector_geom.length)
         connector_row["geometry"] = connector_geom
+        connector_row["_terminal_anchor"] = True
+        connector_row["_terminal_type"] = label.upper()
+        connector_row["_terminal_id"] = target_url
+        connector_row["deliverable"] = True
+        connector_row["virtual"] = False
+        connector_row["_can_deliver"] = True
         # PR #37 — tag provenance so the [FINAL TOPO QA] strict audit
         # recognises this as a legitimate short terminal connector and
         # does NOT report it as ``c0_without_ign_source``.
@@ -485,10 +509,12 @@ def _ensure_terminals_connected(
         rows.append(connector_row)
 
         stats["terminal_connectors_added"] += 1
+        stats["terminal_anchor_edges_added"] += 1
         if label == "pa":
             stats["pa_connected"] += 1
         else:
             stats["pb_connected"] += 1
+        stats[f"{label}_anchor_success"] += 1
         return
 
     if pa_sro is not None and not pa_sro.empty:
@@ -1654,13 +1680,19 @@ def _log_pr31_block(sro_code: str, s: dict) -> None:
     log.info(
         "[SNAP QA] sro=%s pa_connected=%d pb_connected=%d "
         "terminal_connectors_added=%d terminal_snap_failed=%d "
-        "t_junction_splits=%d",
+        "t_junction_splits=%d pa_anchor_success=%d pa_anchor_failed=%d "
+        "pb_anchor_success=%d pb_anchor_failed=%d terminal_anchor_edges_added=%d",
         sro_code,
         s.get("pa_connected", 0),
         s.get("pb_connected", 0),
         s.get("terminal_connectors_added", 0),
         s.get("terminal_snap_failed", 0),
         s.get("t_junction_splits", 0),
+        s.get("pa_anchor_success", 0),
+        s.get("pa_anchor_failed", 0),
+        s.get("pb_anchor_success", 0),
+        s.get("pb_anchor_failed", 0),
+        s.get("terminal_anchor_edges_added", 0),
     )
     log.info(
         "[DEDUP QA] sro=%s exact_duplicates_removed=%d near_duplicates_removed=%d "
