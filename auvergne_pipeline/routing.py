@@ -977,157 +977,206 @@ def route_pa_to_pb(
                         )
                     continue
 
-            # Collect edges along the path (PR #26: use stored geometry, fix attribs)
+            # ── PR #34 amend (v3) — PATH-LEVEL deliverability validation.
+            #
+            # Previous behaviour: walk the path edge-by-edge, and for each
+            # non-deliverable edge (virtual=True, IGN over per-edge or
+            # cumulative cap, IGN outside public domain) silently ``continue``
+            # — but commit the other edges of the same PA→PB. The output
+            # ended up structurally discontinuous: the routing log saw the
+            # PA→PB as connected (a Dijkstra path existed), yet the livrable
+            # had visible holes where blocked edges had been dropped.
+            #
+            # New rule (brief Notion 2026-05): the delivered graph MUST equal
+            # the routed graph for a given PA→PB pair. If any edge along the
+            # path is not deliverable, the WHOLE PB path is rejected — no
+            # partial geometry is emitted — and the pair is flagged as
+            # disconnected. This trades raw connectivity for honest livrables
+            # without straight-line patches.
+            proposed_edges: list[tuple] = []
+            path_ign_delivered_pending_m = 0.0
+            path_deliverable = True
+            path_rejection_reason: str | None = None
+
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 edge_data = G.get_edge_data(u, v)
                 if edge_data is None:
-                    continue
+                    # Should not happen for a Dijkstra path — be defensive.
+                    path_deliverable = False
+                    path_rejection_reason = "missing_edge_data"
+                    break
 
-                # PR #33: VIRTUAL edges are NEVER delivered to livrable_infra.
-                # They exist purely for Dijkstra connectivity (micro-snaps,
-                # component bridges, gc_neuf injected into graph).
+                # ── Virtual / explicitly-non-deliverable edges abort the path.
+                # PR #33 introduced these to keep Dijkstra connectivity (gc_neuf
+                # injected, endpoint→line micro-snap, component bridges) without
+                # delivering them. If any sit on the chosen path, the PA→PB is
+                # only routable through a virtual hop and therefore cannot be
+                # delivered as a continuous chain of real infra.
                 if edge_data.get("virtual") or not edge_data.get("deliverable", True):
                     virtual_edges_blocked_count += 1
-                    continue
+                    path_deliverable = False
+                    path_rejection_reason = "virtual_edge_in_path"
+                    break
+
+                raw_src = edge_data.get("src", edge_data.get("type", ""))
+                raw_type = edge_data.get("type", "")
+                raw_infra = edge_data.get("infra_type", "")
+                raw_length = float(edge_data.get("length", 0.0))
+
+                stored_geom = edge_data.get("geometry")
+                if (
+                    stored_geom is not None
+                    and isinstance(stored_geom, LineString)
+                    and not stored_geom.is_empty
+                ):
+                    out_geom = stored_geom
+                    geom_is_real = True
+                else:
+                    out_geom = LineString([(u[0], u[1]), (v[0], v[1])])
+                    geom_is_real = False
+
+                # ── IGN-as-C0 path-level gate (PR #30 + PR #34 amend v3).
+                # Per-edge checks (length, public area) AND the SRO-wide
+                # cumulative cap must ALL pass for the path to be eligible.
+                # The cap considers already-committed deliveries plus what
+                # this path would add — so paths that would push past the
+                # budget are dropped before any of their IGN edges leak in.
+                if raw_type == "ign_route" and raw_infra != "gc_neuf":
+                    is_short = raw_length <= IGN_DELIVERY_MAX_LENGTH_M
+                    if delivery_public_area_safe is not None:
+                        is_in_public = delivery_public_area_safe.covers(out_geom)
+                    else:
+                        is_in_public = True
+                    within_budget = (
+                        ign_route_delivered_as_gc_m
+                        + path_ign_delivered_pending_m
+                        + raw_length
+                        <= MAX_IGN_DELIVERED_PER_SRO_M
+                    )
+
+                    if not (is_short and is_in_public and within_budget):
+                        ign_route_blocked_m += raw_length
+                        ign_route_blocked_count += 1
+                        if is_short and is_in_public and not within_budget:
+                            ign_cap_hit_count += 1
+                            path_rejection_reason = "ign_cap_exceeded"
+                        elif not is_short:
+                            path_rejection_reason = "ign_segment_too_long"
+                        else:
+                            path_rejection_reason = "ign_outside_public"
+                        if (
+                            not _ign_blocked_flag_added
+                            and flag_collector is not None
+                        ):
+                            flag_collector.add(
+                                "IGN_ROUTE_BLOCKED",
+                                target_url=sro_code_log,
+                                message=(
+                                    "Tronçon IGN routé non livré (trop long, "
+                                    "hors domaine public strict ou budget "
+                                    "cumulatif dépassé)"
+                                ),
+                            )
+                            _ign_blocked_flag_added = True
+                        path_deliverable = False
+                        break
+
+                    path_ign_delivered_pending_m += raw_length
+
+                proposed_edges.append(
+                    (u, v, edge_data, raw_src, raw_type, raw_infra,
+                     raw_length, out_geom, geom_is_real)
+                )
+
+            if not path_deliverable:
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "PA_PB_PATH_NON_DELIVERABLE",
+                        target_url=f"{pa_id}->{pb_id}",
+                        message=(
+                            f"Chemin Dijkstra {pa_id}->{pb_id} non livrable "
+                            f"({path_rejection_reason}). PB compté comme "
+                            "déconnecté pour livrable_infra."
+                        ),
+                    )
+                # PA→PB stays out of edges_out entirely; pr31_stats will
+                # later see no delivered path between this PA and PB.
+                continue
+
+            # ── Commit path atomically ───────────────────────────────────
+            for (u, v, edge_data, raw_src, raw_type, raw_infra,
+                 raw_length, out_geom, geom_is_real) in proposed_edges:
+                # PR #29 amend — accumulate raw-source telemetry BEFORE
+                # any conversion. ign_route_length_used_m is computed
+                # from raw_type, not from the converted output src.
+                raw_src_norm = (
+                    "gc_neuf" if raw_src == "gc_neuf_runtime" else raw_src
+                ) or raw_type or ""
+                raw_src_lengths[raw_src_norm] = (
+                    raw_src_lengths.get(raw_src_norm, 0.0) + raw_length
+                )
+                raw_src_counts[raw_src_norm] = (
+                    raw_src_counts.get(raw_src_norm, 0) + 1
+                )
+                raw_type_lengths[raw_type or ""] = (
+                    raw_type_lengths.get(raw_type or "", 0.0) + raw_length
+                )
+                if raw_src == "gc_neuf_runtime":
+                    raw_src = "gc_neuf"
+
+                if raw_type == "ign_route" and raw_infra != "gc_neuf":
+                    mode_pose = "C0"
+                    infra_type = "gc_neuf"
+                    src = "gc_neuf"
+                    converted_ign_to_gc_length_m += raw_length
+                    ign_route_delivered_as_gc_m += raw_length
+                elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
+                    mode_pose = "C0"
+                    infra_type = "gc_neuf"
+                    src = "gc_neuf"
+                else:
+                    mode_pose = edge_data.get("mode_pose", "")
+                    infra_type = raw_infra or raw_src or raw_type
+                    src = raw_src or raw_type
+
+                out_statut = edge_data.get("statut")
+                if out_statut is None:
+                    out_statut = ""
 
                 ekey = _edge_key(u, v)
-                if ekey not in edges_out:
-                    # ── Resolve attributes with QML / CDC compliance ──────
-                    raw_src = edge_data.get("src", edge_data.get("type", ""))
-                    raw_type = edge_data.get("type", "")
-                    raw_infra = edge_data.get("infra_type", "")
-                    raw_length = float(edge_data.get("length", 0.0))
+                if ekey in edges_out:
+                    continue
+                edges_out[ekey] = {
+                    "sro": sro,
+                    "pa_id": pa_id,
+                    "pb_id": pb_id,
+                    "statut": out_statut,
+                    "mode_pose": mode_pose,
+                    "infra_type": infra_type,
+                    "src": src,
+                    "length_m": raw_length,
+                    "geometry": out_geom,
+                }
 
-                    # PR #29 amend — accumulate raw-source telemetry BEFORE
-                    # any conversion. ign_route_length_used_m is computed
-                    # from raw_type, not from the converted output src.
-                    raw_src_norm = (
-                        "gc_neuf" if raw_src == "gc_neuf_runtime" else raw_src
-                    ) or raw_type or ""
-                    raw_src_lengths[raw_src_norm] = (
-                        raw_src_lengths.get(raw_src_norm, 0.0) + raw_length
-                    )
-                    raw_src_counts[raw_src_norm] = (
-                        raw_src_counts.get(raw_src_norm, 0) + 1
-                    )
-                    raw_type_lengths[raw_type or ""] = (
-                        raw_type_lengths.get(raw_type or "", 0.0) + raw_length
-                    )
-
-                    # PR #26: gc_neuf_runtime → gc_neuf (must not leak into GPKG)
-                    if raw_src == "gc_neuf_runtime":
-                        raw_src = "gc_neuf"
-
-                    # ── Build out_geom now so the PR #30 delivery gate can
-                    # check the actual edge geometry against the strict
-                    # delivery area. Falls back to the chord between
-                    # welded nodes if no stored geometry exists.
-                    stored_geom = edge_data.get("geometry")
-                    if (
-                        stored_geom is not None
-                        and isinstance(stored_geom, LineString)
-                        and not stored_geom.is_empty
-                    ):
-                        out_geom = stored_geom
-                    else:
-                        out_geom = LineString([(u[0], u[1]), (v[0], v[1])])
-
-                    # PR #30 — IGN-as-C0 delivery gate. IGN edges traversed
-                    # by Dijkstra are delivered ONLY when both:
-                    #   (a) raw_length <= IGN_DELIVERY_MAX_LENGTH_M
-                    #   (b) out_geom fully covered by delivery_public_area
-                    # Otherwise the edge is BLOCKED from delivery (still
-                    # routable, just not visible in livrable_infra).
-                    if raw_type == "ign_route" and raw_infra != "gc_neuf":
-                        is_short = raw_length <= IGN_DELIVERY_MAX_LENGTH_M
-                        if delivery_public_area_safe is not None:
-                            is_in_public = delivery_public_area_safe.covers(out_geom)
-                        else:
-                            # No delivery area provided — fall back to the
-                            # legacy lenient behaviour (deliver) but log
-                            # the conversion so Pierre sees the surface.
-                            is_in_public = True
-
-                        # PR #31 H — cumulative cap: even a short, public
-                        # IGN edge is blocked once the SRO-wide budget
-                        # has been spent. This curbs the "many small
-                        # connectors add up to kilometres" pattern.
-                        within_budget = (
-                            ign_route_delivered_as_gc_m + raw_length
-                            <= MAX_IGN_DELIVERED_PER_SRO_M
-                        )
-
-                        if is_short and is_in_public and within_budget:
-                            mode_pose = "C0"
-                            infra_type = "gc_neuf"
-                            src = "gc_neuf"
-                            converted_ign_to_gc_length_m += raw_length
-                            ign_route_delivered_as_gc_m += raw_length
-                        else:
-                            # Block from delivery: count + flag, skip add.
-                            ign_route_blocked_m += raw_length
-                            ign_route_blocked_count += 1
-                            # PR #34 amend (Bloqueur 2): track cumulative-cap
-                            # hits specifically. A short, public IGN edge
-                            # blocked purely because the SRO budget is
-                            # already spent must surface in [FINAL TOPO QA]
-                            # so the log reflects reality instead of a
-                            # hard-coded zero.
-                            if is_short and is_in_public and not within_budget:
-                                ign_cap_hit_count += 1
-                            if (
-                                not _ign_blocked_flag_added
-                                and flag_collector is not None
-                            ):
-                                flag_collector.add(
-                                    "IGN_ROUTE_BLOCKED",
-                                    target_url=sro_code_log,
-                                    message=(
-                                        "Tronçon IGN routé non livré (trop long, "
-                                        "hors domaine public strict ou budget "
-                                        "cumulatif dépassé)"
-                                    ),
-                                )
-                                _ign_blocked_flag_added = True
-                            continue
-                    elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
-                        mode_pose = "C0"
-                        infra_type = "gc_neuf"
-                        src = "gc_neuf"
-                    else:
-                        mode_pose = edge_data.get("mode_pose", "")
-                        infra_type = raw_infra or raw_src or raw_type
-                        src = raw_src or raw_type
-
-                    # ── Normalize statut: never None in the GPKG (PR #26 amend)
-                    out_statut = edge_data.get("statut")
-                    if out_statut is None:
-                        out_statut = ""
-
-                    edges_out[ekey] = {
-                        "sro": sro,
-                        "pa_id": pa_id,
-                        "pb_id": pb_id,
-                        "statut": out_statut,
-                        "mode_pose": mode_pose,
-                        "infra_type": infra_type,
-                        "src": src,
-                        "length_m": raw_length,
-                        "geometry": out_geom,
-                    }
-
-                    # PR #33 — count straight connectors (2-vertex gc_neuf edges)
-                    # that managed to pass through all filters. This should be 0
-                    # after PR#33, but the counter catches regressions.
-                    if infra_type == "gc_neuf" and out_geom is not None:
-                        try:
-                            n_verts = len(out_geom.coords)
-                            if n_verts == 2:
-                                straight_connector_count += 1
-                                straight_connector_length_m += raw_length
-                        except Exception:
-                            pass
+                # PR #34 amend (v3) — straight_connectors counts ONLY
+                # truly synthetic chord segments: a 2-vertex line emitted
+                # because no real source polyline geometry was available.
+                # A 2-coord IGN polyline segment with a real ``geometry``
+                # attribute is legitimate and must NOT be counted, otherwise
+                # the metric inflates by O(IGN segments) and the livrable
+                # always looks broken even when it isn't.
+                if (
+                    infra_type == "gc_neuf"
+                    and not geom_is_real
+                    and out_geom is not None
+                ):
+                    try:
+                        if len(out_geom.coords) == 2:
+                            straight_connector_count += 1
+                            straight_connector_length_m += raw_length
+                    except Exception:
+                        pass
 
     perf["dijkstra_total"] = time.perf_counter() - t0_dijkstra
 
@@ -1135,6 +1184,20 @@ def route_pa_to_pb(
         # PR #29 B4: log perf even on empty output so a slow empty SRO is visible.
         log.info("[ROUTING PERF] sro=%s step=dijkstra_total seconds=%.2f pa_count=%d pb_count=%d",
                  sro_code_log, perf.get("dijkstra_total", 0.0), pa_count, pb_count)
+        # PR #34 amend v3: emit [FINAL TOPO QA] even when nothing was
+        # delivered, so the cap-hit / straight-connector counters are
+        # always observable in the run logs. An empty livrable is a
+        # legitimate outcome (e.g., all paths rejected for cap) and
+        # should still report its zero-row QA snapshot.
+        log.info(
+            "[FINAL TOPO QA] sro=%s connected=0 disconnected=%d "
+            "pa_pb_connected_ratio=0.00 straight_connectors=%d "
+            "straight_connector_length_m=%.0f virtual_delivered=0 "
+            "ign_cap_hit=%d c0_without_source_geometry=0",
+            sro_code_log, pb_count,
+            straight_connector_count, straight_connector_length_m,
+            ign_cap_hit_count,
+        )
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     result = gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
@@ -1248,6 +1311,13 @@ def route_pa_to_pb(
     )
 
     # ── PR #33 — [FINAL TOPO QA] mandatory log ──────────────────────────
+    # PR #34 amend (v3): count ONLY genuinely degenerate C0 rows (no
+    # geometry at all, empty geometry, or a self-loop). A 2-vertex
+    # LineString is legitimate for a real IGN-derived C0 segment — those
+    # are the natural shape between consecutive polyline vertices — and
+    # must not inflate this counter. The path-level deliverability check
+    # (above) already ensures that no synthesized chord (virtual /
+    # non-deliverable edge) reaches this stage.
     c0_without_source_geom = 0
     if not result.empty:
         c0_mask = result["infra_type"] == "gc_neuf"
@@ -1256,7 +1326,12 @@ def route_pa_to_pb(
             if geom is None or not isinstance(geom, LineString) or geom.is_empty:
                 c0_without_source_geom += 1
                 continue
-            if len(geom.coords) == 2:
+            coords = list(geom.coords)
+            if len(coords) < 2:
+                c0_without_source_geom += 1
+                continue
+            if coords[0] == coords[-1] and len(coords) == 2:
+                # degenerate zero-length self-loop
                 c0_without_source_geom += 1
 
     pa_pb_connected = pr31_stats.get("pa_pb_connected_count", 0) if isinstance(pr31_stats, dict) else 0
@@ -1483,21 +1558,55 @@ def _snap_endpoints_to_lines(
 
         G.add_edge(u, proj_key, length=d1, geometry=seg_a, **extra)
         G.add_edge(proj_key, v, length=d2, geometry=seg_b, **extra)
-        G.add_edge(
-            ep, proj_key,
-            length=ep_dist,
-            type="gc_neuf",
-            statut="",
-            mode_pose="C0",
-            src="gc_neuf",
-            infra_type="gc_neuf",
-            geometry=connector,
-            # PR #33: connectors from endpoint-to-line are VIRTUAL
-            # (routable but NOT delivered as visible C0 segments)
-            virtual=True,
-            deliverable=False,
-            virtual_reason="endpoint_micro_snap",
-        )
+
+        # PR #34 amend v3 — RELOCATE the dangling endpoint into the
+        # projection node instead of adding a virtual perpendicular
+        # connector. Pierre's brief item #5: "PA/PB doivent être
+        # connectés par split/projection sur infra livrée proche, sans
+        # connecteur droit visible." A virtual connector still works for
+        # Dijkstra but fails the new path-level deliverability check,
+        # so the PB ends up reported as disconnected.
+        #
+        # Relocation: rewrite each edge incident on ``ep`` so its
+        # ``ep``-endpoint becomes ``proj_key``. The edge's stored
+        # geometry is patched to match the new endpoint, and the edge's
+        # ``length`` is recomputed from the new coordinates. This
+        # introduces at most a ``snap_radius_m``-wide visual nudge on
+        # the snapped segment near its tip, which is the well-known
+        # trade-off Pierre accepts vs visible straight connectors.
+        if ep != proj_key:
+            for w in list(G.neighbors(ep)):
+                e_data = G.get_edge_data(ep, w)
+                if e_data is None:
+                    continue
+                G.remove_edge(ep, w)
+                new_data = dict(e_data)
+                geom_old = new_data.get("geometry")
+                if (
+                    geom_old is not None
+                    and isinstance(geom_old, LineString)
+                    and not geom_old.is_empty
+                ):
+                    coords_g = [_coord2d(c) for c in geom_old.coords]
+                    if len(coords_g) >= 2:
+                        p_first = _Point(coords_g[0])
+                        p_last = _Point(coords_g[-1])
+                        if p_first.distance(_Point(ep)) <= p_last.distance(_Point(ep)):
+                            coords_g[0] = (float(proj_pt.x), float(proj_pt.y))
+                        else:
+                            coords_g[-1] = (float(proj_pt.x), float(proj_pt.y))
+                        if coords_g[0] != coords_g[-1]:
+                            try:
+                                new_data["geometry"] = LineString(coords_g)
+                            except (ValueError, TypeError):
+                                pass
+                new_data["length"] = _Point(proj_pt.x, proj_pt.y).distance(
+                    _Point(w[0], w[1])
+                )
+                if proj_key != w:
+                    G.add_edge(proj_key, w, **new_data)
+            if G.degree(ep) == 0:
+                G.remove_node(ep)
         n_snapped += 1
         # PR #30 — count as an "existing_connector" only when the snap
         # target was an existing infra line (tier 0). Snaps onto IGN

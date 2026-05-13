@@ -232,13 +232,221 @@ def test_ign_cap_hit_count_increments_when_budget_exceeded(caplog):
 
 
 # ---------------------------------------------------------------------------
+# PR #34 amend v3 — Path-level deliverability validation
+# ---------------------------------------------------------------------------
+
+def test_path_with_virtual_edge_is_rejected_whole_pb(caplog):
+    """PR #34 amend v3: if a Dijkstra path contains any non-deliverable
+    edge (``virtual=True`` / ``deliverable=False`` / IGN over cap), the
+    WHOLE PA→PB path must be rejected. Previously, individual edges were
+    silently dropped, leaving a discontinuous livrable.
+    """
+    import logging
+    from shapely.geometry import Polygon
+
+    # Two short infra segments separated by a 1 m gap → routing inserts
+    # a virtual micro-bridge to connect them. The path PA→PB therefore
+    # passes through a virtual edge, and must be rejected end-to-end.
+    infra = gpd.GeoDataFrame([
+        {"statut": "", "mode_pose": "", "src": "ft",
+         "geometry": LineString([(0.0, 0.0), (5.0, 0.0)]),
+         "sro_code": "SRO1"},
+        {"statut": "", "mode_pose": "", "src": "ft",
+         "geometry": LineString([(6.0, 0.0), (11.0, 0.0)]),
+         "sro_code": "SRO1"},
+    ], geometry="geometry", crs="EPSG:2154")
+
+    pa = _pa(0.0, 0.0, pid="PA1")
+    pb = gpd.GeoDataFrame([{
+        "pb_id": "PB1", "pa_id": "PA1", "id_metier": "PA1", "sro": "SRO1",
+        "geometry": Point(11.0, 0.0),
+    }], geometry="geometry", crs="EPSG:2154")
+
+    public = Polygon([(-5, -5), (20, -5), (20, 5), (-5, 5)])
+
+    flags = _Flags()
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        result = routing.route_pa_to_pb(
+            pa, pb,
+            infra,
+            gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            flag_collector=flags,
+            gc_neuf=gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            public_area=public,
+            delivery_public_area=public,
+        )
+
+    # Path snap may stitch the segments via _snap_endpoints_to_lines /
+    # _snap_endpoints_topology (real, deliverable splits). In that case
+    # the path stays fully deliverable — that is acceptable. The strict
+    # assertion is: NO ``mode_pose=C0 / src=gc_neuf`` row may appear,
+    # because any such row would have come from a virtual edge being
+    # delivered, which is exactly what we want to forbid.
+    if not result.empty:
+        gc_rows = result[
+            (result["mode_pose"] == "C0") & (result["src"] == "gc_neuf")
+        ]
+        assert gc_rows.empty, (
+            "PR #34 v3: virtual / gc_neuf edges must never reach the "
+            f"livrable. Got rows:\n{gc_rows}"
+        )
+
+
+def test_ign_cap_drops_whole_path_not_partial(caplog):
+    """PR #34 amend v3: when a PA→PB path's cumulative IGN length would
+    exceed ``MAX_IGN_DELIVERED_PER_SRO_M``, the WHOLE path is dropped
+    (PA_PB_PATH_NON_DELIVERABLE flag) rather than emitted with a hole
+    where the over-cap edges were silently skipped.
+    """
+    import logging
+    from shapely.geometry import Polygon
+
+    # No existing infra — Dijkstra must use IGN. Long IGN polyline whose
+    # total length is well above the per-SRO cap.
+    infra = gpd.GeoDataFrame(
+        [], columns=["statut", "mode_pose", "src", "geometry", "sro_code"],
+        geometry="geometry", crs="EPSG:2154",
+    )
+    seg_len = 20.0
+    n_segs = 30  # 600 m → twice the 300 m cap
+    ign_geom = LineString([(i * seg_len, 0.0) for i in range(n_segs + 1)])
+    ign = gpd.GeoDataFrame(
+        [{"geometry": ign_geom}], geometry="geometry", crs="EPSG:2154",
+    )
+
+    public = Polygon([
+        (-10.0, -10.0), (n_segs * seg_len + 10.0, -10.0),
+        (n_segs * seg_len + 10.0, 10.0), (-10.0, 10.0),
+    ])
+
+    pa = _pa(0.0, 0.0, pid="PA1")
+    pb = gpd.GeoDataFrame([{
+        "pb_id": "PB1", "pa_id": "PA1", "id_metier": "PA1", "sro": "SRO1",
+        "geometry": Point(n_segs * seg_len, 0.0),
+    }], geometry="geometry", crs="EPSG:2154")
+
+    flags = _Flags()
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        result = routing.route_pa_to_pb(
+            pa, pb, infra, ign,
+            flag_collector=flags,
+            gc_neuf=gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            public_area=public,
+            delivery_public_area=public,
+        )
+
+    # The whole path is rejected, so nothing delivered for this PA→PB
+    # (cap kicks in before the budget worth of edges is committed).
+    assert result.empty, (
+        f"PR #34 v3: an over-cap path must be dropped entirely, got "
+        f"{len(result)} delivered edges:\n{result}"
+    )
+    # And the flag should be present
+    rejection_flags = [
+        f for f in flags.entries
+        if f["type"] == "PA_PB_PATH_NON_DELIVERABLE"
+    ]
+    assert rejection_flags, (
+        "Expected PA_PB_PATH_NON_DELIVERABLE flag when IGN cap aborts "
+        f"the path, got flags: {[f['type'] for f in flags.entries]}"
+    )
+
+    # And the [FINAL TOPO QA] log should reflect: no straight_connectors,
+    # no spurious c0_without_source_geometry inflated by real IGN segments.
+    final_topo_lines = [
+        rec.getMessage() for rec in caplog.records
+        if "[FINAL TOPO QA]" in rec.getMessage()
+    ]
+    assert final_topo_lines
+    qa_line = final_topo_lines[-1]
+    import re
+    sc = re.search(r"straight_connectors=(\d+)", qa_line)
+    assert sc is not None and int(sc.group(1)) == 0, (
+        f"straight_connectors must stay at 0 (no edge delivered): {qa_line}"
+    )
+
+
+def test_real_ign_segments_do_not_inflate_straight_connectors(caplog):
+    """PR #34 amend v3: a fully-deliverable PA→PB path made of multiple
+    real IGN polyline segments (each segment is 2-vertex by nature) must
+    NOT inflate ``straight_connectors`` nor ``c0_without_source_geometry``.
+
+    Previously, every IGN segment converted to gc_neuf C0 was counted as
+    a "straight connector" because it had 2 vertices — turning normal
+    deliveries into apparent regressions. The counters now look at the
+    *origin* of the geometry, not just its vertex count.
+    """
+    import logging
+    from shapely.geometry import Polygon
+
+    infra = gpd.GeoDataFrame(
+        [], columns=["statut", "mode_pose", "src", "geometry", "sro_code"],
+        geometry="geometry", crs="EPSG:2154",
+    )
+    # A short IGN polyline well within the per-SRO cap: 5 × 20 m = 100 m.
+    seg_len = 20.0
+    n_segs = 5
+    ign_geom = LineString([(i * seg_len, 0.0) for i in range(n_segs + 1)])
+    ign = gpd.GeoDataFrame(
+        [{"geometry": ign_geom}], geometry="geometry", crs="EPSG:2154",
+    )
+    public = Polygon([(-10, -10), (200, -10), (200, 10), (-10, 10)])
+
+    pa = _pa(0.0, 0.0, pid="PA1")
+    pb = gpd.GeoDataFrame([{
+        "pb_id": "PB1", "pa_id": "PA1", "id_metier": "PA1", "sro": "SRO1",
+        "geometry": Point(n_segs * seg_len, 0.0),
+    }], geometry="geometry", crs="EPSG:2154")
+
+    flags = _Flags()
+    with caplog.at_level(logging.INFO, logger="auvergne_pipeline.routing"):
+        result = routing.route_pa_to_pb(
+            pa, pb, infra, ign,
+            flag_collector=flags,
+            gc_neuf=gpd.GeoDataFrame(geometry=[], crs="EPSG:2154"),
+            public_area=public,
+            delivery_public_area=public,
+        )
+
+    # Path delivered fully — real IGN segments converted to gc_neuf C0.
+    assert not result.empty, "expected a delivered path of IGN-as-C0 segments"
+    gc_rows = result[result["infra_type"] == "gc_neuf"]
+    assert not gc_rows.empty
+    # Each IGN segment is 2-vertex but has a real source geometry, so the
+    # log must NOT report them as straight_connectors.
+    final_topo_lines = [
+        rec.getMessage() for rec in caplog.records
+        if "[FINAL TOPO QA]" in rec.getMessage()
+    ]
+    assert final_topo_lines
+    qa_line = final_topo_lines[-1]
+    import re
+    sc = re.search(r"straight_connectors=(\d+)", qa_line)
+    assert sc is not None and int(sc.group(1)) == 0, (
+        f"PR #34 v3: real IGN segments must not be counted as "
+        f"straight_connectors, got: {qa_line}"
+    )
+    c0w = re.search(r"c0_without_source_geometry=(\d+)", qa_line)
+    assert c0w is not None and int(c0w.group(1)) == 0, (
+        f"PR #34 v3: real IGN-derived C0 rows have a real source "
+        f"geometry — should not be counted as missing it: {qa_line}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 3. test_endpoint_to_line_split_no_straight_connector
 # ---------------------------------------------------------------------------
 
 def test_endpoint_to_line_split_no_straight_connector():
     """When an endpoint is snapped onto an existing line, the line is split.
-    The connector between the endpoint and the projection must be VIRTUAL
-    (not a visible C0 segment)."""
+
+    PR #34 amend v3: instead of inserting a virtual perpendicular
+    connector between the original endpoint and the projection point
+    (which breaks path-level deliverability), the endpoint is RELOCATED
+    onto the projection node. The incident edge's geometry is patched
+    to terminate at the projection. No new visible nor virtual
+    connector is created, and the dangling endpoint disappears.
+    """
     G = nx.Graph()
     # Existing line from (0,0) to (10,0)
     G.add_edge((0.0, 0.0), (5.0, 0.0),
@@ -263,19 +471,24 @@ def test_endpoint_to_line_split_no_straight_connector():
     assert stats["endpoints_to_lines"] >= 1, "Endpoint should be snapped to line"
     assert stats["endpoints_rejected_private"] == 0
 
-    # Find the connector edge (from endpoint to projection)
-    # The projection of (2,2) onto (0,0)-(5,0) is (2,0), distance = 2m
     proj_key = (2.0, 0.0)
     ep_key = (2.0, 2.0)
 
-    connector_data = G.get_edge_data(ep_key, proj_key)
-    if connector_data is None:
-        # Try reverse
-        connector_data = G.get_edge_data(proj_key, ep_key)
-
-    assert connector_data is not None, "Connector edge should exist"
-    assert connector_data.get("virtual") is True, "Connector must be VIRTUAL"
-    assert connector_data.get("deliverable") is False, "Connector must NOT be deliverable"
+    # No virtual connector edge exists between ep and proj
+    assert G.get_edge_data(ep_key, proj_key) is None and \
+           G.get_edge_data(proj_key, ep_key) is None, (
+        "PR #34 v3: relocation must not leave a virtual ep→proj connector"
+    )
+    # The original endpoint must have been relocated away (no more node at ep)
+    assert ep_key not in G or G.degree(ep_key) == 0
+    # And the incident edge ((2,2)-(2,3)) has been re-anchored on proj_key
+    relocated = G.get_edge_data(proj_key, (2.0, 3.0))
+    assert relocated is not None, (
+        "Incident edge should now connect proj_key to its other endpoint"
+    )
+    # The relocated edge must NOT be marked virtual / non-deliverable.
+    assert not relocated.get("virtual", False)
+    assert relocated.get("deliverable", True) is not False
 
 
 # ---------------------------------------------------------------------------
