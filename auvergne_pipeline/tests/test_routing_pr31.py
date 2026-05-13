@@ -155,9 +155,10 @@ def test_livrable_path_has_no_micro_gap():
 
 def test_line_ending_on_middle_of_line_is_split():
     """A PA placed in the middle of an existing livrable line forces a
-    split + a connector at the projection point — the previously
-    intact (0,0)–(20,0) edge is now two sub-edges sharing the (10,0)
-    node, so the livrable forms a proper topology fork at (10,0).
+    split. PR #37 — after the split, ``_snap_endpoints_to_exact`` may
+    cluster the split point with the (≤0.5 m away) PA terminal
+    endpoint into a slightly-shifted centroid; the test still asserts
+    there is a node near x=10 splitting the original line in two.
     """
     df = _df([_row(geometry=LineString([(0, 0), (20, 0)]))])
     pa = _pa(10.0, 0.5, pid="PA1")
@@ -167,9 +168,12 @@ def test_line_ending_on_middle_of_line_is_split():
         delivery_public_area_safe=_BIG_PUBLIC.buffer(0.01),
     )
     G = lt._build_livrable_topology_graph(out)
-    # The split must have produced a 3-node graph with the (10,0) node.
-    assert any(n[0] == 10.0 and n[1] == 0.0 for n in G.nodes()), (
-        f"expected a vertex at (10, 0) in the topology graph; got {list(G.nodes())}"
+    assert any(
+        abs(n[0] - 10.0) < 0.1 and abs(n[1]) < 1.0
+        for n in G.nodes()
+    ), (
+        f"expected a vertex near (10, 0) in the topology graph; "
+        f"got {list(G.nodes())}"
     )
 
 
