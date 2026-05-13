@@ -1052,6 +1052,15 @@ def route_pa_to_pb(
             G.add_node(tnode)
         if tnode != snapped and not G.has_edge(tnode, snapped):
             g = LineString([(tnode[0], tnode[1]), (snapped[0], snapped[1])])
+            # PR38 hard gate: terminal connectors are deliverable only when
+            # short and public. Prevent long straight visible C0 chords.
+            if float(g.length) > MAX_STRAIGHT_CONNECTOR_M:
+                return None
+            if (
+                delivery_public_area_safe is not None
+                and not delivery_public_area_safe.covers(g)
+            ):
+                return None
             G.add_edge(
                 tnode, snapped,
                 length=float(g.length),
@@ -1610,7 +1619,7 @@ def route_pa_to_pb(
     # non-deliverable edge) reaches this stage.
     c0_without_source_geom = 0
     if not result.empty:
-        c0_mask = result["infra_type"] == "gc_neuf"
+        c0_mask = result["mode_pose"] == "C0"
         for idx in result.index[c0_mask]:
             geom = result.loc[idx, "geometry"]
             if geom is None or not isinstance(geom, LineString) or geom.is_empty:
@@ -1662,14 +1671,19 @@ def route_pa_to_pb(
     long_direct_c0_count = 0
     c0_without_ign_source = 0
     if not result.empty:
-        c0_mask = result["infra_type"] == "gc_neuf"
+        c0_mask = result["mode_pose"] == "C0"
         for idx in result.index[c0_mask]:
             length_m = float(result.loc[idx, "length_m"] or 0.0)
+            infra_kind = str(result.loc[idx, "infra_type"] or "")
             src_tag = (
                 result.loc[idx, "_c0_source"]
                 if "_c0_source" in result.columns
                 else None
             )
+            if infra_kind == "terminal_connector" and length_m > MAX_STRAIGHT_CONNECTOR_M:
+                long_direct_c0_count += 1
+                c0_without_ign_source += 1
+                continue
             # Terminal connectors (inserted by livrable_topology) are
             # short (<= 3 m) and tagged ``terminal``. Untagged rows of
             # the same length are tolerated for backwards compatibility.
