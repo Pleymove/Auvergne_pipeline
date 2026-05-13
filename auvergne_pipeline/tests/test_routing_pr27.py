@@ -323,7 +323,13 @@ def test_add_gc_neuf_accepted_in_public():
 
 
 def test_endpoint_snaps_to_line():
-    """PR #28 BLOQUANT 4: degree-1 endpoint near a line splits it and connects."""
+    """PR #28 BLOQUANT 4: degree-1 endpoint near a line splits it and connects.
+
+    PR #34 amend v3: the dangling endpoint is now RELOCATED into the
+    projection node instead of being linked by a virtual perpendicular
+    connector. Connectivity check is still the canonical assertion;
+    the location of the old endpoint coords is no longer guaranteed.
+    """
     G = nx.Graph()
     # Line from (0,0) to (20,0)
     G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
@@ -335,8 +341,8 @@ def test_endpoint_snaps_to_line():
 
     routing._snap_endpoints_to_lines(G, snap_radius_m=3.0)
 
-    # The edge should have been split, and endpoint connected
-    assert G.degree((10.0, 1.0)) >= 1  # now connected
+    # The original endpoint may have been relocated and removed; what
+    # matters is that the graph is now one connected component.
     assert nx.number_connected_components(G) == 1
 
 
@@ -358,7 +364,12 @@ def test_endpoint_to_line_private_rejected():
 
 
 def test_endpoint_to_line_public_accepted():
-    """PR #28 amend B1: endpoint→line connector within public_area accepted."""
+    """PR #28 amend B1: endpoint→line connector within public_area accepted.
+
+    PR #34 amend v3: instead of adding a virtual connector, the endpoint
+    is relocated onto the projection point. The graph becomes one
+    connected component without any new virtual/non-deliverable edge.
+    """
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra",
                geometry=LineString([(0, 0), (20, 0)]))
@@ -370,8 +381,12 @@ def test_endpoint_to_line_public_accepted():
     routing._snap_endpoints_to_lines(
         G, snap_radius_m=3.0, public_area=public_area,
     )
-    # Endpoint degree should increase (connector edge added)
-    assert G.degree((10.0, 1.0)) >= 2
+    # The graph must become fully connected, and no virtual edge created.
+    assert nx.number_connected_components(G) == 1
+    for _u, _v, data in G.edges(data=True):
+        assert not data.get("virtual", False), (
+            "PR #34 v3: no virtual connector after endpoint relocation"
+        )
 
 
 def test_bridge_has_routing_weight():
@@ -392,7 +407,12 @@ def test_bridge_has_routing_weight():
 
 
 def test_line_snap_chooses_closest_line():
-    """PR #28 amend B3: endpoint→line picks closest line by perpendicular distance."""
+    """PR #28 amend B3: endpoint→line picks closest line by perpendicular distance.
+
+    PR #34 amend v3: with the endpoint-relocation refactor the node count
+    is conserved (one node removed at the original endpoint, one added at
+    the projection) — but the snap target must still be the closest line.
+    """
     G = nx.Graph()
     # Two parallel lines: one at y=0, one at y=5
     G.add_edge((0.0, 0.0), (20.0, 0.0), length=20, type="infra")
@@ -400,10 +420,12 @@ def test_line_snap_chooses_closest_line():
     # Endpoint at (10, 1) — 1m from y=0 line, 4m from y=5 line
     G.add_edge((10.0, 1.0), (10.0, 10.0), length=9, type="infra")
 
-    n_before = G.number_of_nodes()
     routing._snap_endpoints_to_lines(G, snap_radius_m=5.0)
-    # Should have snapped to y=0 line (split creates 1 extra node + connection)
-    assert G.number_of_nodes() > n_before
+    # The split point must sit on the y=0 line (closer), creating a
+    # new node at ~(10, 0).
+    assert (10.0, 0.0) in G or any(
+        abs(n[0] - 10.0) < 0.1 and abs(n[1]) < 0.1 for n in G.nodes()
+    ), f"expected a node near (10, 0), got nodes={list(G.nodes())}"
     # The split point should be at ~(10, 0), not (10, 5)
     for u, v, data in G.edges(data=True):
         geom = data.get("geometry")
