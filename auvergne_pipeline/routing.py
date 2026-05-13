@@ -113,6 +113,58 @@ def _routing_weight_for(data: dict) -> float:
     return base
 
 
+def _heal_existing_infra_topology(
+    infra_filtered: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """PR #37 — Repair SIG-level topology of EXISTING infra BEFORE routing.
+
+    Pierre's field test after PR #36 still showed ``pa_pb_connected_ratio
+    = 0.00`` on most pilote SROs, with infra rows being delivered but
+    Dijkstra unable to chain them into a continuous PA→PB path. Root
+    cause: the existing-infra layer in the input GPKG already has
+    micro-gaps between endpoints, T-junctions where one segment ends on
+    the middle of another, and unwelded close endpoints. PR #33/#36
+    had moved these "heals" into the routing graph (mixing infra +
+    IGN), so endpoints were being snapped onto IGN polylines instead
+    of onto neighbouring existing infra — pushing the path through IGN
+    and inflating C0.
+
+    PR #37 fixes this BEFORE building the routing graph:
+      1. Endpoints within ``ENDPOINT_SNAP_TOL_M`` are merged into a
+         shared coordinate (no row added).
+      2. Endpoints that land on the middle of another line within the
+         same tolerance trigger a T-junction split: the target line is
+         cut at the projection so the two segments share a vertex.
+      3. A second snap-pass consolidates whatever the T-junction split
+         exposed.
+
+    No new geometry is invented and no C0 row is created. ``statut``,
+    ``mode_pose``, ``infra_type``, ``src`` are preserved on every row.
+    """
+    if infra_filtered is None or infra_filtered.empty:
+        return infra_filtered
+    # Local import to avoid a circular import at module load time.
+    from . import livrable_topology as _lt
+
+    df = infra_filtered
+    df, n_snap_1 = _lt._snap_endpoints_to_exact(
+        df, tol_m=_lt.ENDPOINT_SNAP_TOL_M,
+    )
+    df, n_split = _lt._split_livrableedges_at_endpoint_projections(
+        df, tol_m=_lt.ENDPOINT_SNAP_TOL_M,
+    )
+    df, n_snap_2 = _lt._snap_endpoints_to_exact(
+        df, tol_m=_lt.ENDPOINT_SNAP_TOL_M,
+    )
+    if n_snap_1 or n_split or n_snap_2:
+        log.info(
+            "[INFRA HEAL] endpoints_snapped=%d t_junctions_split=%d "
+            "endpoints_resnapped=%d",
+            n_snap_1, n_split, n_snap_2,
+        )
+    return df
+
+
 def _public_area_safe(public_area):
     """Pre-compute ``public_area.buffer(0.01)`` once per SRO (PR #29 B1).
 
@@ -769,6 +821,15 @@ def route_pa_to_pb(
     else:
         delivery_public_area_safe = _public_area_safe(delivery_public_area)
 
+    # PR #37 — heal existing infra topology BEFORE routing. The healed
+    # GeoDataFrame is what enters the routing graph; the original
+    # ``infra_filtered`` is no longer used past this point. The heal is
+    # idempotent so calling it again later (e.g. from livrable_topology)
+    # is harmless.
+    t0 = time.perf_counter()
+    infra_filtered = _heal_existing_infra_topology(infra_filtered)
+    perf["heal_existing_infra"] = time.perf_counter() - t0
+
     # Build combined graph
     t0 = time.perf_counter()
     G = _build_graph(infra_filtered, ign_routes, snap_tol=SNAP_TOLERANCE_M)
@@ -849,7 +910,19 @@ def route_pa_to_pb(
                 ):
                     is_deliverable = False
         data["_can_deliver"] = is_deliverable
+        # PR #37 — existing-only flag for pass-1 Dijkstra. Existing =
+        # ``type == "infra"`` (the SIG layer). gc_neuf injected by
+        # pb_fictif is real planned GC but still counts as fallback for
+        # pass 1; if pass 1 reaches the PB on existing only, the planned
+        # gc_neuf isn't even visited. IGN and virtual stay out of pass 1
+        # by design.
+        data["_is_existing"] = (raw_type == "infra") and is_deliverable
         data["_routing_weight"] = base_w if is_deliverable else base_w + HIGH_WEIGHT_PENALTY
+        # Pass-1 weight: only existing infra eligible.
+        data["_pass1_weight"] = (
+            base_w if data["_is_existing"]
+            else base_w + HIGH_WEIGHT_PENALTY
+        )
     perf["prepare_weights"] = time.perf_counter() - t0
 
     # Spec C (PR #22): diagnostic on connected components
@@ -994,54 +1067,85 @@ def route_pa_to_pb(
         if not pb_snapped:
             continue
 
-        # ── One Dijkstra tree per PA (after all PB snaps) ──────────────
-        def _dijkstra_tree():
+        # ── PR #37 — Two-pass Dijkstra per PA. Pass 1 explores ONLY
+        # existing infra (``_is_existing == True``) so a path made of
+        # plain SIG segments is found whenever one exists, completely
+        # avoiding IGN / gc_neuf / virtual fallbacks. Pass 2 falls back
+        # to the full deliverable graph (existing + IGN-as-C0 + planned
+        # gc_neuf) for PBs that pass 1 could not reach.
+        #
+        # The pass-1 tree is computed eagerly; the pass-2 tree is built
+        # lazily and only when at least one PB needs the fallback.
+        def _dijkstra_tree_pass1():
             try:
                 _, paths = nx.single_source_dijkstra(
-                    G, source=pa_node, weight="_routing_weight"  # PR #28 BLOQUANT 5
+                    G, source=pa_node, weight="_pass1_weight",
                 )
                 return paths
             except (nx.NetworkXError, KeyError):
                 return {}
 
-        _paths = _dijkstra_tree()
+        def _dijkstra_tree_full():
+            try:
+                _, paths = nx.single_source_dijkstra(
+                    G, source=pa_node, weight="_routing_weight",
+                )
+                return paths
+            except (nx.NetworkXError, KeyError):
+                return {}
+
+        _paths_p1 = _dijkstra_tree_pass1()
+        _paths_full = None  # lazy
+
+        def _path_is_existing_only(p):
+            """All edges along ``p`` are existing-infra and deliverable."""
+            for i in range(len(p) - 1):
+                data_e = G.get_edge_data(p[i], p[i + 1])
+                if data_e is None:
+                    return False
+                if not data_e.get("_is_existing", False):
+                    return False
+            return True
 
         for pb, pb_node in pb_snapped:
             pb_count += 1
             pb_id = pb.get("pb_id", f"pb#{pb.name}")
 
-            # Check if PB reachable from PA in current tree
-            if pb_node in _paths:
-                path = _paths[pb_node]
-            else:
-                # Spec B (PR #22): bridge components with GC neuf C0
-                bridged = _bridge_components_with_gc_neuf(
-                    G, pa_node, pb_node,
-                    flag_collector=flag_collector,
-                    public_area=public_area,             # PR #27
-                    public_area_safe=public_area_safe,   # PR #29 B1
-                )
-                if bridged:
-                    # Recompute tree after bridge insertion
-                    _paths = _dijkstra_tree()
-                    if pb_node in _paths:
-                        path = _paths[pb_node]
-                    else:
-                        if flag_collector is not None:
-                            flag_collector.add(
-                                "PA_PB_DECONNECTES",
-                                target_url=pa_id,
-                                message=f"Pas de chemin vers {pb_id} meme apres pont GC neuf",
-                            )
-                        continue
+            path = None
+
+            # ── Pass 1: existing-only ─────────────────────────────────
+            if pb_node in _paths_p1:
+                p1 = _paths_p1[pb_node]
+                if _path_is_existing_only(p1):
+                    path = p1
+
+            # ── Pass 2: fallback to IGN/C0 deliverable graph ──────────
+            if path is None:
+                if _paths_full is None:
+                    _paths_full = _dijkstra_tree_full()
+                if pb_node in _paths_full:
+                    path = _paths_full[pb_node]
                 else:
-                    if flag_collector is not None:
-                        flag_collector.add(
-                            "PA_PB_DECONNECTES",
-                            target_url=pa_id,
-                            message=f"Pas de chemin vers {pb_id}",
-                        )
-                    continue
+                    # PB still unreachable: try a last-resort micro-bridge
+                    bridged = _bridge_components_with_gc_neuf(
+                        G, pa_node, pb_node,
+                        flag_collector=flag_collector,
+                        public_area=public_area,
+                        public_area_safe=public_area_safe,
+                    )
+                    if bridged:
+                        _paths_full = _dijkstra_tree_full()
+                        if pb_node in _paths_full:
+                            path = _paths_full[pb_node]
+
+            if path is None:
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "PA_PB_DECONNECTES",
+                        target_url=pa_id,
+                        message=f"Pas de chemin vers {pb_id} (pass 1 + fallback)",
+                    )
+                continue
 
             # ── PR #36 — DELIVERABILITY-AWARE Dijkstra path walk.
             #
@@ -1171,20 +1275,36 @@ def route_pa_to_pb(
                 if raw_src == "gc_neuf_runtime":
                     raw_src = "gc_neuf"
 
+                # PR #37 — track the upstream provenance of every C0 row
+                # so post-routing audits can distinguish:
+                #   - ``ign``: converted IGN segment (allowed at any length
+                #     if short + public + within budget)
+                #   - ``gc_neuf_planned``: pb_fictif injection (allowed)
+                #   - ``micro_bridge``: short component bridge (≤3m public)
+                #   - ``existing``: not a C0 at all
+                c0_source: str | None = None
                 if raw_type == "ign_route" and raw_infra != "gc_neuf":
                     mode_pose = "C0"
                     infra_type = "gc_neuf"
                     src = "gc_neuf"
                     converted_ign_to_gc_length_m += raw_length
                     ign_route_delivered_as_gc_m += raw_length
+                    c0_source = "ign"
                 elif raw_src in ("gc_neuf", "gc_neuf_runtime"):
                     mode_pose = "C0"
                     infra_type = "gc_neuf"
                     src = "gc_neuf"
+                    # Distinguish planned gc_neuf (injected) from a
+                    # micro-bridge that was promoted to deliverable.
+                    if edge_data.get("virtual_reason") == "micro_bridge":
+                        c0_source = "micro_bridge"
+                    else:
+                        c0_source = "gc_neuf_planned"
                 else:
                     mode_pose = edge_data.get("mode_pose", "")
                     infra_type = raw_infra or raw_src or raw_type
                     src = raw_src or raw_type
+                    c0_source = "existing"
 
                 out_statut = edge_data.get("statut")
                 if out_statut is None:
@@ -1203,6 +1323,7 @@ def route_pa_to_pb(
                     "src": src,
                     "length_m": raw_length,
                     "geometry": out_geom,
+                    "_c0_source": c0_source,
                 }
 
                 # PR #34 amend (v3) — straight_connectors counts ONLY
@@ -1239,7 +1360,8 @@ def route_pa_to_pb(
             "[FINAL TOPO QA] sro=%s connected=0 disconnected=%d "
             "pa_pb_connected_ratio=0.00 straight_connectors=%d "
             "straight_connector_length_m=%.0f virtual_delivered=0 "
-            "ign_cap_hit=%d c0_without_source_geometry=0",
+            "ign_cap_hit=%d c0_without_source_geometry=0 "
+            "long_direct_c0_count=0 c0_without_ign_source=0",
             sro_code_log, pb_count,
             straight_connector_count, straight_connector_length_m,
             ign_cap_hit_count,
@@ -1401,16 +1523,60 @@ def route_pa_to_pb(
                 (result["deliverable"].fillna(True).astype(bool) == False).sum()
             )
 
+    # ── PR #37 — strict C0 provenance audit. Every delivered C0 row
+    # must trace back to a legitimate source:
+    #   - ``ign``                  : IGN polyline segment converted to C0
+    #   - ``gc_neuf_planned``      : pb_fictif injection
+    #   - ``micro_bridge``         : public ≤3m component bridge
+    #   - terminal connector emitted by livrable_topology._ensure_-
+    #     terminals_connected (these are inserted AFTER routing and
+    #     have no ``_c0_source`` column; we recognise them by length
+    #     ≤ TERMINAL_CONNECTOR_MAX_LENGTH_M = 3m)
+    # Any C0 row that fails this audit is a regression and counted by
+    # ``long_direct_c0_count`` / ``c0_without_ign_source``.
+    long_direct_c0_count = 0
+    c0_without_ign_source = 0
+    if not result.empty:
+        c0_mask = result["infra_type"] == "gc_neuf"
+        for idx in result.index[c0_mask]:
+            length_m = float(result.loc[idx, "length_m"] or 0.0)
+            src_tag = (
+                result.loc[idx, "_c0_source"]
+                if "_c0_source" in result.columns
+                else None
+            )
+            # Terminal connectors (inserted by livrable_topology) are
+            # short (<= 3 m) and tagged ``terminal``. Untagged rows of
+            # the same length are tolerated for backwards compatibility.
+            if src_tag == "terminal" and length_m <= 3.0:
+                continue
+            if src_tag is None and length_m <= 3.0:
+                continue
+            if src_tag in ("ign", "gc_neuf_planned", "micro_bridge"):
+                continue
+            # Anything else is suspect
+            c0_without_ign_source += 1
+            if length_m > 3.0:
+                long_direct_c0_count += 1
+
     log.info(
         "[FINAL TOPO QA] sro=%s connected=%d disconnected=%d pa_pb_connected_ratio=%.2f "
         "straight_connectors=%d straight_connector_length_m=%.0f "
-        "virtual_delivered=%d ign_cap_hit=%d c0_without_source_geometry=%d",
+        "virtual_delivered=%d ign_cap_hit=%d c0_without_source_geometry=%d "
+        "long_direct_c0_count=%d c0_without_ign_source=%d",
         sro_code_log, pa_pb_connected, pa_pb_disconnected, pa_pb_ratio,
         straight_connector_count, straight_connector_length_m,
         virtual_edges_delivered_count,
         ign_cap_hit_count,
         c0_without_source_geom,
+        long_direct_c0_count,
+        c0_without_ign_source,
     )
+
+    # PR #37 — strip the internal ``_c0_source`` provenance column
+    # before returning. Writer / GPKG output stays unchanged.
+    if "_c0_source" in result.columns:
+        result = result.drop(columns=["_c0_source"])
 
     # PR #29 B4: per-step + total perf logs ───────────────────────────
     perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start

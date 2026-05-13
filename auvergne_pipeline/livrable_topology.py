@@ -478,6 +478,10 @@ def _ensure_terminals_connected(
         connector_row["infra_type"] = "gc_neuf"
         connector_row["length_m"] = float(connector_geom.length)
         connector_row["geometry"] = connector_geom
+        # PR #37 — tag provenance so the [FINAL TOPO QA] strict audit
+        # recognises this as a legitimate short terminal connector and
+        # does NOT report it as ``c0_without_ign_source``.
+        connector_row["_c0_source"] = "terminal"
         rows.append(connector_row)
 
         stats["terminal_connectors_added"] += 1
@@ -1462,34 +1466,39 @@ def _drop_c0_when_existing_equivalent(
             stats["c0_kept_last_resort"] += 1
             continue
 
-        overlaps = False
-        for _, erow in existing.iterrows():
-            egeom = erow.get("geometry")
-            if egeom is None or egeom.is_empty or not isinstance(egeom, LineString):
-                continue
-            if geom.distance(egeom) >= hausdorff_tol_m:
-                continue
-            # Angle check via dot-product
-            c0c = list(geom.coords)
-            ec = list(egeom.coords)
-            dx1 = c0c[-1][0] - c0c[0][0]
-            dy1 = c0c[-1][1] - c0c[0][1]
-            dx2 = ec[-1][0] - ec[0][0]
-            dy2 = ec[-1][1] - ec[0][1]
-            n1 = (dx1 ** 2 + dy1 ** 2) ** 0.5
-            n2 = (dx2 ** 2 + dy2 ** 2) ** 0.5
-            if n1 > 0 and n2 > 0:
-                cos_a = (dx1 * dx2 + dy1 * dy2) / (n1 * n2)
-                cos_a = max(-1.0, min(1.0, cos_a))
-                angle = float(np.degrees(np.arccos(cos_a)))
-                if angle < 45.0 or angle > 135.0:
-                    overlaps = True
+        # PR #37 — STRICT redundancy check. PR #32's original logic
+        # dropped any C0 within ``hausdorff_tol_m`` of an existing edge
+        # whose orientation roughly matched, but ``geom.distance(egeom)``
+        # is 0 whenever the two share even a single endpoint. That meant
+        # a long C0 *continuing* the existing infra (think (0,10)-(50,0)
+        # appended after a BT (0,0)-(10,0)) was being dropped as a
+        # parallel duplicate — leaving the PA→PB chain with a hole.
+        #
+        # The new rule: a C0 is considered redundant only if its
+        # geometry is *almost entirely covered* by the buffer of one
+        # existing edge (>= 80% of the C0's length). A small overlap
+        # near an endpoint is not enough to drop a critical path edge.
+        redundant = False
+        c0_len = float(geom.length or 0.0)
+        if c0_len > 0:
+            for _, erow in existing.iterrows():
+                egeom = erow.get("geometry")
+                if egeom is None or egeom.is_empty or not isinstance(egeom, LineString):
+                    continue
+                try:
+                    buf = egeom.buffer(hausdorff_tol_m)
+                except Exception:
+                    continue
+                try:
+                    inside = geom.intersection(buf)
+                except Exception:
+                    continue
+                inside_len = float(getattr(inside, "length", 0.0) or 0.0)
+                if inside_len / c0_len >= 0.8:
+                    redundant = True
                     break
-            else:
-                overlaps = True
-                break
 
-        if overlaps:
+        if redundant:
             keep_mask[idx] = False
             stats["c0_removed_existing_parallel"] += 1
         else:
