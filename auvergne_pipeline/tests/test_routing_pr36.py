@@ -360,18 +360,20 @@ def test_private_micro_bridge_stays_virtual(monkeypatch):
 # 7. IGN-derived C0 above the cap is delivered with a soft warning
 # ---------------------------------------------------------------------------
 
-def test_ign_over_cap_path_delivered_with_warning_flag(caplog):
-    """PR #36 — the cumulative IGN budget is a SOFT warning, not a
-    blocker. A path made of legitimate short, public IGN segments whose
-    cumulative length exceeds ``MAX_IGN_DELIVERED_PER_SRO_M`` is still
-    delivered end-to-end (no holes), and ``ign_cap_hit`` is recorded.
+def test_ign_over_cap_path_rejected_by_per_path_budget(caplog):
+    """PR #41 — a path whose IGN-only ratio exceeds
+    ``PR41_MAX_IGN_RATIO_PER_PATH`` AND whose total length is above
+    ``PR41_RATIO_MIN_TOTAL_M`` is rejected. 500 m of IGN ⇒ ratio = 1.0
+    ⇒ rejected with flag ``PATH_IGN_BUDGET_EXCEEDED``. PR #36's soft-
+    warning policy is intentionally reversed: Pierre's brief says
+    "Interdire ou pénaliser très fortement les détours IGN massifs".
     """
     infra = gpd.GeoDataFrame(
         [], columns=["statut", "mode_pose", "src", "geometry", "sro_code"],
         geometry="geometry", crs=CRS,
     )
     seg_len = 20.0
-    n_segs = 25
+    n_segs = 25  # 500 m → above PR41_RATIO_MIN_TOTAL_M (300 m), ratio = 1.0
     ign_geom = LineString([(i * seg_len, 0.0) for i in range(n_segs + 1)])
     ign = gpd.GeoDataFrame(
         [{"geometry": ign_geom}], geometry="geometry", crs=CRS,
@@ -393,18 +395,15 @@ def test_ign_over_cap_path_delivered_with_warning_flag(caplog):
             public_area=public,
             delivery_public_area=public,
         )
-    assert not result.empty
-    delivered_m = float(result["length_m"].sum())
-    assert delivered_m == pytest.approx(seg_len * n_segs, abs=1.0)
-
-    final_topo = [
-        rec.getMessage() for rec in caplog.records
-        if "[FINAL TOPO QA]" in rec.getMessage()
+    # Path rejected.
+    assert result.empty or (result["infra_type"] == "gc_neuf").sum() == 0
+    budget_flag = [
+        f for f in flags.entries if f["type"] == "PATH_IGN_BUDGET_EXCEEDED"
     ]
-    assert final_topo
-    line = final_topo[-1]
-    cap = re.search(r"ign_cap_hit=(\d+)", line)
-    assert cap is not None and int(cap.group(1)) >= 1, line
+    assert budget_flag, (
+        f"PR #41: PATH_IGN_BUDGET_EXCEEDED must be raised, got "
+        f"{[f['type'] for f in flags.entries]}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -289,13 +289,13 @@ def test_path_with_virtual_only_edge_is_rejected_whole_pb(caplog):
             pass
 
 
-def test_ign_cap_soft_warning_does_not_drop_path(caplog):
-    """PR #36 — the cumulative SRO IGN cap is now a SOFT warning. PR #34
-    v3 had upgraded it to a hard reject, which on the field test (it.22)
-    left full SROs with infra=0 and ``pa_pb_connected_ratio=0``. PR #36
-    keeps the path continuous (no holes) while still surfacing
-    ``ign_cap_hit > 0`` in [FINAL TOPO QA] so Pierre sees when an SRO
-    over-spends on IGN-derived C0.
+def test_ign_cap_per_path_budget_rejects_spaghetti(caplog):
+    """PR #41 reverses PR #36's soft-cap policy for paths with >800 m
+    of IGN-as-C0. Field run 2026-05-18 showed >5 km IGN C0 per SRO on
+    63149/M06/PMZ/42478 (high_gc_ratio=0.96, full spaghetti). PR #41's
+    ``PR41_MAX_IGN_PER_PATH_M`` rejects such paths entirely with flag
+    ``PATH_IGN_BUDGET_EXCEEDED`` so the operator reviews them rather
+    than ships a kilometric C0 chord.
     """
     import logging
     from shapely.geometry import Polygon
@@ -305,7 +305,7 @@ def test_ign_cap_soft_warning_does_not_drop_path(caplog):
         geometry="geometry", crs="EPSG:2154",
     )
     seg_len = 20.0
-    n_segs = 30  # 600 m → twice the 300 m cap
+    n_segs = 60  # 1200 m → above PR41_MAX_IGN_PER_PATH_M (800 m)
     ign_geom = LineString([(i * seg_len, 0.0) for i in range(n_segs + 1)])
     ign = gpd.GeoDataFrame(
         [{"geometry": ign_geom}], geometry="geometry", crs="EPSG:2154",
@@ -332,32 +332,14 @@ def test_ign_cap_soft_warning_does_not_drop_path(caplog):
             delivery_public_area=public,
         )
 
-    # Full path delivered (no holes), even above the cap.
-    assert not result.empty
-    # Telemetry: cap hit was surfaced
-    final_topo_lines = [
-        rec.getMessage() for rec in caplog.records
-        if "[FINAL TOPO QA]" in rec.getMessage()
+    # Path rejected — no row delivered for this PB.
+    assert result.empty or (result["infra_type"] == "gc_neuf").sum() == 0
+    # And the explicit budget flag is emitted.
+    budget_flag = [
+        f for f in flags.entries if f["type"] == "PATH_IGN_BUDGET_EXCEEDED"
     ]
-    assert final_topo_lines
-    qa_line = final_topo_lines[-1]
-    import re
-    cap = re.search(r"ign_cap_hit=(\d+)", qa_line)
-    assert cap is not None and int(cap.group(1)) >= 1, (
-        f"PR #36: cap exceeded must surface as ign_cap_hit >= 1 in: {qa_line}"
-    )
-    # And no inflated straight_connectors / c0_without_source counters
-    sc = re.search(r"straight_connectors=(\d+)", qa_line)
-    assert sc is not None and int(sc.group(1)) == 0
-    cn = re.search(r"c0_without_source_geometry=(\d+)", qa_line)
-    assert cn is not None and int(cn.group(1)) == 0
-    # And the soft-cap flag is logged
-    soft_cap = [
-        f for f in flags.entries
-        if f["type"] == "IGN_DELIVERED_BUDGET_EXCEEDED"
-    ]
-    assert soft_cap, (
-        f"Expected IGN_DELIVERED_BUDGET_EXCEEDED flag, got "
+    assert budget_flag, (
+        f"PR #41: PATH_IGN_BUDGET_EXCEEDED must be raised, got "
         f"{[f['type'] for f in flags.entries]}"
     )
 
