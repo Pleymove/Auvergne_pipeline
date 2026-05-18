@@ -430,21 +430,9 @@ def build_pb_fictifs(
             if placement_status not in PB_PLACEMENT_PUBLIC_FAMILY:
                 continue
 
-            # If PB is not on existing infra, create GC neuf (C0) from
-            # the PA to the PB
-            if infra_edges is None or infra_edges.empty or not any(
-                infra_edges.geometry.distance(pb_pt) < 1.0
-            ):
-                gc_line = LineString([pa_geom, pb_pt])
-                gc_rows.append({
-                    "sro": sro_code,
-                    "pa_id": pa_id,
-                    "pb_id": pb_id,
-                    "statut": "C",
-                    "mode_pose": config.GC_NEUF_MODE_POSE,
-                    "src": "gc_neuf",
-                    "geometry": gc_line,
-                })
+            # PR #39 — do not invent a direct PA→PB C0 chord here. New GC
+            # must come from routed public/IGN geometry downstream; PB→BAT
+            # remains logical D3 and is not delivered as livrable_infra.
 
     # ── Build output GeoDataFrames ────────────────────────────────────
     pb_gdf = gpd.GeoDataFrame(
