@@ -127,6 +127,35 @@ def _support_family_of(row) -> str:
     return SUPPORT_FAMILY.get(str(src), "unknown")
 
 
+def _path_membership_to_set(value) -> set[str]:
+    if value is None:
+        return set()
+    try:
+        if pd.isna(value):
+            return set()
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, set):
+        return {str(v) for v in value if str(v)}
+    if isinstance(value, (list, tuple)):
+        return {str(v) for v in value if str(v)}
+    text = str(value).strip()
+    if not text:
+        return set()
+    return {p.strip() for p in text.replace(",", "|").split("|") if p.strip()}
+
+
+def _serialize_path_membership(paths: set[str]) -> str:
+    return "|".join(sorted(str(p) for p in paths if str(p)))
+
+
+def _union_path_membership_rows(rows: list[dict]) -> str:
+    paths: set[str] = set()
+    for row in rows:
+        paths.update(_path_membership_to_set(row.get("_used_by_paths")))
+    return _serialize_path_membership(paths)
+
+
 # ---------------------------------------------------------------------------
 # Step 0 — enforce_crs  (PR32 Section A)
 # ---------------------------------------------------------------------------
@@ -490,7 +519,7 @@ def _ensure_terminals_connected(
         # context from the target row so writer-side filters keep the
         # connector grouped with its PA→PB pair.
         connector_row = dict(target_row)
-        connector_row["statut"] = ""
+        connector_row["statut"] = None
         connector_row["mode_pose"] = "C0"
         connector_row["src"] = "gc_neuf"
         connector_row["infra_type"] = "terminal_connector"
@@ -751,6 +780,10 @@ def _remove_near_duplicates(
         ranked = sorted(idxs, key=lambda i: _hierarchy_score(df.iloc[i]))
         winner = ranked[0]
         for loser in ranked[1:]:
+            if "_used_by_paths" in df.columns:
+                paths = _path_membership_to_set(df.at[winner, "_used_by_paths"])
+                paths.update(_path_membership_to_set(df.at[loser, "_used_by_paths"]))
+                df.at[winner, "_used_by_paths"] = _serialize_path_membership(paths)
             stats["exact_duplicates_removed"] += 1
             keep_idx.discard(loser)
             stats["duplicate_parallel_length_m"] += float(
@@ -791,6 +824,12 @@ def _remove_near_duplicates(
             )
             winner = ranked[0]
             for loser in ranked[1:]:
+                if "_used_by_paths" in df.columns:
+                    winner_idx = idx_map[winner]
+                    loser_idx = idx_map[loser]
+                    paths = _path_membership_to_set(df.at[winner_idx, "_used_by_paths"])
+                    paths.update(_path_membership_to_set(df.at[loser_idx, "_used_by_paths"]))
+                    df.at[winner_idx, "_used_by_paths"] = _serialize_path_membership(paths)
                 seen.add(idx_map[loser])
                 keep_idx.discard(idx_map[loser])
                 stats["near_duplicates_removed"] += 1
@@ -848,6 +887,8 @@ def _filter_energy_private(
         if g is None or g.is_empty:
             continue
         if not delivery_public_area_safe.covers(g):
+            if _path_membership_to_set(row.get("_used_by_paths")):
+                continue
             drop_idx.append(idx)
             stats["energy_private_crossing_count"] += 1
             stats["energy_private_crossing_length_m"] += float(row.get("length_m") or 0.0)
@@ -881,17 +922,100 @@ def _build_livrable_topology_graph(df: gpd.GeoDataFrame) -> nx.Graph:
     into separate nodes — we only care about endpoint connectivity here.
     """
     G = nx.Graph()
+    if df is None or df.empty:
+        return G
+
+    lines: list[LineString] = []
     for _, row in df.iterrows():
         g = row.get("geometry")
         if g is None or g.is_empty or not isinstance(g, LineString):
             continue
-        cs = list(g.coords)
-        if len(cs) < 2:
-            continue
-        a = (round(cs[0][0], 6), round(cs[0][1], 6))
-        b = (round(cs[-1][0], 6), round(cs[-1][1], 6))
-        if a == b:
-            continue
+        cs = [(float(c[0]), float(c[1])) for c in g.coords]
+        if len(cs) >= 2:
+            lines.append(LineString(cs))
+    if not lines:
+        return G
+
+    breakpoints: list[set[float]] = [set([0.0, float(line.length)]) for line in lines]
+    endpoints: list[tuple[Point, int]] = []
+    for idx, line in enumerate(lines):
+        cs = list(line.coords)
+        endpoints.append((Point(cs[0]), idx))
+        endpoints.append((Point(cs[-1]), idx))
+
+    from shapely.strtree import STRtree
+    tree = STRtree(lines)
+
+    def _add_break(idx: int, point: Point) -> tuple[float, float]:
+        line = lines[idx]
+        dist = max(0.0, min(float(line.project(point)), float(line.length)))
+        breakpoints[idx].add(round(dist, 6))
+        proj = line.interpolate(dist)
+        return (round(float(proj.x), 6), round(float(proj.y), 6))
+
+    contact_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for endpoint, src_idx in endpoints:
+        endpoint_key = (round(float(endpoint.x), 6), round(float(endpoint.y), 6))
+        for candidate in tree.query(endpoint.buffer(ENDPOINT_SNAP_TOL_M)):
+            idx = int(candidate)
+            line = lines[idx]
+            if idx == src_idx and endpoint.distance(line) <= 1e-9:
+                continue
+            if endpoint.distance(line) > ENDPOINT_SNAP_TOL_M:
+                continue
+            proj_key = _add_break(idx, endpoint)
+            if endpoint_key != proj_key:
+                contact_edges.add(tuple(sorted((endpoint_key, proj_key))))
+            else:
+                G.add_node(endpoint_key)
+
+    def _iter_intersection_points(geom):
+        if geom is None or geom.is_empty:
+            return
+        if geom.geom_type == "Point":
+            yield geom
+        elif geom.geom_type == "MultiPoint":
+            for p in geom.geoms:
+                yield p
+        elif geom.geom_type in ("LineString", "LinearRing"):
+            cs = list(geom.coords)
+            if cs:
+                yield Point(cs[0])
+                yield Point(cs[-1])
+        elif hasattr(geom, "geoms"):
+            for part in geom.geoms:
+                yield from _iter_intersection_points(part)
+
+    for i, line in enumerate(lines):
+        for candidate in tree.query(line):
+            j = int(candidate)
+            if j <= i:
+                continue
+            other = lines[j]
+            if not line.intersects(other):
+                continue
+            inter = line.intersection(other)
+            for p in _iter_intersection_points(inter):
+                _add_break(i, p)
+                _add_break(j, p)
+
+    for idx, line in enumerate(lines):
+        distances = sorted(d for d in breakpoints[idx] if 0.0 <= d <= line.length)
+        for a_d, b_d in zip(distances, distances[1:]):
+            if b_d - a_d <= 1e-6:
+                continue
+            seg = substring(line, a_d, b_d)
+            if not isinstance(seg, LineString) or seg.is_empty:
+                continue
+            cs = list(seg.coords)
+            if len(cs) < 2:
+                continue
+            a = (round(float(cs[0][0]), 6), round(float(cs[0][1]), 6))
+            b = (round(float(cs[-1][0]), 6), round(float(cs[-1][1]), 6))
+            if a != b:
+                G.add_edge(a, b)
+
+    for a, b in contact_edges:
         G.add_edge(a, b)
     return G
 
@@ -1283,6 +1407,8 @@ def _smooth_support_switches(
                         break
 
         if has_orange_parallel:
+            if _path_membership_to_set(row.get("_used_by_paths")):
+                continue
             drop_idx.add(idx)
             stats["support_switches_fixed"] += 1
 
@@ -1418,7 +1544,7 @@ def _reconnect_after_energy_removal(
                 "sro": row_template.get("sro", "?"),
                 "pa_id": row_template.get("pa_id", ""),
                 "pb_id": row_template.get("pb_id", ""),
-                "statut": "",
+                "statut": None,
                 "mode_pose": "C0",
                 "src": "gc_neuf",
                 "infra_type": "gc_neuf",
@@ -1505,6 +1631,7 @@ def _drop_c0_when_existing_equivalent(
         # existing edge (>= 80% of the C0's length). A small overlap
         # near an endpoint is not enough to drop a critical path edge.
         redundant = False
+        redundant_existing_idx = None
         c0_len = float(geom.length or 0.0)
         if c0_len > 0:
             for _, erow in existing.iterrows():
@@ -1522,9 +1649,14 @@ def _drop_c0_when_existing_equivalent(
                 inside_len = float(getattr(inside, "length", 0.0) or 0.0)
                 if inside_len / c0_len >= 0.8:
                     redundant = True
+                    redundant_existing_idx = erow.name
                     break
 
         if redundant:
+            if "_used_by_paths" in df.columns and redundant_existing_idx is not None:
+                paths = _path_membership_to_set(df.at[redundant_existing_idx, "_used_by_paths"])
+                paths.update(_path_membership_to_set(df.at[idx, "_used_by_paths"]))
+                df.at[redundant_existing_idx, "_used_by_paths"] = _serialize_path_membership(paths)
             keep_mask[idx] = False
             stats["c0_removed_existing_parallel"] += 1
         else:
