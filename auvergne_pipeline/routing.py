@@ -524,9 +524,10 @@ def _build_graph(
     def _add_edges(gdf: gpd.GeoDataFrame, attrs: dict) -> None:
         if gdf is None or gdf.empty:
             return
-        for _, row in gdf.iterrows():
-            for line in _explode_to_linestrings(row.geometry):
+        for row_idx, row in gdf.iterrows():
+            for part_idx, line in enumerate(_explode_to_linestrings(row.geometry)):
                 coords = list(line.coords)
+                source_line_id = f"{attrs.get('type', 'edge')}:{row_idx}:{part_idx}"
                 for i in range(len(coords) - 1):
                     a = coords[i]
                     b = coords[i + 1]
@@ -548,6 +549,7 @@ def _build_graph(
                         _point_key(b),
                         length=length,
                         geometry=seg_geom,
+                        _source_line_id=source_line_id,
                         **attrs,
                         **edge_attrs,
                     )
@@ -692,6 +694,7 @@ def _bridge_components_with_gc_neuf(
     max_bridge_length_m: float = 50.0,
     public_area: object = _SENTINEL,  # PR #27 Part A: spatial validation
     public_area_safe=None,             # PR #29 B1: pre-buffered for perf
+    diagnostics: dict | None = None,
 ) -> bool:
     """If pa_node and pb_node belong to different connected components,
     attempt to bridge them WITHOUT creating visible straight-line segments.
@@ -717,6 +720,10 @@ def _bridge_components_with_gc_neuf(
 
     # PR #33: only allow micro-snap bridges (<= 3m) as virtual edges
     if direct_length > MAX_STRAIGHT_CONNECTOR_M:
+        if diagnostics is not None:
+            diagnostics["direct_chord_blocked_count"] = (
+                int(diagnostics.get("direct_chord_blocked_count", 0)) + 1
+            )
         if flag_collector is not None:
             flag_collector.add(
                 "COMPONENT_BRIDGE_REQUIRED_MANUAL_REVIEW",
@@ -741,7 +748,10 @@ def _bridge_components_with_gc_neuf(
     # edge will be filtered out at delivery time.
     bridge_is_public = False
     if ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE:
-        bridge_is_public = True
+        # PR #40 amend: disabling the parcel gate must not make synthetic
+        # component-to-component chords deliverable. Only genuine
+        # micro-bridges stay visible; longer gaps need existing/IGN geometry.
+        bridge_is_public = direct_length <= MAX_STRAIGHT_CONNECTOR_M
     elif public_area is not _SENTINEL:
         if public_area_safe is None:
             public_area_safe = _public_area_safe(public_area)
@@ -1049,6 +1059,7 @@ def route_pa_to_pb(
     # PR #33 — virtual edge telemetry
     virtual_edges_blocked_count = 0
     direct_chord_blocked_count = 0
+    bridge_diagnostics = {"direct_chord_blocked_count": 0}
     straight_connector_count = 0
     straight_connector_length_m = 0.0
     anchor_stats = {
@@ -1407,6 +1418,7 @@ def route_pa_to_pb(
                         flag_collector=flag_collector,
                         public_area=public_area,
                         public_area_safe=public_area_safe,
+                        diagnostics=bridge_diagnostics,
                     )
                     if bridged:
                         _paths_full = _dijkstra_tree_full()
@@ -1620,6 +1632,11 @@ def route_pa_to_pb(
                     "length_m": raw_length,
                     "geometry": out_geom,
                     "_c0_source": c0_source,
+                    "_c0_source_line_id": (
+                        edge_data.get("_source_line_id")
+                        if c0_source == "ign"
+                        else None
+                    ),
                     "_used_by_paths": path_id,
                 }
 
@@ -1731,7 +1748,8 @@ def route_pa_to_pb(
             "direct_chord_blocked_count=%d c0_without_route_geometry_count=0 "
             "c0_suspicious_chord_count=0",
             sro_code_log,
-            direct_chord_blocked_count,
+            direct_chord_blocked_count
+            + int(bridge_diagnostics.get("direct_chord_blocked_count", 0)),
         )
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
@@ -2004,6 +2022,7 @@ def route_pa_to_pb(
     c0_long_without_route_geometry_count = 0
     road_c0_delivered_count = 0
     road_c0_delivered_m = 0.0
+    road_c0_source_line_ids: set[str] = set()
     parcel_gate_disabled_count = 0
     c0_without_route_geometry_count = 0
     if not result.empty:
@@ -2029,7 +2048,12 @@ def route_pa_to_pb(
                 continue
             if src_tag in ("ign", "gc_neuf_planned", "micro_bridge"):
                 if src_tag == "ign":
-                    road_c0_delivered_count += 1
+                    source_line_id = (
+                        result.loc[idx, "_c0_source_line_id"]
+                        if "_c0_source_line_id" in result.columns
+                        else None
+                    )
+                    road_c0_source_line_ids.add(str(source_line_id or idx))
                     road_c0_delivered_m += length_m
                     geom = result.loc[idx, "geometry"]
                     if (
@@ -2072,6 +2096,11 @@ def route_pa_to_pb(
             ):
                 c0_suspicious_chord_count += 1
                 diag["c0_private_crossing_kept"] += 1
+
+    road_c0_delivered_count = len(road_c0_source_line_ids)
+    direct_chord_blocked_count += int(
+        bridge_diagnostics.get("direct_chord_blocked_count", 0)
+    )
 
     log.info(
         "[C0 GEOM QA] sro=%s c0_suspicious_chord_count=%d "
@@ -2138,6 +2167,8 @@ def route_pa_to_pb(
     # before returning. Writer / GPKG output stays unchanged.
     if "_c0_source" in result.columns:
         result = result.drop(columns=["_c0_source"])
+    if "_c0_source_line_id" in result.columns:
+        result = result.drop(columns=["_c0_source_line_id"])
 
     # PR #29 B4: per-step + total perf logs ───────────────────────────
     perf["total_route_pa_to_pb"] = time.perf_counter() - t_total_start

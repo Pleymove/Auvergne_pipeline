@@ -119,6 +119,109 @@ def test_direct_pa_pb_chord_still_forbidden(caplog):
     assert "pb_dropped=0" in qa
 
 
+def test_pr40_does_not_deliver_50m_component_bridge_without_ign_geometry(caplog):
+    infra = gpd.GeoDataFrame(
+        [
+            {
+                "sro": "S1",
+                "statut": "E",
+                "mode_pose": "1",
+                "src": "bt",
+                "infra_type": "bt",
+                "length_m": 1.0,
+                "geometry": LineString([(0, 0), (1, 0)]),
+            },
+            {
+                "sro": "S1",
+                "statut": "E",
+                "mode_pose": "1",
+                "src": "bt",
+                "infra_type": "bt",
+                "length_m": 1.0,
+                "geometry": LineString([(50, 0), (51, 0)]),
+            },
+        ],
+        geometry="geometry",
+        crs=CRS,
+    )
+
+    with caplog.at_level("INFO", logger="auvergne_pipeline.routing"):
+        out = routing.route_pa_to_pb(
+            _pa((0, 0)),
+            _pb([(50, 0)]),
+            infra,
+            _empty_edges(),
+            public_area=PUBLIC_AROUND_TEST,
+            delivery_public_area=STRICT_PUBLIC_ELSEWHERE,
+        )
+
+    direct = LineString([(0, 0), (50, 0)])
+    assert out.empty or not any(out.geometry.apply(lambda g: g.equals(direct)))
+    qa = [r.getMessage() for r in caplog.records if "[PB ROUTING QA]" in r.getMessage()][-1]
+    road = [r.getMessage() for r in caplog.records if "[ROAD C0 QA]" in r.getMessage()][-1]
+    assert "pb_committed=0" in qa
+    assert "pb_impossible=1" in qa
+    assert re.search(r"direct_chord_blocked_count=[1-9]", road)
+
+
+def test_pr40_allows_same_50m_when_real_ign_geometry_exists(caplog):
+    ign_geom = LineString([(0, 0), (25, 10), (50, 0)])
+
+    with caplog.at_level("INFO", logger="auvergne_pipeline.routing"):
+        out = routing.route_pa_to_pb(
+            _pa((0, 0)),
+            _pb([(50, 0)]),
+            _empty_edges(),
+            _ign(list(ign_geom.coords)),
+            public_area=PUBLIC_AROUND_TEST,
+            delivery_public_area=STRICT_PUBLIC_ELSEWHERE,
+        )
+
+    direct = LineString([(0, 0), (50, 0)])
+    c0 = out[out["mode_pose"] == "C0"]
+    assert not c0.empty
+    assert not any(c0.geometry.apply(lambda g: g.equals(direct)))
+    assert any(c0.geometry.apply(lambda g: g.equals(LineString([(0, 0), (25, 10)]))))
+    assert any(c0.geometry.apply(lambda g: g.equals(LineString([(25, 10), (50, 0)]))))
+    road = [r.getMessage() for r in caplog.records if "[ROAD C0 QA]" in r.getMessage()][-1]
+    assert "road_c0_delivered_count=1" in road
+
+
+def test_pr40_micro_bridge_under_3m_can_still_be_delivered():
+    graph = routing.nx.Graph()
+    graph.add_edge(
+        (0.0, 0.0),
+        (0.5, 0.0),
+        length=0.5,
+        type="infra",
+        src="bt",
+        infra_type="bt",
+        geometry=LineString([(0, 0), (0.5, 0)]),
+    )
+    graph.add_edge(
+        (2.5, 0.0),
+        (3.0, 0.0),
+        length=0.5,
+        type="infra",
+        src="bt",
+        infra_type="bt",
+        geometry=LineString([(2.5, 0), (3, 0)]),
+    )
+
+    assert routing._bridge_components_with_gc_neuf(
+        graph,
+        (0.0, 0.0),
+        (2.5, 0.0),
+        public_area=STRICT_PUBLIC_ELSEWHERE,
+    )
+    edge = graph.get_edge_data((0.0, 0.0), (2.5, 0.0))
+    assert edge is not None
+    assert edge["deliverable"] is True
+    assert edge["virtual"] is False
+    assert edge["_can_deliver"] is True
+    assert edge["length"] <= routing.MAX_STRAIGHT_CONNECTOR_M
+
+
 def test_existing_infra_preferred_over_shorter_ign():
     out = routing.route_pa_to_pb(
         _pa((0, 0)),
