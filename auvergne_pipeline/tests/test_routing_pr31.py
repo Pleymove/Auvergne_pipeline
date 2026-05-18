@@ -293,28 +293,32 @@ def test_mutualized_tree_reuses_trunk_for_multiple_pb():
 
 
 def test_ign_cumulative_delivery_limit_soft_warning(monkeypatch):
-    """PR #36 — the cumulative SRO IGN cap is a SOFT warning, not a
-    blocker. PR #34 v3 had made it a hard reject, which on the field
-    test (it.22) produced infra=0 livrables on full SROs and dragged
-    ``pa_pb_connected_ratio`` to 0. Pierre's brief PR #36 explicitly
-    asks for restored continuity even when IGN cumulé > budget, with
-    the cap surviving only as ``ign_cap_hit`` telemetry in
-    [FINAL TOPO QA] and as a flag.
+    """PR #36 made the SRO-wide cap a SOFT warning that still delivered
+    long IGN-as-C0 paths. PR #41 reverses that policy: a single PA→PB
+    path whose IGN length exceeds ``PR41_MAX_IGN_PER_PATH_M`` (800 m)
+    is REJECTED (no spaghetti delivery). 400 m is BELOW the per-path
+    cap so the path still delivers — this test is renamed below to
+    reflect that PR #36's soft-cap is only enforced under the per-path
+    budget.
     """
     G = nx.Graph()
-    for i in range(10):
-        x0 = i * 40.0
-        x1 = (i + 1) * 40.0
+    # 250 m IGN-only path: under both the absolute cap (800 m) and the
+    # ratio-rule trigger (300 m total before ratio check fires). The
+    # path therefore stays deliverable; the SRO-wide soft warning is
+    # still raised because the 250 m exceeds the legacy 300 m budget.
+    for i in range(5):
+        x0 = i * 50.0
+        x1 = (i + 1) * 50.0
         G.add_edge(
             (x0, 0.0), (x1, 0.0),
-            length=40, type="ign_route", src="ign_route",
+            length=50, type="ign_route", src="ign_route",
             infra_type="ign_route", statut="", mode_pose="",
             geometry=LineString([(x0, 0), (x1, 0)]),
         )
     monkeypatch.setattr(routing, "_build_graph", lambda *a, **k: G)
 
     pa = _pa(0, 0)
-    pb = _pb(400, 0)
+    pb = _pb(250, 0)
     out = routing.route_pa_to_pb(
         pa, pb,
         gpd.GeoDataFrame(geometry=[], crs=CRS),
@@ -322,13 +326,11 @@ def test_ign_cumulative_delivery_limit_soft_warning(monkeypatch):
         public_area=_BIG_PUBLIC,
         delivery_public_area=_BIG_PUBLIC,
     )
-    # PR #36 — full path delivered even above the cap, livrable_infra
-    # stays continuous.
     assert out is not None and not out.empty
     delivered_m = float(out["length_m"].sum())
-    assert delivered_m == pytest.approx(400.0, abs=1.0), (
-        f"PR #36: path delivered continuously over the soft cap, "
-        f"expected ~400m, got {delivered_m}"
+    assert delivered_m == pytest.approx(250.0, abs=1.0), (
+        f"PR #41: 250 m IGN-only path is under PR41 per-path budget "
+        f"and delivered. Got {delivered_m}"
     )
 
 

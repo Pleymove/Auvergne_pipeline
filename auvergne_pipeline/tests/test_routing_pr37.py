@@ -156,11 +156,16 @@ def test_existing_path_chosen_when_reachable_after_heal(caplog):
         )
 
     assert not out.empty, "PR #37: PA→PB must deliver an existing-only path"
-    # No gc_neuf row required — heal closed the gap so pass 1 succeeded.
+    # PR #41 — heal closes the gap inside the infra layer, but the
+    # subsequent ``_weld_close_nodes`` merges infra and IGN endpoints
+    # together when they sit within WELD_RADIUS_M. PA / PB therefore
+    # need micro terminal connectors to anchor onto the welded node.
+    # The strict assertion becomes: NO **long** gc_neuf row exists.
     gc_rows = out[out["infra_type"] == "gc_neuf"]
-    assert gc_rows.empty, (
-        f"PR #37: existing path should not need any gc_neuf row, got "
-        f"{gc_rows}"
+    long_gc_rows = gc_rows[gc_rows["length_m"] > 1.0]
+    assert long_gc_rows.empty, (
+        f"PR #37: heal must avoid long gc_neuf rows on a pure existing "
+        f"path, got {long_gc_rows}"
     )
     # And the QA log
     final_topo = [

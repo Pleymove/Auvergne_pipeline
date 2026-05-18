@@ -98,6 +98,29 @@ MAX_STRAIGHT_CONNECTOR_M = 3.0
 # livrable_infra C0 row.
 MAX_LOGICAL_TERMINAL_ANCHOR_M = 30.0
 
+# PR #41 — Per-path IGN-as-C0 budget. PR #40's field run delivered
+# >5 km of IGN-as-C0 on a single SRO (high_gc_ratio=0.96) producing the
+# blue spaghetti Pierre flagged. These caps reject (don't truncate) any
+# single PA→PB path whose IGN share exceeds either bound: an absolute
+# ceiling, AND a ratio-of-total-length that only kicks in once the
+# path is long enough to look like a real itinerary (otherwise a
+# small purely-IGN fallback would be wrongly rejected).
+PR41_MAX_IGN_PER_PATH_M = 800.0
+PR41_MAX_IGN_RATIO_PER_PATH = 0.80
+# Ratio rule only applies above this absolute path length; below, only
+# the absolute cap matters. This keeps the synthetic unit tests with
+# 20–50 m IGN-only paths intact while still catching real "PA→PB has
+# 2 km of C0 instead of using nearby existing infra" spaghettis.
+PR41_RATIO_MIN_TOTAL_M = 300.0
+
+# PR #41 — When the global ``_snap`` fails to anchor an orphan PA
+# (e.g. SRO 63258/LLW/PMZ/24228 on the 2026-05-18 field run), allow a
+# longer logical anchor (still virtual, never delivered) so the rest
+# of the PBs aren't dropped wholesale. Logical anchors do not become
+# C0 in the livrable; their only role is to give Dijkstra an entry
+# point onto the closest existing / IGN edge.
+PR41_MAX_LOGICAL_ANCHOR_M_FOR_ORPHAN = 150.0
+
 # PR #40 experimental mode: parcels remain visual context only. Routing and
 # delivery are constrained by existing infrastructure and real IGN road
 # geometries, not by public/private parcel ownership.
@@ -1190,9 +1213,21 @@ def route_pa_to_pb(
             visible = length_m <= MAX_STRAIGHT_CONNECTOR_M
             if visible and delivery_public_area_safe is not None:
                 visible = delivery_public_area_safe.covers(g)
+            # PR #41 — relax the logical-anchor cap for orphan PAs
+            # (those that have no infra within MAX_LOGICAL_TERMINAL_ANCHOR_M
+            # but still sit within PR41_MAX_LOGICAL_ANCHOR_M_FOR_ORPHAN
+            # of an exploitable edge). The relaxed anchor is virtual /
+            # non-delivered — it only allows Dijkstra to find a starting
+            # node, so the SRO does not lose all its PBs to a single
+            # missing PA snap. Visible C0 connectors remain capped at
+            # MAX_STRAIGHT_CONNECTOR_M.
             if length_m > MAX_LOGICAL_TERMINAL_ANCHOR_M:
-                anchor_stats["terminal_anchor_missing"] += 1
-                return None
+                if visible or length_m > PR41_MAX_LOGICAL_ANCHOR_M_FOR_ORPHAN:
+                    anchor_stats["terminal_anchor_missing"] += 1
+                    return None
+                # Long logical anchor accepted as a virtual non-delivered
+                # edge. Keep ``visible=False`` so it is never emitted as
+                # a real C0 row in livrable_infra.
             if visible:
                 anchor_stats["terminal_visible_connectors"] += 1
             else:
@@ -1555,6 +1590,45 @@ def route_pa_to_pb(
                     )
                     _ign_blocked_flag_added = True
 
+            # ── PR #41 — Per-path IGN budget. Reject paths whose IGN /
+            # gc_neuf-as-C0 share would turn the livrable into a
+            # spaghetti map. On the field test of 2026-05-18 we saw
+            # paths made of >5 km of IGN per SRO with high_gc_ratio=0.96.
+            # The rule: if the path's IGN length exceeds either an
+            # absolute cap (PR41_MAX_IGN_PER_PATH_M) or a ratio of the
+            # total path length (PR41_MAX_IGN_RATIO_PER_PATH), reject
+            # the whole path rather than deliver a kilometric C0 chord.
+            # The PB is reported as ``path_ign_budget_exceeded`` so the
+            # operator can review it (rather than disappearing silently
+            # behind a wall of C0).
+            total_path_m = sum(p[6] for p in proposed_edges)
+            ratio_violated = (
+                total_path_m >= PR41_RATIO_MIN_TOTAL_M
+                and (path_ign_delivered_pending_m / total_path_m)
+                    > PR41_MAX_IGN_RATIO_PER_PATH
+            )
+            if (
+                path_ign_delivered_pending_m > PR41_MAX_IGN_PER_PATH_M
+                or ratio_violated
+            ):
+                ign_route_blocked_m += path_ign_delivered_pending_m
+                ign_route_blocked_count += 1
+                ign_cap_hit_count += 1
+                _mark_pb_impossible(str(pb_id), "path_ign_budget_exceeded")
+                diag["pass2_gc_rejected"] += 1
+                if flag_collector is not None:
+                    flag_collector.add(
+                        "PATH_IGN_BUDGET_EXCEEDED",
+                        target_url=f"{pa_id}->{pb_id}",
+                        message=(
+                            f"Chemin rejeté: IGN-as-C0={path_ign_delivered_pending_m:.0f}m "
+                            f"sur {total_path_m:.0f}m total — au-delà du budget "
+                            f"PR41 ({PR41_MAX_IGN_PER_PATH_M:.0f}m / "
+                            f"ratio {PR41_MAX_IGN_RATIO_PER_PATH:.2f})."
+                        ),
+                    )
+                continue
+
             # ── Commit path atomically ───────────────────────────────────
             for (u, v, edge_data, raw_src, raw_type, raw_infra,
                  raw_length, out_geom, geom_is_real) in proposed_edges:
@@ -1892,13 +1966,59 @@ def route_pa_to_pb(
     def _build_final_graph(df: gpd.GeoDataFrame) -> nx.Graph:
         return _lt._build_livrable_topology_graph(df)
 
-    # PR38 hard validation: actual final-graph reachability for committed paths
+    # PR38 hard validation: actual final-graph reachability for committed paths.
+    # PR41 fix — the PA / PB anchor coordinates were captured during the
+    # routing stage, BEFORE ``finalize_livrable_topology`` ran. That stage
+    # snaps near-by endpoints into shared centroids (``_snap_endpoints_to_-
+    # exact``, T-junction splits, etc.), so the anchor (x, y) recorded in
+    # ``committed_paths`` is no longer guaranteed to be a literal node of
+    # the final graph. A literal ``pa_a in G_final`` lookup therefore
+    # returned False for paths that were still genuinely reachable, which
+    # is what produced ``committed_path_unreachable_final_graph=7/7`` on
+    # 63149/M06/PMZ/42478 even though all 7 PBs had been committed.
+    #
+    # We now resolve each anchor to the NEAREST final-graph node within
+    # a small tolerance before checking reachability. The tolerance must
+    # be greater than ``ENDPOINT_SNAP_TOL_M`` (0.5 m) so a snap-to-exact
+    # shift cannot fool the lookup, but small enough not to glue PA and
+    # PB onto unrelated network branches. 2 m matches PR #36's
+    # TERMINAL_TOUCH_TOL_M class of tolerance.
+    PR41_ANCHOR_LOOKUP_TOL_M = 2.0
     G_final = _build_final_graph(result)
+    _final_node_list = list(G_final.nodes())
+
+    def _resolve_anchor(target):
+        if target is None:
+            return None
+        if target in G_final:
+            return target
+        # Linear scan is fine here — typical SROs have < a few thousand
+        # nodes, called once per committed path.
+        try:
+            tx, ty = float(target[0]), float(target[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        best = None
+        best_d2 = (PR41_ANCHOR_LOOKUP_TOL_M ** 2)
+        for n in _final_node_list:
+            try:
+                dx = float(n[0]) - tx
+                dy = float(n[1]) - ty
+            except (TypeError, ValueError, IndexError):
+                continue
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = n
+        return best
+
     unreachable_committed = 0
     unreachable_path_ids: set[str] = set()
     for pid, rec in committed_paths.items():
-        pa_a = rec.get("pa_final_anchor") or rec.get("pa_anchor")
-        pb_a = rec.get("pb_final_anchor") or rec.get("pb_anchor")
+        pa_a_raw = rec.get("pa_final_anchor") or rec.get("pa_anchor")
+        pb_a_raw = rec.get("pb_final_anchor") or rec.get("pb_anchor")
+        pa_a = _resolve_anchor(pa_a_raw)
+        pb_a = _resolve_anchor(pb_a_raw)
         metadata_present = (
             "_used_by_paths" in result.columns
             and any(
@@ -1907,7 +2027,8 @@ def route_pa_to_pb(
             )
         )
         reachable = (
-            pa_a in G_final and pb_a in G_final
+            pa_a is not None and pb_a is not None
+            and pa_a in G_final and pb_a in G_final
             and nx.has_path(G_final, pa_a, pb_a)
         )
         if reachable:
@@ -1928,6 +2049,22 @@ def route_pa_to_pb(
 
     # ── PR #28 [MUTUAL QA] mutualisation diagnostics ─────────────────────
     _log_mutual_qa(n_before_dedup, n_after_dedup, pa_sro)
+
+    # PR #41 — honest pb_committed counter. A PB whose committed path
+    # cannot be reached on the final livrable graph must NOT be counted
+    # as committed in the QA log. Pierre's brief: "pb_committed doit
+    # représenter des chemins livrés et connectés final graph, pas
+    # juste trouvés avant postprocess." Demote unreachable PBs to
+    # ``pb_impossible`` with reason ``path_broken_after_postprocess``
+    # so the field log surfaces the real shape of the delivery.
+    for pid in unreachable_path_ids:
+        rec = committed_paths.get(pid)
+        if rec is None:
+            continue
+        pb_id_str = str(rec.get("pb_id"))
+        if pb_id_str in pb_committed_ids:
+            pb_committed_ids.discard(pb_id_str)
+            _mark_pb_impossible(pb_id_str, "path_broken_after_postprocess")
 
     _log_pr39_routing_anchor_qa()
 

@@ -571,6 +571,68 @@ def _ensure_terminals_connected(
 # ---------------------------------------------------------------------------
 
 
+def _coords_to_2d_tuples(raw_coords) -> list[tuple[float, float]]:
+    """PR #41 — Normalise an iterable of coords into clean 2-D float tuples.
+
+    The terrain run on 2026-05-18 crashed in
+    ``_split_livrableedges_at_endpoint_projections`` with
+    ``ValueError: setting an array element with a sequence. The
+    requested array has an inhomogeneous shape after 1 dimensions.``
+    The trigger is a LineString built from coordinates where some
+    elements are 2-tuples and others 3-tuples (mixed 2D / 3D after the
+    SIG layer absorbed a Z value somewhere), or where an element is
+    itself a non-numeric sequence.
+
+    This helper:
+      - accepts any iterable of coordinate-like items;
+      - drops the Z dimension if present;
+      - skips entries that cannot be coerced to a pair of floats;
+      - returns a list of clean ``(float(x), float(y))`` tuples.
+
+    Callers MUST guard against the empty-or-degenerate case
+    (``len(out) < 2``) before passing the result to ``LineString``.
+    """
+    cleaned: list[tuple[float, float]] = []
+    if raw_coords is None:
+        return cleaned
+    try:
+        iterator = list(raw_coords)
+    except TypeError:
+        return cleaned
+    for c in iterator:
+        try:
+            x = float(c[0])
+            y = float(c[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        cleaned.append((x, y))
+    # Drop consecutive duplicates so a degenerate LineString cannot be built.
+    deduped: list[tuple[float, float]] = []
+    for c in cleaned:
+        if not deduped or deduped[-1] != c:
+            deduped.append(c)
+    return deduped
+
+
+def _safe_linestring(raw_coords) -> Optional[LineString]:
+    """Build a LineString from possibly-dirty coords, or return ``None``.
+
+    PR #41 — central guard against the 63257/QSB crash and any future
+    similar incident. Returns ``None`` when fewer than two valid 2-D
+    coordinates remain after normalisation; callers must handle this
+    by skipping the row instead of raising.
+    """
+    coords = _coords_to_2d_tuples(raw_coords)
+    if len(coords) < 2:
+        return None
+    try:
+        return LineString(coords)
+    except (ValueError, TypeError):
+        return None
+
+
 def _split_livrableedges_at_endpoint_projections(
     df: gpd.GeoDataFrame,
     *,
@@ -582,6 +644,13 @@ def _split_livrableedges_at_endpoint_projections(
 
     This is the classic T-junction fix: endpoints must share exact
     coordinates, not just sit close to another edge.
+
+    PR #41 hardening — every ``LineString(...)`` call now goes through
+    ``_safe_linestring`` so a row carrying mixed 2D / 3D coords or
+    non-numeric entries no longer crashes the whole SRO. Affected rows
+    are kept unchanged in the output rather than dropped, so path
+    metadata (``_used_by_paths``) is preserved across the
+    transformation.
     """
     if df is None or df.empty:
         return df, 0
@@ -654,13 +723,19 @@ def _split_livrableedges_at_endpoint_projections(
                     src_r = new_rows[src_idx]
                     src_g = src_r.get("geometry")
                     if src_g is not None and isinstance(src_g, LineString):
-                        src_cs = list(src_g.coords)
-                        if is_first:
-                            src_cs[0] = proj_tuple
-                        else:
-                            src_cs[-1] = proj_tuple
-                        new_rows[src_idx] = {**src_r, "geometry": LineString(src_cs),
-                                             "length_m": LineString(src_cs).length}
+                        src_cs = _coords_to_2d_tuples(src_g.coords)
+                        if len(src_cs) >= 2:
+                            if is_first:
+                                src_cs[0] = proj_tuple
+                            else:
+                                src_cs[-1] = proj_tuple
+                            patched = _safe_linestring(src_cs)
+                            if patched is not None:
+                                new_rows[src_idx] = {
+                                    **src_r,
+                                    "geometry": patched,
+                                    "length_m": patched.length,
+                                }
 
                 # PR32-B3: Also rewrite source in the original rows list for
                 # source-after-target case (src not yet in new_rows).
@@ -668,13 +743,16 @@ def _split_livrableedges_at_endpoint_projections(
                     orig_r = rows[src_idx]
                     orig_g = orig_r.get("geometry")
                     if orig_g is not None and isinstance(orig_g, LineString):
-                        orig_cs = list(orig_g.coords)
-                        if is_first:
-                            orig_cs[0] = proj_tuple
-                        else:
-                            orig_cs[-1] = proj_tuple
-                        orig_r["geometry"] = LineString(orig_cs)
-                        orig_r["length_m"] = LineString(orig_cs).length
+                        orig_cs = _coords_to_2d_tuples(orig_g.coords)
+                        if len(orig_cs) >= 2:
+                            if is_first:
+                                orig_cs[0] = proj_tuple
+                            else:
+                                orig_cs[-1] = proj_tuple
+                            patched = _safe_linestring(orig_cs)
+                            if patched is not None:
+                                orig_r["geometry"] = patched
+                                orig_r["length_m"] = patched.length
 
                 # Also update endpoints list for source line
                 for ei, (ec, si, if_) in enumerate(endpoints):
@@ -684,16 +762,26 @@ def _split_livrableedges_at_endpoint_projections(
                         else:
                             endpoints[ei] = (proj_tuple, src_idx, if_)
 
-                # Add split segments
+                # Add split segments — PR #41: ``_safe_linestring`` skips
+                # degenerate or heterogeneous-coord halves rather than
+                # raising, so a malformed source row leaves the others
+                # intact instead of crashing the SRO.
+                seg_a_geom = _safe_linestring(seg_a_coords)
+                seg_b_geom = _safe_linestring(seg_b_coords)
+                if seg_a_geom is None or seg_b_geom is None:
+                    # Skip this split silently — the source row stays
+                    # unchanged in ``new_rows`` (added at the bottom of
+                    # this iteration when ``is_split`` remains False).
+                    continue
                 old_to_new.append(len(new_rows))
                 row_a = dict(r)
-                row_a["geometry"] = LineString(seg_a_coords)
-                row_a["length_m"] = LineString(seg_a_coords).length
+                row_a["geometry"] = seg_a_geom
+                row_a["length_m"] = seg_a_geom.length
                 new_rows.append(row_a)
                 old_to_new.append(len(new_rows))
                 row_b = dict(r)
-                row_b["geometry"] = LineString(seg_b_coords)
-                row_b["length_m"] = LineString(seg_b_coords).length
+                row_b["geometry"] = seg_b_geom
+                row_b["length_m"] = seg_b_geom.length
                 new_rows.append(row_b)
                 splits_added += 1
                 changed = True
@@ -1653,6 +1741,23 @@ def _drop_c0_when_existing_equivalent(
                     break
 
         if redundant:
+            # PR #41 — NEVER drop a C0 row that is currently the only
+            # carrier of a committed path, even when an existing edge
+            # buffer covers it. Propagating ``_used_by_paths`` onto the
+            # existing edge does not guarantee the existing edge's
+            # endpoints match the path's recorded anchors, so the
+            # validation step downstream would then see the path as
+            # broken. Keep the C0 if it carries any path; only drop
+            # purely-redundant C0 rows.
+            row_paths = (
+                _path_membership_to_set(df.at[idx, "_used_by_paths"])
+                if "_used_by_paths" in df.columns
+                else set()
+            )
+            if row_paths:
+                keep_mask[idx] = True
+                stats["c0_kept_last_resort"] += 1
+                continue
             if "_used_by_paths" in df.columns and redundant_existing_idx is not None:
                 paths = _path_membership_to_set(df.at[redundant_existing_idx, "_used_by_paths"])
                 paths.update(_path_membership_to_set(df.at[idx, "_used_by_paths"]))
