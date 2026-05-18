@@ -397,11 +397,16 @@ def test_ign_over_cap_path_rejected_by_per_path_budget(caplog):
         )
     # Path rejected.
     assert result.empty or (result["infra_type"] == "gc_neuf").sum() == 0
+    # PR #42 — SRO hard cap may fire before per-path cap. Accept either.
     budget_flag = [
-        f for f in flags.entries if f["type"] == "PATH_IGN_BUDGET_EXCEEDED"
+        f for f in flags.entries
+        if f["type"] in (
+            "PATH_IGN_BUDGET_EXCEEDED",
+            "IGN_DELIVERED_BUDGET_EXCEEDED",
+        )
     ]
     assert budget_flag, (
-        f"PR #41: PATH_IGN_BUDGET_EXCEEDED must be raised, got "
+        f"PR #41/#42: a budget rejection flag must be raised, got "
         f"{[f['type'] for f in flags.entries]}"
     )
 
