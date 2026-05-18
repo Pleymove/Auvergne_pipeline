@@ -117,17 +117,26 @@ def run_for_sro(
         bt_mask = reusable["src"] == "bt"
         bt_raw = reusable[bt_mask]
         non_bt = reusable[~bt_mask]
-        bt_filtree = loader.filter_bt_to_public_domain(
-            bt_raw, parcelle_publique, ign_roads, buffer_m=5.0,
-        )
-        log.info("[CDC] %s BT clip public : %d -> %d segments (-%d)",
-                 sro_code, len(bt_raw), len(bt_filtree),
-                 len(bt_raw) - len(bt_filtree))
-        reusable = gpd.GeoDataFrame(
-            pd.concat([non_bt, bt_filtree], ignore_index=True),
-            geometry="geometry", crs=config.PROJECT_CRS,
-        ) if not bt_filtree.empty else non_bt
-        # Update by_src after BT filter
+        if routing.ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE:
+            bt_filtree = bt_raw
+            log.info(
+                "[ROUTING MODE] %s BT parcel clip disabled for PR40 routing: "
+                "keeping %d BT segments",
+                sro_code,
+                len(bt_raw),
+            )
+        else:
+            bt_filtree = loader.filter_bt_to_public_domain(
+                bt_raw, parcelle_publique, ign_roads, buffer_m=5.0,
+            )
+            log.info("[CDC] %s BT clip public : %d -> %d segments (-%d)",
+                     sro_code, len(bt_raw), len(bt_filtree),
+                     len(bt_raw) - len(bt_filtree))
+            reusable = gpd.GeoDataFrame(
+                pd.concat([non_bt, bt_filtree], ignore_index=True),
+                geometry="geometry", crs=config.PROJECT_CRS,
+            ) if not bt_filtree.empty else non_bt
+        # Update by_src after optional BT filter
         by_src["bt"] = len(bt_filtree)
         summary["bt_out"] = by_src["bt"]
         summary["reusable_total"] = len(reusable)
@@ -263,6 +272,8 @@ def run_for_sro(
         if ign_routes_buffered is not None and not ign_routes_buffered.is_empty:
             _parts.append(ign_routes_buffered)
         public_routing_area = _uu(_parts) if _parts else None
+        # In PR40 mode routing receives the strict parcel geometry only as
+        # telemetry context; route_pa_to_pb disables it as a delivery blocker.
         delivery_public_area = public_geom  # strict: pas de buffer IGN
 
         routed_infra = routing.route_pa_to_pb(

@@ -330,12 +330,13 @@ def test_public_micro_bridge_is_deliverable_not_virtual():
     assert e.get("_can_deliver") is True
 
 
-def test_private_micro_bridge_stays_virtual():
+def test_private_micro_bridge_stays_virtual(monkeypatch):
     """A ≤3 m micro-bridge whose geometry would cross private parcels
     stays virtual: Dijkstra can still use it for connectivity, but the
     path will be rejected by the deliverable-graph check rather than
     drawing a diagonal across a private parcel.
     """
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", False)
     G = nx.Graph()
     G.add_edge((0.0, 0.0), (5.0, 0.0),
                length=5.0, type="infra", src="ft", infra_type="ft",

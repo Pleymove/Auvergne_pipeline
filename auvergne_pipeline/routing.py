@@ -98,6 +98,11 @@ MAX_STRAIGHT_CONNECTOR_M = 3.0
 # livrable_infra C0 row.
 MAX_LOGICAL_TERMINAL_ANCHOR_M = 30.0
 
+# PR #40 experimental mode: parcels remain visual context only. Routing and
+# delivery are constrained by existing infrastructure and real IGN road
+# geometries, not by public/private parcel ownership.
+ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE = True
+
 # PR #31 H — soft warning when IGN-derived C0 dominates the livrable.
 IGN_DELIVERED_TOTAL_RATIO_WARN = 0.10
 
@@ -735,7 +740,9 @@ def _bridge_components_with_gc_neuf(
     # virtual-only behaviour so Dijkstra still finds connectivity but the
     # edge will be filtered out at delivery time.
     bridge_is_public = False
-    if public_area is not _SENTINEL:
+    if ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE:
+        bridge_is_public = True
+    elif public_area is not _SENTINEL:
         if public_area_safe is None:
             public_area_safe = _public_area_safe(public_area)
         if public_area_safe is not None and public_area_safe.covers(bridge_geom):
@@ -856,6 +863,13 @@ def route_pa_to_pb(
         delivery_public_area_safe = public_area_safe  # backward compat
     else:
         delivery_public_area_safe = _public_area_safe(delivery_public_area)
+    parcel_gate_reference_area = delivery_public_area_safe
+    if ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE:
+        log.info(
+            "[ROUTING MODE] parcel_gate=disabled network=existing+ign_roads "
+            "existing_first=true direct_chords=false"
+        )
+        delivery_public_area_safe = None
 
     # PR #37 — heal existing infra topology BEFORE routing. The healed
     # GeoDataFrame is what enters the routing graph; the original
@@ -886,6 +900,44 @@ def route_pa_to_pb(
     perf["add_gc_neuf"] = time.perf_counter() - t0
 
     if G.number_of_nodes() == 0:
+        pb_total = int(len(pb_sro))
+        log.info(
+            "[PB ROUTING QA] sro=%s pb_total=%d pb_assigned=0 "
+            "pb_unassigned=%d pb_attempted=0 pb_committed=0 "
+            "pb_impossible=%d pb_dropped=0 reasons=no_path_in_existing_or_ign_graph:%d",
+            sro_code_log,
+            pb_total,
+            pb_total,
+            pb_total,
+            pb_total,
+        )
+        log.info(
+            "[ANCHOR QA] sro=%s terminal_visible_connectors=0 "
+            "terminal_logical_only=0 terminal_anchor_missing=%d",
+            sro_code_log,
+            pb_total,
+        )
+        log.info(
+            "[ROAD C0 QA] sro=%s road_c0_delivered_count=0 "
+            "road_c0_delivered_m=0 parcel_gate_disabled_count=0 "
+            "direct_chord_blocked_count=0 c0_without_route_geometry_count=0 "
+            "c0_suspicious_chord_count=0",
+            sro_code_log,
+        )
+        log.info(
+            "[FINAL TOPO QA] sro=%s connected=0 disconnected=%d "
+            "pa_pb_connected_ratio=0.00 straight_connectors=0 "
+            "straight_connector_length_m=0 virtual_delivered=0 "
+            "ign_cap_hit=0 c0_without_source_geometry=0 "
+            "long_direct_c0_count=0 c0_without_ign_source=0 "
+            "path_lost_between_routing_and_final_graph=0 "
+            "path_broken_after_postprocess=0 "
+            "committed_path_reachable_final_graph=0 "
+            "committed_path_unreachable_final_graph=0 "
+            "path_metadata_present_but_graph_disconnected=0",
+            sro_code_log,
+            pb_total,
+        )
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     # PR #27 Part B: snap close A/Z endpoints before routing
@@ -934,7 +986,9 @@ def route_pa_to_pb(
         raw_type = data.get("type")
         raw_length = float(data.get("length", 0.0))
         if raw_type == "ign_route":
-            if raw_length > IGN_DELIVERY_MAX_LENGTH_M:
+            if ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE:
+                is_deliverable = True
+            elif raw_length > IGN_DELIVERY_MAX_LENGTH_M:
                 is_deliverable = False
             elif delivery_public_area_safe is not None:
                 stored = data.get("geometry")
@@ -994,6 +1048,7 @@ def route_pa_to_pb(
 
     # PR #33 — virtual edge telemetry
     virtual_edges_blocked_count = 0
+    direct_chord_blocked_count = 0
     straight_connector_count = 0
     straight_connector_length_m = 0.0
     anchor_stats = {
@@ -1412,11 +1467,13 @@ def route_pa_to_pb(
                     # Dijkstra had to traverse a non-deliverable edge — no
                     # deliverable alternative exists. Drop the PB cleanly.
                     virtual_edges_blocked_count += 1
+                    if float(edge_data.get("length", 0.0) or 0.0) > MAX_STRAIGHT_CONNECTOR_M:
+                        direct_chord_blocked_count += 1
                     path_deliverable = False
                     if edge_data.get("virtual"):
                         path_rejection_reason = "virtual_edge_no_alternative"
                     elif edge_data.get("type") == "ign_route":
-                        path_rejection_reason = "ign_non_deliverable_no_alternative"
+                        path_rejection_reason = "no_path_in_existing_or_ign_graph"
                     else:
                         path_rejection_reason = "non_deliverable_no_alternative"
                     break
@@ -1668,6 +1725,14 @@ def route_pa_to_pb(
             "c0_long_without_route_geometry_count=0",
             sro_code_log,
         )
+        log.info(
+            "[ROAD C0 QA] sro=%s road_c0_delivered_count=0 "
+            "road_c0_delivered_m=0 parcel_gate_disabled_count=0 "
+            "direct_chord_blocked_count=%d c0_without_route_geometry_count=0 "
+            "c0_suspicious_chord_count=0",
+            sro_code_log,
+            direct_chord_blocked_count,
+        )
         return gpd.GeoDataFrame(geometry=[], crs=config.PROJECT_CRS)
 
     result = gpd.GeoDataFrame(list(edges_out.values()), geometry="geometry", crs=config.PROJECT_CRS)
@@ -1680,7 +1745,11 @@ def route_pa_to_pb(
     final_removed_private_gc = 0
     private_crossing_final_length_m = 0.0
     private_c0_path_ids: set[str] = set()
-    if delivery_public_area_safe is not None and not result.empty:
+    if (
+        not ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE
+        and delivery_public_area_safe is not None
+        and not result.empty
+    ):
         mask_c0 = (result["mode_pose"] == "C0") | (result["infra_type"] == "gc_neuf")
 
         def _row_in_delivery(g):
@@ -1777,9 +1846,14 @@ def route_pa_to_pb(
         pa_for_topology = pa_sro[
             pa_sro["id_metier"].astype(str).isin(committed_pa_ids)
         ].copy()
+    topology_delivery_public_area_safe = (
+        None
+        if ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE
+        else delivery_public_area_safe
+    )
     result, pr31_stats = _lt.finalize_livrable_topology(
         result, pa_for_topology, pb_for_topology, sro_code_log,
-        delivery_public_area_safe=delivery_public_area_safe,
+        delivery_public_area_safe=topology_delivery_public_area_safe,
         flag_collector=flag_collector,
     )
     perf["pr31_topology"] = time.perf_counter() - t0
@@ -1928,6 +2002,10 @@ def route_pa_to_pb(
     c0_without_ign_source = 0
     c0_suspicious_chord_count = 0
     c0_long_without_route_geometry_count = 0
+    road_c0_delivered_count = 0
+    road_c0_delivered_m = 0.0
+    parcel_gate_disabled_count = 0
+    c0_without_route_geometry_count = 0
     if not result.empty:
         c0_mask = result["mode_pose"] == "C0"
         for idx in result.index[c0_mask]:
@@ -1950,9 +2028,22 @@ def route_pa_to_pb(
             if src_tag is None and length_m <= 3.0:
                 continue
             if src_tag in ("ign", "gc_neuf_planned", "micro_bridge"):
+                if src_tag == "ign":
+                    road_c0_delivered_count += 1
+                    road_c0_delivered_m += length_m
+                    geom = result.loc[idx, "geometry"]
+                    if (
+                        ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE
+                        and parcel_gate_reference_area is not None
+                        and geom is not None
+                        and not getattr(geom, "is_empty", False)
+                        and not parcel_gate_reference_area.covers(geom)
+                    ):
+                        parcel_gate_disabled_count += 1
                 continue
             # Anything else is suspect
             c0_without_ign_source += 1
+            c0_without_route_geometry_count += 1
             if length_m > 3.0:
                 long_direct_c0_count += 1
 
@@ -1988,6 +2079,19 @@ def route_pa_to_pb(
         sro_code_log,
         c0_suspicious_chord_count,
         c0_long_without_route_geometry_count,
+    )
+    log.info(
+        "[ROAD C0 QA] sro=%s road_c0_delivered_count=%d "
+        "road_c0_delivered_m=%.0f parcel_gate_disabled_count=%d "
+        "direct_chord_blocked_count=%d c0_without_route_geometry_count=%d "
+        "c0_suspicious_chord_count=%d",
+        sro_code_log,
+        road_c0_delivered_count,
+        road_c0_delivered_m,
+        parcel_gate_disabled_count,
+        direct_chord_blocked_count,
+        c0_without_route_geometry_count,
+        c0_suspicious_chord_count,
     )
 
     log.info(
