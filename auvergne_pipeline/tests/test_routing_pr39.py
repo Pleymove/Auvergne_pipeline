@@ -150,7 +150,8 @@ def test_path_preserving_postprocess_keeps_committed_path_connected(caplog):
     assert re.search(r"committed_path_reachable_final_graph=[1-9]", final)
 
 
-def test_private_c0_path_is_marked_impossible_not_kept(caplog):
+def test_private_c0_path_is_marked_impossible_not_kept(monkeypatch, caplog):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", False)
     pa = _pa()
     pb = _pb([(20, 0)])
     empty_infra = gpd.GeoDataFrame([], columns=["geometry"], geometry="geometry", crs=CRS)

@@ -64,6 +64,7 @@ def test_long_ign_route_not_delivered_as_gc(monkeypatch):
     """A 200 m IGN edge traversed by Dijkstra must NOT appear in the
     livrable_infra (length > IGN_DELIVERY_MAX_LENGTH_M = 50 m).
     """
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", False)
     G = nx.Graph()
     # Single 200 m IGN edge between PA and PB. Public domain is everything,
     # so routing area covers the edge — but the length disqualifies it.
@@ -136,6 +137,7 @@ def test_ign_private_crossing_blocked(monkeypatch):
     """A short IGN edge whose geometry partially exits the strict
     delivery area must be blocked from the livrable.
     """
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", False)
     G = nx.Graph()
     # 30 m IGN edge along y=0, but delivery_public_area is a tight strip
     # around y=0 that does NOT cover x in [10, 20] (a private parcel).
@@ -291,6 +293,7 @@ def test_final_gc_private_filter_uses_delivery_public_area(monkeypatch):
     counted in private_crossing_final_count, and a
     C0_PRIVATE_CROSSING_REMOVED flag must be added.
     """
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", False)
     from auvergne_pipeline import flags as flags_mod
 
     G = nx.Graph()
