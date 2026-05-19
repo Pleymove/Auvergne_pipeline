@@ -535,6 +535,39 @@ def _ensure_terminals_connected(
         # recognises this as a legitimate short terminal connector and
         # does NOT report it as ``c0_without_ign_source``.
         connector_row["_c0_source"] = "terminal"
+        # PR #42 amend — explicit _used_by_paths inheritance so the
+        # PR #42 final-graph purge does not drop the terminal connector
+        # as orphan. ``dict(target_row)`` already carries any tag the
+        # target line had, but if the target was untagged we still want
+        # the path id of the terminal we just attached. We compute the
+        # tag from the rows in ``rows`` whose endpoints touch the
+        # connector's projection point — that's the path(s) that will
+        # use this connector to reach PA/PB.
+        if (
+            "_used_by_paths" not in connector_row
+            or not _path_membership_to_set(connector_row.get("_used_by_paths"))
+        ):
+            connector_paths: set = set()
+            tol = EXISTING_COINCIDENCE_M
+            proj_pt = (round(best_proj.x, 3), round(best_proj.y, 3))
+            for r in rows:
+                g = r.get("geometry")
+                if g is None or g.is_empty or not isinstance(g, LineString):
+                    continue
+                cs = list(g.coords)
+                first = (round(cs[0][0], 3), round(cs[0][1], 3))
+                last = (round(cs[-1][0], 3), round(cs[-1][1], 3))
+                if (
+                    Point(first).distance(Point(proj_pt)) <= tol
+                    or Point(last).distance(Point(proj_pt)) <= tol
+                ):
+                    connector_paths.update(
+                        _path_membership_to_set(r.get("_used_by_paths"))
+                    )
+            if connector_paths:
+                connector_row["_used_by_paths"] = _serialize_path_membership(
+                    connector_paths
+                )
         rows.append(connector_row)
 
         stats["terminal_connectors_added"] += 1
@@ -1628,6 +1661,36 @@ def _reconnect_after_energy_removal(
         if (delivery_public_area_safe is not None
                 and delivery_public_area_safe.covers(connector)):
             row_template = dict(rows[0]) if rows else {}
+            # PR #42 amend — propagate ``_used_by_paths`` onto the new
+            # energy-reconnect connector. Without this, PR #42's purge
+            # treats the connector as orphan and drops it after the
+            # final reachability check, silently breaking the path it
+            # was meant to stitch. We collect the union of path tags
+            # from every existing row whose endpoint sits within
+            # ``EXISTING_COINCIDENCE_M`` of either end of the new
+            # connector — those are the paths that actually need this
+            # bridge to remain connected.
+            connector_paths: set = set()
+            tol = EXISTING_COINCIDENCE_M
+            for r in rows:
+                g = r.get("geometry")
+                if g is None or g.is_empty or not isinstance(g, LineString):
+                    continue
+                cs = list(g.coords)
+                first = (round(cs[0][0], 3), round(cs[0][1], 3))
+                last = (round(cs[-1][0], 3), round(cs[-1][1], 3))
+                touches_a = (
+                    Point(first).distance(Point(rem_ep)) <= tol
+                    or Point(last).distance(Point(rem_ep)) <= tol
+                )
+                touches_b = (
+                    Point(first).distance(Point(best_node)) <= tol
+                    or Point(last).distance(Point(best_node)) <= tol
+                )
+                if touches_a or touches_b:
+                    connector_paths.update(
+                        _path_membership_to_set(r.get("_used_by_paths"))
+                    )
             connector_row = {
                 "sro": row_template.get("sro", "?"),
                 "pa_id": row_template.get("pa_id", ""),
@@ -1638,6 +1701,8 @@ def _reconnect_after_energy_removal(
                 "infra_type": "gc_neuf",
                 "length_m": best_d,
                 "geometry": connector,
+                "_used_by_paths": _serialize_path_membership(connector_paths),
+                "_c0_source": "energy_reconnect",
             }
             rows.append(connector_row)
             stats["energy_reconnectors_added"] += 1

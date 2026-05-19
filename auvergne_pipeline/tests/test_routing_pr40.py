@@ -78,7 +78,12 @@ def _empty_edges():
     return gpd.GeoDataFrame([], columns=["geometry"], geometry="geometry", crs=CRS)
 
 
-def test_ign_road_outside_delivery_area_still_delivers_c0(caplog):
+def test_ign_road_outside_delivery_area_still_delivers_c0(caplog, monkeypatch):
+    # PR #42 — opt-in to the PR #40 experimental mode. The flag was
+    # disabled by default to stop the spaghetti on the 2026-05-18 field
+    # run; tests that explicitly verify the experimental path must
+    # re-enable it locally.
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     with caplog.at_level("INFO", logger="auvergne_pipeline.routing"):
         out = routing.route_pa_to_pb(
             _pa((0, 0)),
@@ -119,7 +124,8 @@ def test_direct_pa_pb_chord_still_forbidden(caplog):
     assert "pb_dropped=0" in qa
 
 
-def test_pr40_does_not_deliver_50m_component_bridge_without_ign_geometry(caplog):
+def test_pr40_does_not_deliver_50m_component_bridge_without_ign_geometry(caplog, monkeypatch):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     infra = gpd.GeoDataFrame(
         [
             {
@@ -164,7 +170,8 @@ def test_pr40_does_not_deliver_50m_component_bridge_without_ign_geometry(caplog)
     assert re.search(r"direct_chord_blocked_count=[1-9]", road)
 
 
-def test_pr40_allows_same_50m_when_real_ign_geometry_exists(caplog):
+def test_pr40_allows_same_50m_when_real_ign_geometry_exists(caplog, monkeypatch):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     ign_geom = LineString([(0, 0), (25, 10), (50, 0)])
 
     with caplog.at_level("INFO", logger="auvergne_pipeline.routing"):
@@ -187,7 +194,8 @@ def test_pr40_allows_same_50m_when_real_ign_geometry_exists(caplog):
     assert "road_c0_delivered_count=1" in road
 
 
-def test_pr40_micro_bridge_under_3m_can_still_be_delivered():
+def test_pr40_micro_bridge_under_3m_can_still_be_delivered(monkeypatch):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     graph = routing.nx.Graph()
     graph.add_edge(
         (0.0, 0.0),
@@ -237,7 +245,8 @@ def test_existing_infra_preferred_over_shorter_ign():
     assert set(out["src"]) == {"bt"}
 
 
-def test_final_graph_preserves_mixed_existing_and_ign_path(caplog):
+def test_final_graph_preserves_mixed_existing_and_ign_path(caplog, monkeypatch):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     infra = _infra([(0, 0), (10, 0)])
     ign = _ign([(10, 0), (50, 0)])
 
@@ -260,7 +269,8 @@ def test_final_graph_preserves_mixed_existing_and_ign_path(caplog):
     assert re.search(r"committed_path_reachable_final_graph=1\b", final)
 
 
-def test_parcel_gate_disabled_mode_and_road_c0_log(caplog):
+def test_parcel_gate_disabled_mode_and_road_c0_log(caplog, monkeypatch):
+    monkeypatch.setattr(routing, "ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE", True)
     with caplog.at_level("INFO", logger="auvergne_pipeline.routing"):
         routing.route_pa_to_pb(
             _pa((0, 0)),

@@ -121,10 +121,17 @@ PR41_RATIO_MIN_TOTAL_M = 300.0
 # point onto the closest existing / IGN edge.
 PR41_MAX_LOGICAL_ANCHOR_M_FOR_ORPHAN = 150.0
 
-# PR #40 experimental mode: parcels remain visual context only. Routing and
-# delivery are constrained by existing infrastructure and real IGN road
-# geometries, not by public/private parcel ownership.
-ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE = True
+# PR #40 introduced ``ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE = True`` so the
+# routing stage could ignore parcel ownership and deliver IGN-road C0
+# wherever Dijkstra wandered. The 2026-05-18 field run on PR #41 showed
+# this default produces > 50 km of spaghetti per pilot SRO and writes
+# infra rows even for PBs whose path is broken after final validation.
+#
+# PR #42 — disable the experimental mode by default. Strict parcel gating
+# and BT private clip become the production defaults again. Callers that
+# explicitly want the lenient routing can still flip the flag (it stays
+# in the module surface so existing tests / scripts keep working).
+ALLOW_IGN_ROAD_C0_WITHOUT_PARCEL_GATE = False
 
 # PR #31 H — soft warning when IGN-derived C0 dominates the livrable.
 IGN_DELIVERED_TOTAL_RATIO_WARN = 0.10
@@ -1111,6 +1118,7 @@ def route_pa_to_pb(
         "path_rejected_missing_anchor": 0,
         "path_lost_between_routing_and_final_graph": 0,
         "path_broken_after_postprocess": 0,
+        "path_broken_after_pr42_purge": 0,
         "committed_path_reachable_final_graph": 0,
         "committed_path_unreachable_final_graph": 0,
         "path_metadata_present_but_graph_disconnected": 0,
@@ -1569,13 +1577,25 @@ def route_pa_to_pb(
                     )
                 continue
 
-            # PR #36 — cumulative IGN soft-cap warning (no longer blocks).
+            # PR #42 — SRO-level IGN-as-C0 HARD cap. PR #36 had demoted
+            # it to a soft warning; the 2026-05-18 field run showed
+            # individual SROs delivering 5+ km of IGN-derived C0
+            # (high_gc_ratio=0.96) anyway. The cap is now an
+            # acceptance criterion: once the SRO has burned its
+            # budget, no further IGN-using path is committed. The PB
+            # is marked impossible with ``sro_ign_cap_exceeded`` and
+            # the operator can review which PBs need a manual fix
+            # rather than receiving a spaghetti livrable.
             if (
-                ign_route_delivered_as_gc_m + path_ign_delivered_pending_m
-                > MAX_IGN_DELIVERED_PER_SRO_M
-                and path_ign_delivered_pending_m > 0
+                path_ign_delivered_pending_m > 0
+                and ign_route_delivered_as_gc_m + path_ign_delivered_pending_m
+                    > MAX_IGN_DELIVERED_PER_SRO_M
             ):
                 ign_cap_hit_count += 1
+                ign_route_blocked_m += path_ign_delivered_pending_m
+                ign_route_blocked_count += 1
+                _mark_pb_impossible(str(pb_id), "sro_ign_cap_exceeded")
+                diag["pass2_gc_rejected"] += 1
                 if (
                     not _ign_blocked_flag_added
                     and flag_collector is not None
@@ -1584,11 +1604,13 @@ def route_pa_to_pb(
                         "IGN_DELIVERED_BUDGET_EXCEEDED",
                         target_url=sro_code_log,
                         message=(
-                            f"IGN-as-C0 cumulé > {MAX_IGN_DELIVERED_PER_SRO_M:.0f}m "
-                            "sur ce SRO (livré en continuité — alerte budget)."
+                            f"IGN-as-C0 cumulé dépasserait "
+                            f"{MAX_IGN_DELIVERED_PER_SRO_M:.0f}m sur ce SRO — "
+                            "PB suivant rejeté (PR42 hard cap)."
                         ),
                     )
                     _ign_blocked_flag_added = True
+                continue
 
             # ── PR #41 — Per-path IGN budget. Reject paths whose IGN /
             # gc_neuf-as-C0 share would turn the livrable into a
@@ -1799,12 +1821,20 @@ def route_pa_to_pb(
         # always observable in the run logs. An empty livrable is a
         # legitimate outcome (e.g., all paths rejected for cap) and
         # should still report its zero-row QA snapshot.
+        # PR #42 — emit the full counter set even on the empty-output
+        # early return so downstream tooling can grep for the same
+        # fields whether or not routing produced rows.
         log.info(
             "[FINAL TOPO QA] sro=%s connected=0 disconnected=%d "
             "pa_pb_connected_ratio=0.00 straight_connectors=%d "
             "straight_connector_length_m=%.0f virtual_delivered=0 "
             "ign_cap_hit=%d c0_without_source_geometry=0 "
             "long_direct_c0_count=0 c0_without_ign_source=0 "
+            "path_lost_between_routing_and_final_graph=0 "
+            "path_broken_after_postprocess=0 "
+            "committed_path_reachable_final_graph=0 "
+            "committed_path_unreachable_final_graph=0 "
+            "path_metadata_present_but_graph_disconnected=0 "
             "path_impossible_private_c0=0 c0_private_crossing_kept=0 "
             "pb_impossible_private_c0=0",
             sro_code_log, pb_count,
@@ -2014,6 +2044,7 @@ def route_pa_to_pb(
 
     unreachable_committed = 0
     unreachable_path_ids: set[str] = set()
+    reachable_path_ids: set[str] = set()
     for pid, rec in committed_paths.items():
         pa_a_raw = rec.get("pa_final_anchor") or rec.get("pa_anchor")
         pb_a_raw = rec.get("pb_final_anchor") or rec.get("pb_anchor")
@@ -2032,6 +2063,7 @@ def route_pa_to_pb(
             and nx.has_path(G_final, pa_a, pb_a)
         )
         if reachable:
+            reachable_path_ids.add(pid)
             diag["committed_path_reachable_final_graph"] += 1
         else:
             diag["committed_path_unreachable_final_graph"] += 1
@@ -2040,6 +2072,197 @@ def route_pa_to_pb(
             if metadata_present:
                 diag["path_metadata_present_but_graph_disconnected"] += 1
             diag["path_broken_after_postprocess"] += 1
+
+    # ── PR #42 — final-connected delivery contract (purge) ──────────────
+    # PR #41 demoted unreachable PBs from ``pb_committed_ids`` for the
+    # log, but it still wrote the geometries of broken-path edges into
+    # ``livrable_infra`` (terrain run 2026-05-18 produced 80 km of
+    # spaghetti for the same reason). PR #42 enforces a stricter rule:
+    # every row in the returned GeoDataFrame must be carried by AT
+    # LEAST ONE final-connected path. Rows tagged only with broken
+    # path IDs are dropped; rows shared with a valid path have their
+    # tag rewritten to the valid IDs only.
+    #
+    # PR #42 amend — this purge alone is not enough. Some rows added
+    # by ``finalize_livrable_topology`` (terminal connectors, T-split
+    # halves, energy-reconnect connectors) may be required for the
+    # final graph but may not carry ``_used_by_paths``. Dropping them
+    # after a first reachability check can silently break a path while
+    # the QA counters claim everything is fine.
+    #
+    # The fix is an iterative purge / re-validate loop:
+    #   1. apply the purge using the current ``reachable_path_ids``
+    #   2. rebuild the final graph from the purged rows
+    #   3. re-check reachability for every previously-valid path
+    #   4. if any path is now broken, demote it with reason
+    #      ``path_broken_after_pr42_purge`` and loop again
+    # The loop terminates when a full purge produces no further demotion.
+    pr42_purged_rows_total = 0
+    pr42_purged_length_total = 0.0
+    pr42_tag_rewritten_total = 0
+    pr42_broken_after_purge: set[str] = set()
+    pr42_iter = 0
+    while True:
+        pr42_iter += 1
+        # Defensive — bail after a few rounds, the purge cannot grow
+        # the set of broken paths indefinitely.
+        if pr42_iter > 5:
+            log.warning(
+                "[PR42 PURGE] sro=%s purge/revalidate loop exceeded 5 "
+                "iterations; stopping to avoid infinite recursion.",
+                sro_code_log,
+            )
+            break
+
+        pr42_purged_rows = 0
+        pr42_purged_length_m = 0.0
+        pr42_tag_rewritten = 0
+        if "_used_by_paths" in result.columns and not result.empty:
+            keep_idx: list = []
+            rewrite_at: list[tuple] = []
+            for idx in result.index:
+                row_paths = _path_membership_to_set(
+                    result.at[idx, "_used_by_paths"]
+                )
+                if not row_paths:
+                    pr42_purged_rows += 1
+                    pr42_purged_length_m += float(
+                        result.at[idx, "length_m"] or 0.0
+                    )
+                    continue
+                valid_paths_for_row = row_paths & reachable_path_ids
+                if not valid_paths_for_row:
+                    pr42_purged_rows += 1
+                    pr42_purged_length_m += float(
+                        result.at[idx, "length_m"] or 0.0
+                    )
+                    continue
+                if valid_paths_for_row != row_paths:
+                    rewrite_at.append(
+                        (idx, _serialize_path_membership(valid_paths_for_row))
+                    )
+                    pr42_tag_rewritten += 1
+                keep_idx.append(idx)
+            for idx, new_tag in rewrite_at:
+                result.at[idx, "_used_by_paths"] = new_tag
+            if pr42_purged_rows:
+                result = result.loc[keep_idx].copy()
+
+        pr42_purged_rows_total += pr42_purged_rows
+        pr42_purged_length_total += pr42_purged_length_m
+        pr42_tag_rewritten_total += pr42_tag_rewritten
+
+        # Re-validate reachability on the freshly purged graph. If a
+        # path that was reachable before is no longer reachable on the
+        # purged graph, demote it and loop again.
+        G_post = _build_final_graph(result)
+        _post_node_list = list(G_post.nodes())
+
+        def _resolve_anchor_post(target):
+            if target is None:
+                return None
+            if target in G_post:
+                return target
+            try:
+                tx, ty = float(target[0]), float(target[1])
+            except (TypeError, ValueError, IndexError):
+                return None
+            best = None
+            best_d2 = (PR41_ANCHOR_LOOKUP_TOL_M ** 2)
+            for n in _post_node_list:
+                try:
+                    dx = float(n[0]) - tx
+                    dy = float(n[1]) - ty
+                except (TypeError, ValueError, IndexError):
+                    continue
+                d2 = dx * dx + dy * dy
+                if d2 <= best_d2:
+                    best_d2 = d2
+                    best = n
+            return best
+
+        newly_broken: set[str] = set()
+        for pid in list(reachable_path_ids):
+            rec = committed_paths.get(pid)
+            if rec is None:
+                continue
+            pa_a_raw = rec.get("pa_final_anchor") or rec.get("pa_anchor")
+            pb_a_raw = rec.get("pb_final_anchor") or rec.get("pb_anchor")
+            pa_a = _resolve_anchor_post(pa_a_raw)
+            pb_a = _resolve_anchor_post(pb_a_raw)
+            still_reachable = (
+                pa_a is not None
+                and pb_a is not None
+                and pa_a in G_post and pb_a in G_post
+                and nx.has_path(G_post, pa_a, pb_a)
+            )
+            if not still_reachable:
+                newly_broken.add(pid)
+
+        if not newly_broken:
+            # Loop converged: no further demotion needed.
+            break
+
+        # Demote the newly-broken paths and prepare for another purge
+        # iteration. We update counters here so the QA log reflects the
+        # final state honestly.
+        for pid in newly_broken:
+            reachable_path_ids.discard(pid)
+            pr42_broken_after_purge.add(pid)
+            unreachable_path_ids.add(pid)
+            rec = committed_paths.get(pid)
+            if rec is not None:
+                pb_id_str = str(rec.get("pb_id"))
+                if pb_id_str in pb_committed_ids:
+                    pb_committed_ids.discard(pb_id_str)
+                _mark_pb_impossible(pb_id_str, "path_broken_after_pr42_purge")
+            diag["committed_path_reachable_final_graph"] = max(
+                0, diag["committed_path_reachable_final_graph"] - 1
+            )
+            diag["path_broken_after_postprocess"] += 1
+
+    if pr42_purged_rows_total or pr42_broken_after_purge:
+        log.info(
+            "[PR42 PURGE] sro=%s rows_dropped=%d length_dropped_m=%.0f "
+            "tags_rewritten=%d paths_broken_after_purge=%d iterations=%d",
+            sro_code_log,
+            pr42_purged_rows_total,
+            pr42_purged_length_total,
+            pr42_tag_rewritten_total,
+            len(pr42_broken_after_purge),
+            pr42_iter,
+        )
+        if flag_collector is not None:
+            flag_collector.add(
+                "BROKEN_PATH_EDGES_PURGED",
+                target_url=sro_code_log,
+                message=(
+                    f"PR #42 purge: {pr42_purged_rows_total} edges / "
+                    f"{pr42_purged_length_total:.0f} m supprimés du "
+                    f"livrable_infra "
+                    f"({len(pr42_broken_after_purge)} paths additionnels "
+                    "cassés après revalidation)."
+                ),
+            )
+
+    # After the iterative purge converges, the QA counters for
+    # "unreachable but still in output" are zero by construction.
+    diag["committed_path_unreachable_final_graph"] = 0
+    diag["path_metadata_present_but_graph_disconnected"] = 0
+    diag["path_broken_after_pr42_purge"] = len(pr42_broken_after_purge)
+
+    # If the SRO has zero final-connected paths the output must be
+    # empty: writing "candidate" path edges that nobody can use was a
+    # major source of the PR #41 field-run spaghetti
+    # (63149/M06/PMZ/42478 had infra=192 with pb_committed=0).
+    if not reachable_path_ids:
+        if not result.empty:
+            log.info(
+                "[PR42 PURGE] sro=%s reachable_paths=0 → returning empty "
+                "livrable_infra (was %d rows)",
+                sro_code_log, len(result),
+            )
+            result = result.iloc[0:0].copy()
 
     # ── PR #26 [INFRA QA] diagnostic logs ───────────────────────────────
     _log_infra_qa(result, pa_sro)
